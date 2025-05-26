@@ -1,0 +1,20 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C++ build artifacts
+*.o
+*.a
+*.so
+*.elf
+*.bin
+*.map
+
+# ESPHome build artifacts
+.esphome/
+.pioenvs/
+.piolibdeps/
+
+# deployment secrets
+/secrets.yaml
