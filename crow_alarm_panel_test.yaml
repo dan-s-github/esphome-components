@@ -1,0 +1,79 @@
+# Sample configuration to validate/compile the crow_alarm_panel component.
+# Replace pin numbers and other values to match your hardware.
+#
+# Usage:
+#   esphome config crow_alarm_panel_test.yaml      # validate config
+#   esphome compile crow_alarm_panel_test.yaml     # compile firmware
+
+esphome:
+  name: crow-alarm-panel-test
+  friendly_name: Crow Alarm Panel Test
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+# Enable logging
+logger:
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+external_components:
+  - source:
+      type: local
+      path: components
+
+crow_alarm_panel:
+  clock_pin: GPIO18
+  data_pin: GPIO19
+  address: 8
+  on_message:
+    - logger.log:
+        format: "type=0x%02x data=%s"
+        args:
+          - "type"
+          - "format_hex_pretty(data).c_str()"
+
+text_sensor:
+  - platform: crow_alarm_panel
+    name: "Alarm Armed State"
+    type: armed_state
+
+binary_sensor:
+  - platform: crow_alarm_panel
+    name: "Zone 1"
+    type: zone
+    zone: 1
+
+  - platform: crow_alarm_panel
+    name: "Zone 1 Bypassed"
+    type: bypass
+    zone: 1
+
+alarm_control_panel:
+  - platform: crow_alarm_panel
+    name: "Crow Alarm"
+    requires_code: true
+    requires_code_to_arm: false
+
+button:
+  - platform: crow_alarm_panel
+    name: "Arm Away"
+    type: arm_away
+
+  - platform: crow_alarm_panel
+    name: "Arm Stay"
+    type: arm_stay
+
+  - platform: crow_alarm_panel
+    name: "Disarm"
+    type: disarm
+    code: !secret alarm_code

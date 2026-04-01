@@ -18,3 +18,7 @@ __pycache__/
 
 # deployment secrets
 /secrets.yaml
+
+# uv / Python virtual environment
+.venv/
+uv.lock
