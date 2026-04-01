@@ -211,6 +211,10 @@ void CrowAlarmPanel::loop() {
         break;
       }
       case ARMED_STATE: {
+        if (data.size() < 2) {
+          ESP_LOGW(TAG, "Armed state invalid length, discarding");
+          break;
+        }
         if (armed_state_ != nullptr) {
           if (data[0] == 0x00 && data[1] == 0x01) {
             this->armed_state_->publish_state("arming");
