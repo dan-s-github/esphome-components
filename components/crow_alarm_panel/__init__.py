@@ -32,7 +32,7 @@ CONFIG_SCHEMA = cv.Schema(
         cv.GenerateID(): cv.declare_id(CrowAlarmPanel),
         cv.Required(CONF_CLOCK_PIN): pins.internal_gpio_input_pin_schema,
         cv.Required(CONF_DATA_PIN): pins.internal_gpio_input_pin_schema,
-        cv.Optional(CONF_ADDRESS): cv.int_range(min=0, max=8),
+        cv.Required(CONF_ADDRESS): cv.int_range(min=0, max=8),
         cv.Optional(CONF_KEYPADS, default=[]): cv.ensure_list(
             cv.Schema(
                 {
@@ -56,8 +56,7 @@ async def to_code(config):
     data_pin = await cg.gpio_pin_expression(config[CONF_DATA_PIN])
     cg.add(var.set_data_pin(data_pin))
 
-    if CONF_ADDRESS in config:
-        cg.add(var.set_keypad_address(config[CONF_ADDRESS]))
+    cg.add(var.set_keypad_address(config[CONF_ADDRESS]))
 
     for keypad in config[CONF_KEYPADS]:
         cg.add(var.add_keypad(keypad[CONF_NAME], keypad[CONF_ADDRESS]))
