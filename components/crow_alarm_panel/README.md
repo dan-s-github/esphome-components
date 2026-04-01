@@ -19,7 +19,7 @@ crow_alarm_panel:
   on_message:
     - logger.log:
         format: "%02x -  %s"
-        args: 
-        - "type"
-        - "format_hex_pretty(data).c_str()"
+        args:
+          - "type"
+          - "format_hex_pretty(data).c_str()"
 ```

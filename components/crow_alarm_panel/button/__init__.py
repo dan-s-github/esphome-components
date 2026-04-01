@@ -14,15 +14,27 @@ TYPES = ["arm_away", "arm_stay", "disarm"]
 
 CONF_CODE = "code"
 
-CONFIG_SCHEMA = button.button_schema(CrowAlarmPanelButton).extend(
-    {
-        cv.GenerateID(CONF_CROW_ALARM_PANEL_ID): cv.use_id(CrowAlarmPanel),
-        cv.Required(CONF_TYPE): cv.one_of(*TYPES, lower=True),
-        cv.Optional(CONF_CODE): cv.string,  # Only needed for disarm
-    }
-).extend(cv.COMPONENT_SCHEMA)
+
+def _validate_disarm_code(value):
+    """Ensure that a code is provided for disarm buttons."""
+    button_type = value.get(CONF_TYPE)
+    if button_type == "disarm":
+        code = value.get(CONF_CODE)
+        if not code:
+            raise cv.Invalid("For type 'disarm', a non-empty 'code' must be provided.")
+    return value
 
 
+CONFIG_SCHEMA = cv.All(
+    button.button_schema(CrowAlarmPanelButton).extend(
+        {
+            cv.GenerateID(CONF_CROW_ALARM_PANEL_ID): cv.use_id(CrowAlarmPanel),
+            cv.Required(CONF_TYPE): cv.one_of(*TYPES, lower=True),
+            cv.Optional(CONF_CODE): cv.string,  # Only needed for disarm
+        }
+    ).extend(cv.COMPONENT_SCHEMA),
+    _validate_disarm_code,
+)
 async def to_code(config):
     paren = await cg.get_variable(config[CONF_CROW_ALARM_PANEL_ID])
     var = cg.new_Pvariable(config[CONF_ID])

@@ -26,7 +26,7 @@ CONFIG_SCHEMA = cv.typed_schema(
         CONF_OUTPUT: CROW_SWITCH_SCHEMA.extend(
             {
                 cv.GenerateID(): cv.declare_id(CrowAlarmPanelOutputSwitch),
-                cv.Required(CONF_OUTPUT): cv.positive_int,
+                cv.Required(CONF_OUTPUT): cv.int_range(1, 8),
             }
         ),
     }
