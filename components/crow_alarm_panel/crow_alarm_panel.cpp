@@ -167,7 +167,7 @@ void CrowAlarmPanel::loop() {
       case ZONE_STATE: {
         if (data.size() < 6) {
           ESP_LOGW(TAG, "Zone state invalid length, discarding");
-          return;
+          break;
         }
         ESP_LOGD(TAG, "Zone state received [%s]", format_hex_pretty(data).c_str());
         bool clear = true;
