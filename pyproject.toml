@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "esphome-components"
+version = "0.1.0"
+description = "Custom ESPHome components"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "esphome>=2026.3.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/dan-s-github/esphome-components"
+Repository = "https://github.com/dan-s-github/esphome-components"
+Issues = "https://github.com/dan-s-github/esphome-components/issues"
+
+[dependency-groups]
+dev = [
+    "commitlint>=1.13.3",
+    "pre-commit>=4.2.0",
+]
+
+
+[tool.setuptools]
+package-dir = {"" = "components"}
+
+[tool.setuptools.packages.find]
+where = ["components"]
+include = ["crow_alarm_panel*"]
