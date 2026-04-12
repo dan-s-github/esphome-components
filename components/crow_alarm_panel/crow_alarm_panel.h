@@ -14,8 +14,7 @@
 namespace esphome {
 namespace crow_alarm_panel {
 
-static const uint8_t UNKNOWN = 0x10;
-static const uint8_t UNKNOWN2 = 0x20;
+static const uint8_t CONTROLLER_STATUS = 0x10;
 
 static const uint8_t ARMED_STATE = 0x11;
 static const uint8_t ZONE_STATE = 0x12;
@@ -28,9 +27,11 @@ static const uint8_t SETTING_VALUE3 = 0x18;  // for flashing LEDs > 255
 
 static const uint8_t MEMORY_EVENT = 0x20;
 
+static const uint8_t OUTPUT_SELECT_ACK = 0x1D;
+
 static const uint8_t OUTPUT_STATE = 0x50;
 static const uint8_t CURRENT_TIME = 0x54;
-static const uint8_t CURRENT_TEMP = 0x23; // Unconfirmed, this is just my suspicion based on observed data
+static const uint8_t KEYPAD_PING = 0x23;  // Observed recurring keypad keep-alive/ping traffic
 static const uint8_t BOUNDARY = 0x7E;
 // static const uint8_t KEYPRESS = 0xD1; // This is from upstream, but doesn't get sent by arrowhead panels that I can see
 static const uint8_t KEYPRESS = 0xA1;
@@ -38,17 +39,18 @@ static const uint8_t MEMORY_CLEAR = 0xD2;
 static const uint8_t PACKET_COMPLETE_MARKER = 0xFE; // This gets added after the boundary for keypad packets - signaling end of packet?
 
 // Keys 0 - 9 are 0-9
-static const uint8_t KEY_MEMORY = 11;
-static const uint8_t KEY_BYPASS = 15;
-static const uint8_t KEY_PROGRAM = 16;
-static const uint8_t KEY_ENTER = 17;
-static const uint8_t KEY_STAY = 0x0E; // Untested
-static const uint8_t KEY_ARM = 0x0D;
+static const uint8_t KEY_OUTPUT = 0x0A;   // 10
+static const uint8_t KEY_MEMORY = 0x0B;   // 11
+static const uint8_t KEY_ARM = 0x0D;      // 13
+static const uint8_t KEY_STAY = 0x0E;     // 14, untested
+static const uint8_t KEY_BYPASS = 0x0F;   // 15
+static const uint8_t KEY_PROGRAM = 0x10;  // 16
+static const uint8_t KEY_ENTER = 0x11;    // 17
 
 static const uint8_t BUFFER_LENGTH = 20;
 
 static const char *KEYS[18] = {"0", "1",     "2",      "3",       "4",   "5",    "6",      "7",       "8",
-                               "9", "PANIC", "MEMORY", "CONTROL", "ARM", "STAY", "BYPASS", "PROGRAM", "ENTER"};
+                               "9", "OUTPUT", "MEMORY", "CONTROL", "ARM", "STAY", "BYPASS", "PROGRAM", "ENTER"};
 
 static const uint8_t RESPONSE_TIME = 0x19;
 
