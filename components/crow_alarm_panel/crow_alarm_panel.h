@@ -36,7 +36,6 @@ static const uint8_t BOUNDARY = 0x7E;
 // static const uint8_t KEYPRESS = 0xD1; // This is from upstream, but doesn't get sent by arrowhead panels that I can see
 static const uint8_t KEYPRESS = 0xA1;
 static const uint8_t MEMORY_CLEAR = 0xD2;
-static const uint8_t PACKET_COMPLETE_MARKER = 0xFE; // This gets added after the boundary for keypad packets - signaling end of packet?
 
 // Keys 0 - 9 are 0-9
 static const uint8_t KEY_OUTPUT = 0x0A;   // 10
@@ -95,14 +94,13 @@ class CrowAlarmPanelStore {
   uint8_t boundary_buffer_{0};
 
  public:
-  static const uint32_t BUS_IDLE_TIMEOUT_US = 5000;          // 5ms idle = bus free
+  static const uint32_t BUS_IDLE_TIMEOUT_US = 1000;          // Require ~1 bit-time of clock silence
   static const uint32_t MIN_TX_INTERVAL_MS = 50;             // Min 50ms between TX
   /**
-   * Minimum interval between falling edges to avoid glitches. The clock runs at ~1.2kHz,
-   * so we expect ~833μs between edges. Setting this to 700μs filters out most glitches while
-   * still allowing normal operation.
+   * Minimum interval between falling edges to avoid glitches. Working keypad captures show
+   * legitimate edge spacing jitter, so keep this comfortably below the nominal ~833μs period.
    */
-  static const uint32_t MIN_FALLING_EDGE_INTERVAL_US = 700;  // Min 700μs between falling edges
+  static const uint32_t MIN_FALLING_EDGE_INTERVAL_US = 350;  // Filter bounce without dropping real edges
   static const uint32_t TX_START_TIMEOUT_US = 100000;        // 100ms to start TX
   static const uint32_t TX_BIT_TIMEOUT_US = 10000;           // 10ms between bits
 };

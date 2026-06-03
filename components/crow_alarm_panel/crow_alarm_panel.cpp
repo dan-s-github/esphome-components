@@ -493,6 +493,16 @@ bool CrowAlarmPanel::is_bus_idle_() {
     return false;
   }
 
+  // Require a short quiet period after the last observed clock edge before transmitting.
+  // This avoids starting a frame in the tiny inter-frame gap and improves ACK timing.
+  uint32_t now_us = micros();
+  uint32_t time_since_clock_edge = now_us - this->store_.last_clock_time_;
+  if (time_since_clock_edge < CrowAlarmPanelStore::BUS_IDLE_TIMEOUT_US) {
+    ESP_LOGV(TAG, "Bus not idle: only %uus since last clock edge (need %uus)", time_since_clock_edge,
+             CrowAlarmPanelStore::BUS_IDLE_TIMEOUT_US);
+    return false;
+  }
+
   // Check minimum interval since last transmission (anti-spam)
   uint32_t now_ms = millis();
   uint32_t time_since_tx = now_ms - this->store_.last_transmission_time_;
@@ -503,7 +513,8 @@ bool CrowAlarmPanel::is_bus_idle_() {
     return false;
   }
 
-  ESP_LOGV(TAG, "Bus is idle: not inside message, data line high, %ums since last TX", time_since_tx);
+  ESP_LOGV(TAG, "Bus is idle: data high, %uus since last clock edge, %ums since last TX", time_since_clock_edge,
+           time_since_tx);
   return true;
 }
 
@@ -631,8 +642,7 @@ void CrowAlarmPanel::send_packet(uint8_t type, const std::vector<uint8_t> &data)
   packet.push_back(type);
   packet.push_back(this->keypad_address_);
   packet.insert(packet.end(), data.begin(), data.end());
-  packet.push_back(BOUNDARY);                // End boundary
-  packet.push_back(PACKET_COMPLETE_MARKER);  // Explicit end marker
+  packet.push_back(BOUNDARY);  // End boundary
 
   // Check if bus is idle
   while (!this->is_bus_idle_()) {
