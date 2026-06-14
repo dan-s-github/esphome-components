@@ -97,10 +97,11 @@ class CrowAlarmPanelStore {
   static const uint32_t BUS_IDLE_TIMEOUT_US = 1000;          // Require ~1 bit-time of clock silence
   static const uint32_t MIN_TX_INTERVAL_MS = 50;             // Min 50ms between TX
   /**
-   * Minimum interval between falling edges to avoid glitches. Working keypad captures show
-   * legitimate edge spacing jitter, so keep this comfortably below the nominal ~833μs period.
-   */
-  static const uint32_t MIN_FALLING_EDGE_INTERVAL_US = 350;  // Filter bounce without dropping real edges
+  * Minimum interval between falling edges to avoid glitches. The clock runs at ~1.2kHz, so we
+  * expect ~833us between edges. Keep this comfortably below that to filter bounce without
+  * dropping real edges.
+  */
+  static const uint32_t MIN_FALLING_EDGE_INTERVAL_US = 700;  // Filter bounce without dropping real edges
   static const uint32_t TX_START_TIMEOUT_US = 100000;        // 100ms to start TX
   static const uint32_t TX_BIT_TIMEOUT_US = 10000;           // 10ms between bits
 };
