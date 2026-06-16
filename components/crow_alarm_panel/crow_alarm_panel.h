@@ -94,8 +94,8 @@ class CrowAlarmPanelStore {
   uint8_t boundary_buffer_{0};
 
  public:
-  static const uint32_t BUS_IDLE_TIMEOUT_US = 1000;          // Require ~1 bit-time of clock silence
-  static const uint32_t MIN_TX_INTERVAL_MS = 50;             // Min 50ms between TX
+  static const uint32_t BUS_IDLE_TIMEOUT_US = 180;           // Allow takeover between bit bursts
+  static const uint32_t MIN_TX_INTERVAL_MS = 5;              // Allow keypad-like key burst cadence
   /**
   * Minimum interval between falling edges to avoid glitches. The clock runs at ~1.2kHz, so we
   * expect ~833us between edges. Keep this comfortably below that to filter bounce without
@@ -193,6 +193,9 @@ class CrowAlarmPanel : public Component {
   bool wait_for_clock_edge_(bool wait_for_high, uint32_t timeout_us);
   std::vector<uint8_t> keypress_queue_;
   uint32_t last_keypress_sent_ms_{0};
+  bool waiting_for_output_select_ack_{false};
+  uint32_t output_select_sent_ms_{0};
+  bool output_select_takeover_pending_{false};
   bool disarm_in_progress_{false};
   uint32_t disarm_started_ms_{0};
   bool arm_in_progress_{false};

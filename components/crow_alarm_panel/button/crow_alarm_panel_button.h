@@ -16,7 +16,11 @@ class CrowAlarmPanelButton : public button::Button, public Component {
 
  protected:
   void press_action() override {
-    if (this->button_type_ == "arm_away") {
+   if (this->parent_ == nullptr) {
+     ESP_LOGE("crow_alarm_panel.button", "Parent not set, ignoring button press");
+     return;
+   }
+   if (this->button_type_ == "arm_away") {
       if (this->parent_->is_arm_in_progress()) {
         ESP_LOGW("crow_alarm_panel.button", "Arm operation already in progress, ignoring button press");
         return;
@@ -41,7 +45,7 @@ class CrowAlarmPanelButton : public button::Button, public Component {
     }
   }
 
-  CrowAlarmPanel *parent_;
+  CrowAlarmPanel *parent_{nullptr};
   std::string button_type_;
   std::string code_;
 };

@@ -633,7 +633,15 @@ void CrowAlarmPanel::disarm(const std::string &code) {
   this->keypress_queue_.push_back(KEY_ENTER);
 }
 
-void CrowAlarmPanel::set_output(uint8_t output, bool state) {}
+void CrowAlarmPanel::set_output(uint8_t output, bool state) {
+  ESP_LOGD(TAG, "Set output %u to %s", output, state ? "on" : "off");
+
+  this->keypress(KEY_OUTPUT);
+  for (char digit : std::to_string(output)) {
+    this->keypress(static_cast<uint8_t>(digit - '0'));
+  }
+  this->keypress(KEY_ENTER);
+}
 
 void CrowAlarmPanel::send_packet(uint8_t type, const std::vector<uint8_t> &data) {
   // Build packet with boundaries
