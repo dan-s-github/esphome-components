@@ -1,0 +1,8 @@
+repos:
+  - repo: local
+    hooks:
+      - id: commitlint
+        name: commitlint
+        entry: uv run commitlint --file
+        language: system
+        stages: [commit-msg]
