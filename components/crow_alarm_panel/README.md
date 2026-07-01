@@ -23,3 +23,7 @@ crow_alarm_panel:
         - "type"
         - "format_hex_pretty(data).c_str()"
 ```
+
+## Built-in debug logs
+
+With `logger:` set to `DEBUG`, the component also emits decoded runtime logs for observed controller-status packets, keypad polls, output-select acknowledgements, keypad commands/states, and controller time updates. Unknown or inferred packet meanings are still labeled conservatively in the log output.

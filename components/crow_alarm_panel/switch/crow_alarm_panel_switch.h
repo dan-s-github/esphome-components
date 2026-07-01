@@ -16,7 +16,7 @@ class CrowAlarmPanelSwitch : public switch_::Switch, public Component {
  protected:
   virtual void write_state(bool state) = 0;
 
-  CrowAlarmPanel *parent_;
+  CrowAlarmPanel *parent_{nullptr};
 };
 
 class CrowAlarmPanelOutputSwitch : public CrowAlarmPanelSwitch {
@@ -26,7 +26,7 @@ class CrowAlarmPanelOutputSwitch : public CrowAlarmPanelSwitch {
  protected:
   void write_state(bool state) override;
 
-  uint8_t output_number_;
+  uint8_t output_number_{0};
 };
 
 }  // namespace crow_alarm_panel

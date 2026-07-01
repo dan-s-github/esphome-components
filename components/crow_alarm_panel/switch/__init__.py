@@ -38,6 +38,7 @@ def to_code(config):
     type = config[CONF_TYPE]
     if type == "output":
         var = cg.new_Pvariable(config[CONF_ID])
+        cg.add(var.set_crow_alarm_panel_parent(paren))
         cg.add(var.set_output_number(config[CONF_OUTPUT]))
         cg.add(paren.register_output_switch(var, config[CONF_OUTPUT]))
 

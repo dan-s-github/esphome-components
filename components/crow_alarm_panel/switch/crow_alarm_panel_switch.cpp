@@ -11,6 +11,10 @@ void CrowAlarmPanelSwitch::dump_config() {
 }
 
 void CrowAlarmPanelOutputSwitch::write_state(bool state) {
+  if (this->parent_ == nullptr) {
+    ESP_LOGE(TAG, "Parent not set, ignoring output switch command");
+    return;
+  }
   this->parent_->set_output(this->output_number_, state);
   this->publish_state(state);
 }

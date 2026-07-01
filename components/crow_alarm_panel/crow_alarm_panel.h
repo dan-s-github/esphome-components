@@ -14,8 +14,8 @@
 namespace esphome {
 namespace crow_alarm_panel {
 
-static const uint8_t UNKNOWN = 0x10;
-static const uint8_t UNKNOWN2 = 0x20;
+
+static const uint8_t CONTROLLER_STATUS = 0x10;
 
 static const uint8_t ARMED_STATE = 0x11;
 static const uint8_t ZONE_STATE = 0x12;
@@ -28,27 +28,30 @@ static const uint8_t SETTING_VALUE3 = 0x18;  // for flashing LEDs > 255
 
 static const uint8_t MEMORY_EVENT = 0x20;
 
+static const uint8_t OUTPUT_SELECT_ACK = 0x1D;
+
 static const uint8_t OUTPUT_STATE = 0x50;
 static const uint8_t CURRENT_TIME = 0x54;
-static const uint8_t CURRENT_TEMP = 0x23; // Unconfirmed, this is just my suspicion based on observed data
+static const uint8_t KEYPAD_PING = 0x23;  // Observed recurring keypad keep-alive/ping traffic
+static const uint8_t KEYPAD_REGISTRATION = 0xA0;  // Keypad announce: [a0.address.00]; sent on power-up/reset
 static const uint8_t BOUNDARY = 0x7E;
 // static const uint8_t KEYPRESS = 0xD1; // This is from upstream, but doesn't get sent by arrowhead panels that I can see
 static const uint8_t KEYPRESS = 0xA1;
 static const uint8_t MEMORY_CLEAR = 0xD2;
-static const uint8_t PACKET_COMPLETE_MARKER = 0xFE; // This gets added after the boundary for keypad packets - signaling end of packet?
 
 // Keys 0 - 9 are 0-9
-static const uint8_t KEY_MEMORY = 11;
-static const uint8_t KEY_BYPASS = 15;
-static const uint8_t KEY_PROGRAM = 16;
-static const uint8_t KEY_ENTER = 17;
-static const uint8_t KEY_STAY = 0x0E; // Untested
-static const uint8_t KEY_ARM = 0x0D;
+static const uint8_t KEY_OUTPUT = 0x0A;   // 10
+static const uint8_t KEY_MEMORY = 0x0B;   // 11
+static const uint8_t KEY_ARM = 0x0D;      // 13
+static const uint8_t KEY_STAY = 0x0E;     // 14, untested
+static const uint8_t KEY_BYPASS = 0x0F;   // 15
+static const uint8_t KEY_PROGRAM = 0x10;  // 16
+static const uint8_t KEY_ENTER = 0x11;    // 17
 
 static const uint8_t BUFFER_LENGTH = 20;
 
 static const char *KEYS[18] = {"0", "1",     "2",      "3",       "4",   "5",    "6",      "7",       "8",
-                               "9", "PANIC", "MEMORY", "CONTROL", "ARM", "STAY", "BYPASS", "PROGRAM", "ENTER"};
+                               "9", "OUTPUT", "MEMORY", "CONTROL", "ARM", "STAY", "BYPASS", "PROGRAM", "ENTER"};
 
 static const uint8_t RESPONSE_TIME = 0x19;
 
@@ -93,14 +96,14 @@ class CrowAlarmPanelStore {
   uint8_t boundary_buffer_{0};
 
  public:
-  static const uint32_t BUS_IDLE_TIMEOUT_US = 5000;          // 5ms idle = bus free
-  static const uint32_t MIN_TX_INTERVAL_MS = 50;             // Min 50ms between TX
+  static const uint32_t BUS_IDLE_TIMEOUT_US = 180;           // Allow takeover between bit bursts
+  static const uint32_t MIN_TX_INTERVAL_MS = 5;              // Allow keypad-like key burst cadence (conservative)
   /**
-   * Minimum interval between falling edges to avoid glitches. The clock runs at ~1.2kHz,
-   * so we expect ~833μs between edges. Setting this to 700μs filters out most glitches while
-   * still allowing normal operation.
-   */
-  static const uint32_t MIN_FALLING_EDGE_INTERVAL_US = 700;  // Min 700μs between falling edges
+  * Minimum interval between falling edges to avoid glitches. The clock runs at ~1.2kHz, so we
+  * expect ~833us between edges. Keep this comfortably below that to filter bounce without
+  * dropping real edges.
+  */
+  static const uint32_t MIN_FALLING_EDGE_INTERVAL_US = 700;  // Filter bounce without dropping real edges
   static const uint32_t TX_START_TIMEOUT_US = 100000;        // 100ms to start TX
   static const uint32_t TX_BIT_TIMEOUT_US = 10000;           // 10ms between bits
 };
@@ -173,8 +176,6 @@ class CrowAlarmPanel : public Component {
   void arm_away();
   void arm_stay();
   void disarm(const std::string &code);
-  bool is_disarm_in_progress() const { return this->disarm_in_progress_; }
-  bool is_arm_in_progress() const { return this->arm_in_progress_; }
   bool is_armed() const;
 
   Trigger<uint8_t, std::vector<uint8_t>> *get_on_message_trigger() const { return this->on_message_trigger_; }
@@ -185,17 +186,6 @@ class CrowAlarmPanel : public Component {
 
  protected:
   CrowAlarmPanelKeypad find_keypad_(uint8_t address);
-  bool is_bus_idle_();
-
-  // Transmission methods (blocking)
-  void send_packet_blocking_(const std::vector<uint8_t> &packet);
-  bool wait_for_clock_edge_(bool wait_for_high, uint32_t timeout_us);
-  std::vector<uint8_t> keypress_queue_;
-  uint32_t last_keypress_sent_ms_{0};
-  bool disarm_in_progress_{false};
-  uint32_t disarm_started_ms_{0};
-  bool arm_in_progress_{false};
-  uint32_t arm_started_ms_{0};
 
   CrowAlarmPanelStore store_;
   InternalGPIOPin *clock_pin_;

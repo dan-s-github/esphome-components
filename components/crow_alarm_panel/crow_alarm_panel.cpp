@@ -1,6 +1,7 @@
 #include "crow_alarm_panel.h"
 #include "esphome/core/helpers.h"
 #include "esphome/core/log.h"
+#include "esphome/core/gpio.h"
 
 #define HIGH 1
 #define LOW 0
@@ -34,6 +35,45 @@ std::string binary_indices(uint8_t byte) {
     }
   }
   return str;
+}
+
+std::string keypad_label(const CrowAlarmPanelKeypad &keypad, uint8_t address) {
+  if (!keypad.name.empty()) {
+    return keypad.name;
+  }
+  return str_sprintf("Keypad 0x%02X", address);
+}
+
+const char *controller_status_profile(uint8_t flags) {
+  if (flags == 0x80) {
+    return "zone_activity";
+  }
+  if (flags == 0xC1) {
+    return "zones_clear";
+  }
+  if (flags & 0x80) {
+    return "zone_activity?";
+  }
+  if ((flags & 0xC1) == 0xC1) {
+    return "zones_clear?";
+  }
+  return "unclassified";
+}
+
+const char *controller_status_state(uint8_t flags) {
+  if (flags == 0x80) {
+    return "zone_active_or_transition";
+  }
+  if (flags == 0xC1) {
+    return "zones_clear";
+  }
+  if (flags & 0x80) {
+    return "zone_related?";
+  }
+  if ((flags & 0xC1) == 0xC1) {
+    return "zones_clear?";
+  }
+  return "unknown";
 }
 
 void IRAM_ATTR HOT CrowAlarmPanelStore::interrupt(CrowAlarmPanelStore *arg) {
@@ -150,9 +190,26 @@ void CrowAlarmPanel::loop() {
       this->store_.data_length = 0;
     }
 
-    ESP_LOGD(TAG, "Received data: [%02x.%s]", type, format_hex_pretty(data).c_str());
+    ESP_LOGV(TAG, "Received raw frame [%02x.%s]", type, format_hex_pretty(data).c_str());
 
     switch (type) {
+      case CONTROLLER_STATUS: {
+        if (data.size() < 5) {
+          ESP_LOGW(TAG, "Controller status too short, discarding");
+          break;
+        }
+        CrowAlarmPanelKeypad keypad = this->find_keypad_(data[0]);
+        std::string bits = binary_indices(data[2]);
+        if (bits.empty()) {
+          bits = "none";
+        }
+        ESP_LOGD(TAG, "[%s] Controller status: b1=0x%02X flags=0x%02X bits=%s b3=0x%02X b4=0x%02X profile:%s state:%s "
+                      "[%02x.%s]",
+                 keypad_label(keypad, data[0]).c_str(), data[1], data[2], bits.c_str(), data[3], data[4],
+                 controller_status_profile(data[2]), controller_status_state(data[2]), type,
+                 format_hex_pretty(data).c_str());
+        break;
+      }
       case OUTPUT_STATE:
         if (data.size() < 1) {
           ESP_LOGW(TAG, "Output state too short, discarding");
@@ -211,6 +268,10 @@ void CrowAlarmPanel::loop() {
         break;
       }
       case ARMED_STATE: {
+        if (data.size() < 2) {
+          ESP_LOGW(TAG, "Armed state too short, discarding");
+          break;
+        }
         if (armed_state_ != nullptr) {
           if (data[0] == 0x00 && data[1] == 0x01) {
             this->armed_state_->publish_state("arming");
@@ -236,6 +297,16 @@ void CrowAlarmPanel::loop() {
         }
         break;
       }
+      case OUTPUT_SELECT_ACK: {
+        if (data.empty()) {
+          ESP_LOGW(TAG, "Output-select ack too short, discarding");
+          break;
+        }
+        CrowAlarmPanelKeypad keypad = this->find_keypad_(data[0]);
+        ESP_LOGD(TAG, "[%s] Output-select ack [%02x.%s]", keypad_label(keypad, data[0]).c_str(), type,
+                 format_hex_pretty(data).c_str());
+        break;
+      }
       case KEYPRESS: {
         if (data.size() < 2) {
           ESP_LOGW(TAG, "Keypress too short, discarding");
@@ -247,7 +318,7 @@ void CrowAlarmPanel::loop() {
           break;
         }
         CrowAlarmPanelKeypad keypad = this->find_keypad_(data[0]);
-        ESP_LOGD(TAG, "Key %s (%d) pressed on %s [%02x.%s]", KEYS[key], key, keypad.name.c_str(), type,
+        ESP_LOGD(TAG, "[%s] Key %s (%d) pressed [%02x.%s]", keypad_label(keypad, data[0]).c_str(), KEYS[key], key, type,
                  format_hex_pretty(data).c_str());
         break;
       }
@@ -261,15 +332,27 @@ void CrowAlarmPanel::loop() {
           break;
         }
         const char *day_of_week = DAYS[data[0] - 1];
-        uint8_t mins = data[2];
-        uint8_t hour = data[1];
-        if (mins >= 60) {
-          hour = hour + (mins / 60);
-          mins = mins % 60;
+        uint16_t minutes_since_midnight = (static_cast<uint16_t>(data[1]) << 8) | data[2];
+        uint8_t hour = minutes_since_midnight / 60;
+        uint8_t minute = minutes_since_midnight % 60;
+        if (hour >= 24) {
+          ESP_LOGW(TAG, "Current time has invalid minutes-since-midnight value %u", minutes_since_midnight);
+          break;
         }
-        ESP_LOGV(TAG, "Date/Time %s 20%02d-%02d-%02d %02d:%02d:%02d", day_of_week, data[6], data[5], data[4], hour,
-                 mins, data[3]);
-        // ESP_LOGD(TAG, "[%s]", format_hex_pretty(data).c_str());
+        if (data[3] >= 60) {
+          ESP_LOGW(TAG, "Current time has invalid seconds value %u", data[3]);
+          break;
+        }
+        if (data[4] == 0 || data[4] > 31) {
+          ESP_LOGW(TAG, "Current time has invalid day-of-month value %u", data[4]);
+          break;
+        }
+        if (data[5] == 0 || data[5] > 12) {
+          ESP_LOGW(TAG, "Current time has invalid month value %u", data[5]);
+          break;
+        }
+        ESP_LOGD(TAG, "Controller time update: %s 20%02d-%02d-%02d %02d:%02d:%02d", day_of_week, data[6], data[5],
+                 data[4], hour, minute, data[3]);
         break;
       }
       case RESPONSE_TIME:
@@ -285,7 +368,8 @@ void CrowAlarmPanel::loop() {
           break;
         }
         CrowAlarmPanelKeypad keypad = this->find_keypad_(data[0]);
-        ESP_LOGD(TAG, "%s command [%02x.%s]", keypad.name.c_str(), type, format_hex_pretty(data).c_str());
+        ESP_LOGD(TAG, "[%s] Command [%02x.%s]", keypad_label(keypad, data[0]).c_str(), type,
+                 format_hex_pretty(data).c_str());
         break;
       }
       case KEYPAD_STATE: {
@@ -295,19 +379,46 @@ void CrowAlarmPanel::loop() {
         }
         CrowAlarmPanelKeypad keypad = this->find_keypad_(data[0]);
         if (data[1] == 00) {
-          ESP_LOGD(TAG, "%s in normal state [%02x.%s]", keypad.name.c_str(), type, format_hex_pretty(data).c_str());
+          ESP_LOGD(TAG, "[%s] In normal state [%02x.%s]", keypad_label(keypad, data[0]).c_str(), type,
+                   format_hex_pretty(data).c_str());
         } else if (data[1] == 02) {
-          ESP_LOGD(TAG, "%s in installer mode [%02x.%s]", keypad.name.c_str(), type, format_hex_pretty(data).c_str());
+          ESP_LOGD(TAG, "[%s] In installer mode [%02x.%s]", keypad_label(keypad, data[0]).c_str(), type,
+                   format_hex_pretty(data).c_str());
         } else if (data[1] == 03) {
           if (data.size() < 3) {
             ESP_LOGW(TAG, "Keypad programming state too short, discarding");
             break;
           }
-          ESP_LOGD(TAG, "%s programming %d [%02x.%s]", keypad.name.c_str(), data[2], type,
+          ESP_LOGD(TAG, "[%s] Programming %d [%02x.%s]", keypad_label(keypad, data[0]).c_str(), data[2], type,
                    format_hex_pretty(data).c_str());
         } else {
-          ESP_LOGD(TAG, "%s state unknown [%02x.%s]", keypad.name.c_str(), type, format_hex_pretty(data).c_str());
+          ESP_LOGD(TAG, "[%s] State unknown [%02x.%s]", keypad_label(keypad, data[0]).c_str(), type,
+                   format_hex_pretty(data).c_str());
         }
+        break;
+      }
+      case KEYPAD_PING: {
+        if (data.empty()) {
+          ESP_LOGW(TAG, "Keypad ping too short, discarding");
+          break;
+        }
+        CrowAlarmPanelKeypad keypad = this->find_keypad_(data[0]);
+        ESP_LOGD(TAG, "[%s] Ping [%02x.%s]", keypad_label(keypad, data[0]).c_str(), type,
+                 format_hex_pretty(data).c_str());
+        break;
+      }
+      case KEYPAD_REGISTRATION: {
+        if (data.empty()) {
+          ESP_LOGW(TAG, "Keypad registration too short, discarding");
+          break;
+        }
+        CrowAlarmPanelKeypad keypad = this->find_keypad_(data[0]);
+        ESP_LOGD(TAG, "[%s] Registration [%02x.%s]", keypad_label(keypad, data[0]).c_str(), type,
+                 format_hex_pretty(data).c_str());
+        // Other keypads re-registering indicates a controller reset. We intentionally do NOT
+        // re-register here: if 0x05 is not pre-programmed in the controller, registering causes
+        // a crash loop (controller adds 0x05 to polls, we can't respond inline, crash repeats).
+        // Users who have 0x05 programmed in the controller will see it work correctly on boot.
         break;
       }
       case SETTING_VALUE: {
@@ -354,220 +465,30 @@ void CrowAlarmPanel::loop() {
     }
     this->on_message_trigger_->trigger(type, data);
   }
-
-  // Send queued keypresses without blocking the caller that enqueued them
-  if (!this->keypress_queue_.empty() && this->is_bus_idle_()) {
-    const uint32_t now_ms = millis();
-    if (now_ms - this->last_keypress_sent_ms_ >= 500) {
-      uint8_t key = this->keypress_queue_.front();
-      this->keypress_queue_.erase(this->keypress_queue_.begin());
-      ESP_LOGD(TAG, "Sending queued keypress: %s (%d)", KEYS[key], key);
-      this->keypress(key);
-      this->last_keypress_sent_ms_ = now_ms;
-      
-      // Clear disarm flag when ENTER is sent during a disarm operation
-      if (key == KEY_ENTER && this->disarm_in_progress_) {
-        this->disarm_in_progress_ = false;
-        this->arm_in_progress_ = false;  // Also clear arm flag since disarm completes any arm operation
-        ESP_LOGD(TAG, "Disarm sequence completed, clearing disarm and arm flags");
-      }
-      
-      // Clear arm flag when ARM or STAY keys are sent during an arm operation
-      if ((key == KEY_ARM || key == KEY_STAY) && this->arm_in_progress_) {
-        this->arm_in_progress_ = false;
-        this->disarm_in_progress_ = false;  // Also clear disarm flag since arm completes any disarm operation
-        ESP_LOGD(TAG, "Arm sequence completed, clearing arm and disarm flags");
-      }
-    }
-  }
-  
-  // Timeout protection: Clear disarm flag if it's been too long (30 seconds)
-  if (this->disarm_in_progress_ && (millis() - this->disarm_started_ms_ > 30000)) {
-    ESP_LOGW(TAG, "Disarm timeout reached, clearing disarm flag");
-    this->disarm_in_progress_ = false;
-  }
-  
-  // Timeout protection: Clear arm flag if it's been too long (30 seconds)
-  if (this->arm_in_progress_ && (millis() - this->arm_started_ms_ > 30000)) {
-    ESP_LOGW(TAG, "Arm timeout reached, clearing arm flag");
-    this->arm_in_progress_ = false;
-  }
-}
-
-bool CrowAlarmPanel::is_bus_idle_() {
-  // Check if we're currently inside a message
-  if (this->store_.inside_) {
-    ESP_LOGV(TAG, "Bus not idle: inside message boundary");
-    return false;
-  }
-
-  // Check if data line is pulled low (someone is transmitting)
-  // Data line pulls high when idle, so low means active transmission
-  if (!this->data_pin_->digital_read()) {
-    ESP_LOGV(TAG, "Bus not idle: data line is low (active transmission)");
-    return false;
-  }
-
-  // Check minimum interval since last transmission (anti-spam)
-  uint32_t now_ms = millis();
-  uint32_t time_since_tx = now_ms - this->store_.last_transmission_time_;
-
-  if (time_since_tx < CrowAlarmPanelStore::MIN_TX_INTERVAL_MS) {
-    ESP_LOGV(TAG, "Bus not idle: only %ums since last TX (need %ums)", time_since_tx,
-             CrowAlarmPanelStore::MIN_TX_INTERVAL_MS);
-    return false;
-  }
-
-  ESP_LOGV(TAG, "Bus is idle: not inside message, data line high, %ums since last TX", time_since_tx);
-  return true;
-}
-
-/**
- * @brief Wait for the clock pin to reach the desired state, with timeout.
- * @return true if the desired state was reached, false on timeout.
- */
-bool CrowAlarmPanel::wait_for_clock_edge_(bool wait_for_state, uint32_t timeout_us) {
-  const uint32_t start = micros();
-  while (this->clock_pin_->digital_read() != wait_for_state) {
-    if (micros() - start >= timeout_us) {
-      return false;
-    }
-    delayMicroseconds(10);  // Yield to watchdog/WiFi
-  }
-  return true;
-}
-
-/**
- * @brief Send a packet over the Crow alarm panel bus, blocking until complete.
- */
-void IRAM_ATTR CrowAlarmPanel::send_packet_blocking_(const std::vector<uint8_t> &packet) {
-  InterruptLock lock;
-
-  // Convert bytes to bits (LSB first)
-  bool bits[200];
-  uint16_t bit_count = 0;
-  for (uint8_t byte : packet) {
-    for (uint8_t j = 0; j < 8; j++) {
-      bits[bit_count++] = (byte >> j) & 1;
-    }
-  }
-
-  // Wait for a full clock cycle to hopefully synchronize better
-  if (!this->wait_for_clock_edge_(HIGH, CrowAlarmPanelStore::TX_START_TIMEOUT_US) ||
-      !this->wait_for_clock_edge_(LOW, CrowAlarmPanelStore::TX_START_TIMEOUT_US) ||
-      !this->wait_for_clock_edge_(HIGH, CrowAlarmPanelStore::TX_START_TIMEOUT_US)) {
-    // Release data pin back to input (idle high via panel pull-up) before bailing
-    this->data_pin_->pin_mode(gpio::FLAG_INPUT);
-    return;
-  }
-
-  // Transmit each bit on clock falling edge
-  for (uint16_t i = 0; i < bit_count; i++) {
-    // Drive the next bit before the falling edge so the panel samples the correct value.
-    // Use open-drain style: pull low for 0, release (input) for 1 to avoid fighting the panel.
-    if (bits[i]) {
-      this->data_pin_->pin_mode(gpio::FLAG_INPUT);  // release line for logic high
-    } else {
-      this->data_pin_->pin_mode(gpio::FLAG_OUTPUT);
-      this->data_pin_->digital_write(LOW);  // actively pull low for 0
-    }
-
-    // Wait for falling edge to ensure the panel has sampled the bit
-    if (!this->wait_for_clock_edge_(LOW, CrowAlarmPanelStore::TX_BIT_TIMEOUT_US)) {
-      break;
-    }
-
-    // Wait for rising edge before next bit. This prevents the line from releasing high too early
-    if (!this->wait_for_clock_edge_(HIGH, CrowAlarmPanelStore::TX_BIT_TIMEOUT_US)) {
-      break;
-    }
-  }
-
-  // Release data pin back to input (idle high via panel pull-up)
-  this->data_pin_->pin_mode(gpio::FLAG_INPUT);
-
-  // Track last transmission time
-  this->store_.last_transmission_time_ = millis();
 }
 
 void CrowAlarmPanel::arm_away() {
-  if (this->arm_in_progress_) {
-    ESP_LOGW(TAG, "Arm operation already in progress, ignoring new arm request");
-    return;
-  }
-  
-  ESP_LOGD(TAG, "Arm away");
-  this->arm_in_progress_ = true;
-  this->arm_started_ms_ = millis();
-  this->keypress(KEY_ARM);
+  ESP_LOGW(TAG, "arm_away: TX disabled in listen-only mode");
 }
 
 void CrowAlarmPanel::arm_stay() {
-  if (this->arm_in_progress_) {
-    ESP_LOGW(TAG, "Arm operation already in progress, ignoring new arm request");
-    return;
-  }
-  
-  ESP_LOGD(TAG, "Arm stay");
-  this->arm_in_progress_ = true;
-  this->arm_started_ms_ = millis();
-  this->keypress(KEY_STAY);
+  ESP_LOGW(TAG, "arm_stay: TX disabled in listen-only mode");
 }
 
 void CrowAlarmPanel::disarm(const std::string &code) {
-  if (!this->is_armed()) {
-    ESP_LOGW(TAG, "Cannot disarm - alarm is not armed (current state: %s)", 
-             this->armed_state_ ? this->armed_state_->state.c_str() : "unknown");
-    return;
-  }
-  
-  if (this->disarm_in_progress_) {
-    ESP_LOGW(TAG, "Disarm already in progress, ignoring new disarm request");
-    return;
-  }
-  
-  ESP_LOGD(TAG, "Disarm with code (queued)");
-  this->disarm_in_progress_ = true;
-  this->disarm_started_ms_ = millis();
-  for (char c : code) {
-    if (c >= '0' && c <= '9') {
-      this->keypress_queue_.push_back(c - '0');
-    }
-  }
-  this->keypress_queue_.push_back(KEY_ENTER);
+  ESP_LOGW(TAG, "disarm: TX disabled in listen-only mode");
 }
 
-void CrowAlarmPanel::set_output(uint8_t output, bool state) {}
+void CrowAlarmPanel::set_output(uint8_t output, bool state) {
+  ESP_LOGW(TAG, "set_output(%u, %s): TX disabled in listen-only mode", output, state ? "on" : "off");
+}
 
 void CrowAlarmPanel::send_packet(uint8_t type, const std::vector<uint8_t> &data) {
-  // Build packet with boundaries
-  std::vector<uint8_t> packet;
-  packet.push_back(BOUNDARY);  // Start boundary
-  packet.push_back(type);
-  packet.push_back(this->keypad_address_);
-  packet.insert(packet.end(), data.begin(), data.end());
-  packet.push_back(BOUNDARY);                // End boundary
-  packet.push_back(PACKET_COMPLETE_MARKER);  // Explicit end marker
-
-  // Check if bus is idle
-  while (!this->is_bus_idle_()) {
-    ESP_LOGI(TAG, "Waiting for bus to become idle before sending packet...");
-    delay(10); // Each packet takes around 30ms to fully send
-    yield();
-  }
-
-  ESP_LOGI(TAG, "Sending packet: [%s]", format_hex_pretty(packet).c_str());
-
-  // Send it (blocks until complete)
-  this->send_packet_blocking_(packet);
-
-  ESP_LOGI(TAG, "Packet sent");
+  ESP_LOGW(TAG, "send_packet(0x%02x): TX disabled in listen-only mode", type);
 }
 
 void CrowAlarmPanel::keypress(uint8_t key) {
-  ESP_LOGD(TAG, "Keypress: %s (%d)", KEYS[key], key);
-  std::vector<uint8_t> data = {key};
-  this->send_packet(KEYPRESS, data);
+  ESP_LOGW(TAG, "keypress(%s): TX disabled in listen-only mode", KEYS[key]);
 }
 
 bool CrowAlarmPanel::is_armed() const {
