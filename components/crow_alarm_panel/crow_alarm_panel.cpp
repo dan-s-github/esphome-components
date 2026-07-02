@@ -143,14 +143,19 @@ void IRAM_ATTR HOT CrowAlarmPanelStore::interrupt(CrowAlarmPanelStore *arg) {
       arg->inside_ = false;
       arg->num_bits_ = 0;
       arg->data = false;
-      // Hardware ACK: drive DAT low for one clock cycle if this frame is addressed to us.
-      // buffer2[0]=type, buffer2[1]=addr, buffer2[data_length-1]=end boundary (0x7E).
-      // data_length >= 3 ensures both type and addr bytes are present.
-      if (arg->data_length >= 3 && arg->buffer2[1] == arg->ack_keypad_address_) {
-        arg->data_pin_.pin_mode(gpio::FLAG_OUTPUT);
-        arg->data_pin_.digital_write(0);
-        arg->ack_set_time_us_ = now;
-        arg->ack_pending_ = true;
+      // Hardware ACK: drive DAT low for one clock cycle only for per-keypad frame types
+      // addressed to us. Broadcast frame payload bytes must never be treated as an address.
+      // buffer2[0]=type, buffer2[1]=addr (for addressed types), buffer2[data_length-1]=0x7E.
+      if (arg->data_length >= 3) {
+        const uint8_t type = arg->buffer2[0];
+        const bool addressed_type = (type == KEYPAD_COMMAND || type == KEYPAD_STATE || type == OUTPUT_SELECT_ACK ||
+                                     type == KEYPAD_PING);
+        if (addressed_type && arg->buffer2[1] == arg->ack_keypad_address_) {
+          arg->data_pin_.pin_mode(gpio::FLAG_OUTPUT);
+          arg->data_pin_.digital_write(0);
+          arg->ack_set_time_us_ = now;
+          arg->ack_pending_ = true;
+        }
       }
       return;
     } else if (arg->num_bits_ >= BUFFER_LENGTH * 8) {
@@ -273,14 +278,21 @@ void CrowAlarmPanel::loop() {
       case ZONE_STATE: {
         if (data.size() < 6) {
           ESP_LOGW(TAG, "Zone state invalid length, discarding");
-          return;
+          break;
         }
         ESP_LOGD(TAG, "Zone state received [%s]", format_hex_pretty(data).c_str());
         bool clear = true;
         for (CrowAlarmPanelZone zone : this->zones_) {
-          bool triggered = ((data[1] >> (zone.zone - 1)) & 0x01);
-          bool triggered_alarmed = ((data[2] >> (zone.zone - 1)) & 0x01);
-          bool bypassed = ((data[3] >> (zone.zone - 1)) & 0x01);
+          const uint8_t zone_index = zone.zone - 1;
+          const uint8_t bit_mask = static_cast<uint8_t>(1U << (zone_index % 8));
+          const bool high_bank = zone_index >= 8;
+          const size_t active_idx = high_bank ? 4 : 1;
+          const size_t alarmed_idx = high_bank ? 5 : 2;
+          const size_t bypassed_idx = high_bank ? 6 : 3;
+
+          bool triggered = (active_idx < data.size()) && ((data[active_idx] & bit_mask) != 0);
+          bool triggered_alarmed = (alarmed_idx < data.size()) && ((data[alarmed_idx] & bit_mask) != 0);
+          bool bypassed = (bypassed_idx < data.size()) && ((data[bypassed_idx] & bit_mask) != 0);
 
           if (zone.motion_binary_sensor != nullptr) {
             zone.motion_binary_sensor->publish_state(triggered | triggered_alarmed);

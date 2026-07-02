@@ -255,10 +255,10 @@ class CrowAlarmPanel : public Component {
   uint8_t arm_disarm_terminal_key_{KEY_ENTER};  // KEY_ENTER (disarm), KEY_ARM or KEY_STAY (arm-with-code)
 
   CrowAlarmPanelStore store_;
-  InternalGPIOPin *clock_pin_;
-  InternalGPIOPin *data_pin_;
-  uint8_t keypad_address_;
-  text_sensor::TextSensor *armed_state_;
+  InternalGPIOPin *clock_pin_{nullptr};
+  InternalGPIOPin *data_pin_{nullptr};
+  uint8_t keypad_address_{0};
+  text_sensor::TextSensor *armed_state_{nullptr};
   alarm_control_panel::AlarmControlPanel *alarm_control_panel_{nullptr};
   Trigger<uint8_t, std::vector<uint8_t>> *on_message_trigger_{new Trigger<uint8_t, std::vector<uint8_t>>()};
 
@@ -273,12 +273,11 @@ class CrowAlarmControlPanel : public alarm_control_panel::AlarmControlPanel, pub
   uint32_t get_supported_features() const override {
     return alarm_control_panel::ACP_FEAT_ARM_AWAY | alarm_control_panel::ACP_FEAT_ARM_HOME;
   }
-  bool get_requires_code() const override { return this->requires_code_; }
+  bool get_requires_code() const override { return true; }
   bool get_requires_code_to_arm() const override { return this->requires_code_to_arm_; }
 
   void set_parent(CrowAlarmPanel *parent) { this->parent_ = parent; }
   void set_code(const std::string &code) { this->code_ = code; }
-  void set_requires_code(bool requires_code) { this->requires_code_ = requires_code; }
   void set_requires_code_to_arm(bool requires_code_to_arm) { this->requires_code_to_arm_ = requires_code_to_arm; }
 
  protected:
@@ -286,7 +285,6 @@ class CrowAlarmControlPanel : public alarm_control_panel::AlarmControlPanel, pub
 
   CrowAlarmPanel *parent_{nullptr};
   std::string code_;
-  bool requires_code_{true};
   bool requires_code_to_arm_{false};
 };
 

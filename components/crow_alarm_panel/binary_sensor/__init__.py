@@ -16,7 +16,7 @@ ZONE_SCHEMA = binary_sensor.binary_sensor_schema().extend(
     {
         cv.GenerateID(): cv.declare_id(BinarySensor),
         cv.GenerateID(CONF_CROW_ALARM_PANEL_ID): cv.use_id(CrowAlarmPanel),
-        cv.Optional(CONF_ZONE): cv.positive_int,
+        cv.Required(CONF_ZONE): cv.int_range(min=1, max=16),
     }
 ).extend(cv.COMPONENT_SCHEMA)
 

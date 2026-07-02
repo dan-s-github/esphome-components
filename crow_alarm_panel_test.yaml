@@ -36,14 +36,14 @@ external_components:
 crow_alarm_panel:
   clock_pin: GPIO18
   data_pin: GPIO19
-  address: 8
+  address: 7
 
   keypads:
     # Optional: label other keypads for logging
     - name: "Main Keypad"
       address: 0
     - name: "Control 4 Keypad"
-      address: 8
+      address: 7
 
   on_message:
     - lambda: |-
@@ -70,7 +70,6 @@ binary_sensor:
 alarm_control_panel:
   - platform: crow_alarm_panel
     name: "Crow Alarm"
-    requires_code: true
     requires_code_to_arm: false
 
 button:

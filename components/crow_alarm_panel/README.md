@@ -14,7 +14,7 @@ This example will just log every message it sees on the keypad bus.
 crow_alarm_panel:
   clock_pin: REPLACEME
   data_pin: REPLACEME
-  address: 8
+  address: 7
 
   on_message:
     - logger.log:

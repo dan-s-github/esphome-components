@@ -32,12 +32,12 @@ CONFIG_SCHEMA = cv.Schema(
         cv.GenerateID(): cv.declare_id(CrowAlarmPanel),
         cv.Required(CONF_CLOCK_PIN): pins.internal_gpio_input_pin_schema,
         cv.Required(CONF_DATA_PIN): pins.internal_gpio_input_pin_schema,
-        cv.Optional(CONF_ADDRESS): cv.int_range(min=0, max=8),
+        cv.Optional(CONF_ADDRESS): cv.int_range(min=0, max=7),
         cv.Optional(CONF_KEYPADS, default=[]): cv.ensure_list(
             cv.Schema(
                 {
                     cv.Required(CONF_NAME): cv.string,
-                    cv.Required(CONF_ADDRESS): cv.int_range(min=0, max=8),
+                    cv.Required(CONF_ADDRESS): cv.int_range(min=0, max=7),
                 }
             )
         ),
