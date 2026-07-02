@@ -62,7 +62,17 @@ enum class OutputSelectState : uint8_t {
   OUTPUT_PENDING,  // sent OUTPUT keypress, waiting for 0x1D ACK addressed to us
   AWAIT_COMMAND,   // got 0x1D, waiting for first 0x14 KEYPAD_COMMAND
   DIGIT_PENDING,   // sent a digit, waiting for 0x14 KEYPAD_COMMAND confirmation
+  ENTER_DELAY,     // all digits confirmed; waiting ~60 ms before sending ENTER so the
+                   // controller's output-fire broadcast clears the bus first
   ENTER_PENDING,   // sent ENTER, waiting for final 0x14 KEYPAD_COMMAND confirmation
+};
+
+enum class ArmDisarmState : uint8_t {
+  IDLE,
+  ARM_AWAY_PENDING,   // sent KEY_ARM (no code), waiting for KEYPAD_COMMAND
+  ARM_STAY_PENDING,   // sent KEY_STAY (no code), waiting for KEYPAD_COMMAND
+  CODE_DIGIT_PENDING, // sent a code digit (arm-with-code or disarm), waiting for KEYPAD_COMMAND
+  CODE_ENTER_PENDING, // sent terminal key (KEY_ARM/KEY_STAY/KEY_ENTER), waiting for KEYPAD_COMMAND
 };
 
 struct CrowAlarmPanelMessage {
@@ -109,6 +119,15 @@ class CrowAlarmPanelStore {
   // falling edge after driving DAT low for one clock cycle (~1 bus clock, ~416–833µs).
   uint8_t ack_keypad_address_{0};
   volatile bool ack_pending_{false};
+  // Timestamp (micros) when ack_pending_ was set. Used by loop() to release the ACK pin
+  // if the next clock edge never arrives (e.g. clock stops between packets).
+  volatile uint32_t ack_set_time_us_{0};
+  // Set true during send_packet_blocking_() so the ISR on the other core
+  // ignores clock edges caused by our own transmission.
+  volatile bool is_transmitting_{false};
+  // Set by ISR while is_transmitting_ is true; cleared on the first edge after
+  // transmission ends so the ISR can reset its mid-packet receive state cleanly.
+  volatile bool was_transmitting_{false};
 
   static const uint32_t BUS_IDLE_TIMEOUT_US = 180;           // Allow takeover between bit bursts
   static const uint32_t MIN_TX_INTERVAL_MS = 5;              // Allow keypad-like key burst cadence (conservative)
@@ -120,6 +139,14 @@ class CrowAlarmPanelStore {
   static const uint32_t MIN_FALLING_EDGE_INTERVAL_US = 700;  // Filter bounce without dropping real edges
   static const uint32_t TX_START_TIMEOUT_US = 100000;        // 100ms to start TX
   static const uint32_t TX_BIT_TIMEOUT_US = 10000;           // 10ms between bits
+
+  // Delay between digit confirmation and sending ENTER in the output-select sequence.
+  // Real keypads wait for the user to press ENTER (~100 ms after digit confirmation).
+  // Without this delay our ENTER TX overlaps the controller's KEYPAD_COMMAND [15]
+  // (exit output-select) reply, causing the ISR's was_transmitting_ reset to discard it.
+  // The controller then keeps the keypad stuck in "output-select mode", rejecting all
+  // subsequent KEY_OUTPUT attempts with KEYPAD_COMMAND [07].
+  static const uint32_t OUTPUT_SELECT_ENTER_DELAY_MS = 60;
 };
 
 struct CrowAlarmPanelZone {
@@ -187,8 +214,8 @@ class CrowAlarmPanel : public Component {
   }
   void register_alarm_control_panel(alarm_control_panel::AlarmControlPanel *acp) { this->alarm_control_panel_ = acp; }
 
-  void arm_away();
-  void arm_stay();
+  void arm_away(const std::string &code = "");
+  void arm_stay(const std::string &code = "");
   void disarm(const std::string &code);
   bool is_armed() const;
 
@@ -201,6 +228,7 @@ class CrowAlarmPanel : public Component {
  protected:
   CrowAlarmPanelKeypad find_keypad_(uint8_t address);
   bool is_bus_idle_();
+  void start_code_sequence_(const std::string &code, uint8_t terminal_key);
 
   void send_packet_blocking_(const std::vector<uint8_t> &packet);
   bool wait_for_clock_edge_(bool wait_for_state, uint32_t timeout_us);
@@ -209,11 +237,22 @@ class CrowAlarmPanel : public Component {
   bool registration_sent_{false};
   uint32_t registration_after_ms_{15000};
 
+  // Watchdog: track last time the controller polled us; re-register if silent for 60 s.
+  uint32_t last_ping_ms_{0};
+
   // Output-select state machine.
   OutputSelectState output_select_state_{OutputSelectState::IDLE};
   uint32_t output_select_state_enter_ms_{0};
   std::vector<uint8_t> output_select_keys_;  // digit(s) to send, consumed one per KEYPAD_COMMAND
   uint8_t output_select_key_idx_{0};
+  uint8_t output_select_retry_count_{0};  // max 1 automatic retry before aborting
+
+  // Arm/disarm state machine.
+  ArmDisarmState arm_disarm_state_{ArmDisarmState::IDLE};
+  uint32_t arm_disarm_state_enter_ms_{0};
+  std::vector<uint8_t> arm_disarm_code_digits_;  // code digits consumed one per KEYPAD_COMMAND
+  uint8_t arm_disarm_code_idx_{0};
+  uint8_t arm_disarm_terminal_key_{KEY_ENTER};  // KEY_ENTER (disarm), KEY_ARM or KEY_STAY (arm-with-code)
 
   CrowAlarmPanelStore store_;
   InternalGPIOPin *clock_pin_;

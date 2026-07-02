@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Custom ESPHome components"
 requires-python = ">=3.11,<3.14"
 dependencies = [
-    "esphome>=2026.3.0",
+    "esphome>=2026.6.2",
     "littlefs-python>=0.17.1",
     "fatfs-ng>=0.1.15",
 ]
