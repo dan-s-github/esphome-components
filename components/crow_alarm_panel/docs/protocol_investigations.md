@@ -172,3 +172,36 @@
 [12:46:38.461][D][crow_alarm_panel:334]: [Control 4 Keypad] Poll [23.06.03.8C.02.01.00.23.0E (8)]
 [12:46:38.564][D][crow_alarm_panel:334]: [IP Keypad] Poll [23.07.03.8C.02.01.00.23.0E (8)]
 ```
+
+### Snippet 5 (Control4 + ESPHome ARM/DISARM with arming delay, logs-25)
+
+```sh
+[07:22:24.859][D][crow_alarm_panel:356]: [Control 4 Keypad] Key ARM (13) pressed [a1.06.0D]
+[07:22:24.905][D][crow_alarm_panel:312]: Arming [11.00.01.00.00]
+[07:22:49.230][D][crow_alarm_panel:405]: [Control 4 Keypad] Command [14.06.AA.00.00.01.80 (6)]
+[07:22:53.121][D][crow_alarm_panel:318]: Armed Away [11.01.00.00.00]
+
+[07:23:09.642][D][crow_alarm_panel:356]: [Control 4 Keypad] Key <redacted digit> pressed [a1.06.XX]
+[07:23:09.813][D][crow_alarm_panel:356]: [Control 4 Keypad] Key <redacted digit> pressed [a1.06.XX]
+[07:23:09.834][D][crow_alarm_panel:356]: [Control 4 Keypad] Key <redacted digit> pressed [a1.06.XX]
+[07:23:10.018][D][crow_alarm_panel:356]: [Control 4 Keypad] Key <redacted digit> pressed [a1.06.XX]
+[07:23:10.120][D][crow_alarm_panel:356]: [Control 4 Keypad] Key ENTER (17) pressed [a1.06.11]
+[07:23:10.222][D][crow_alarm_panel:330]: Disarmed [11.00.00.00.00]
+
+[07:23:52.514][D][crow_alarm_panel:356]: [ESPHome Keypad] Key ARM (13) pressed [a1.05.0D]
+[07:23:52.616][D][crow_alarm_panel:312]: Arming [11.00.01.00.00]
+[07:24:17.229][D][crow_alarm_panel:405]: [ESPHome Keypad] Command [14.05.AA.00.08.01.80 (6)]
+[07:24:21.083][D][crow_alarm_panel:318]: Armed Away [11.01.00.00.00]
+
+[07:24:29.281][D][crow_alarm_panel:356]: [ESPHome Keypad] Key <redacted digit> pressed [a1.05.XX]
+[07:24:29.384][D][crow_alarm_panel:356]: [ESPHome Keypad] Key <redacted digit> pressed [a1.05.XX]
+[07:24:29.501][D][crow_alarm_panel:356]: [ESPHome Keypad] Key <redacted digit> pressed [a1.05.XX]
+[07:24:29.618][D][crow_alarm_panel:356]: [ESPHome Keypad] Key <redacted digit> pressed [a1.05.XX]
+[07:24:29.789][D][crow_alarm_panel:356]: [ESPHome Keypad] Key ENTER (17) pressed [a1.05.11]
+[07:24:29.890][D][crow_alarm_panel:330]: Disarmed [11.00.00.00.00]
+```
+
+Notes:
+- Both Control4 and ESPHome keypads show ~28s arming delay between `Arming` and `Armed Away`.
+- `0x14 ... AA ...` appears during this delay on both keypads, consistent with a countdown/exit-delay marker.
+- Disarm remains code-entry + ENTER; captured code samples are intentionally redacted.

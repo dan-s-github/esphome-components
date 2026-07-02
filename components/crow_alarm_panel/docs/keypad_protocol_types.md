@@ -117,13 +117,31 @@ Total code-entry time: 1,558ms
 
 ### 3. Control4 Keypad (Address 0x06)
 **Status:** 
-Not yet directly tested by user traces, but appears in logs-3 and logs-5 as background activity.
+Output-select and arm/disarm sequences are now captured (`esphome-aap-keypad-monitor-logs-25.txt`).
 
-**Observations from Command broadcasts:**
-- Receives Command messages during arm/disarm broadcasts
-- Responds with polls in regular intervals
-- Protocol likely identical to IP or AAP
-- Address 0x06 suggests intermediate keypad type
+**Observations:**
+- OUTPUT-select confirmed working: KEY_OUTPUT → digit → KEY_ENTER, same sequence as IP keypad
+- ARM (away) is direct: KEY_ARM enters arming state, then delayed armed-away transition
+- DISARM requires code entry + ENTER (captured code redacted)
+- During arming countdown, keypad receives `Command [14.06.AA.00.00.01.80]` before final armed-away state
+- Protocol appears identical to IP keypad for output-select and code-entry command gating
+- Address 0x06 confirmed
+
+#### ARM_AWAY + DISARM with code (from logs-25)
+```text
+07:22:24.859  [Control 4 Keypad] Key ARM (13) pressed [a1.06.0D]
+07:22:24.905  → Arming [11.00.01.00.00]
+07:22:49.230  [Control 4 Keypad] Command [14.06.AA.00.00.01.80]
+07:22:53.121  → Armed Away [11.01.00.00.00]
+
+07:23:09.xxx  Key <digit>
+07:23:09.xxx  Key <digit>
+07:23:09.xxx  Key <digit>
+07:23:10.xxx  Key <digit>
+07:23:10.120  Key ENTER
+07:23:10.222  → Disarmed [11.00.00.00.00]
+```
+**Arming delay:** ~28.2s from arming start to armed-away.
 
 ---
 
@@ -143,6 +161,8 @@ Each key press sends: `[14.XX.01.00.08.01.80]` (address XX, code "01" = entering
 | IP Keypad (0x07) | Sample 1234 | ~610ms | ~100ms | ~710ms |
 | AAP Keypad (0x00) | Sample 1234 | ~1,460ms | ~100ms | ~1,560ms |
 | AAP Keypad (0x00) | 5-digit (error) | ~2,140ms | 14,155ms ⚠️ | ~16,295ms |
+| Control4 (0x06) | Sample (redacted, 4-digit) | ~478ms | ~102ms | ~580ms |
+| ESPHome Keypad (0x05) | Sample (redacted, 4-digit) | ~508ms | ~101ms | ~609ms |
 
 The AAP error case (5 digits) shows controller validation timeout:
 - Code length mismatch (5 instead of 4 digits)
@@ -181,50 +201,37 @@ All keypads receive:
 
 ## Implications for ESPHome Keypad (Address 0x05)
 
-The ESPHome keypad should support:
+Current implementation supports:
 
-1. **Direct arm/disarm** like AAP (single keypress option for users)
-   - `arm_away()` → send KEY_ARM
-   - `disarm()` → send KEY_ARM again (toggle behavior)
+1. **Direct arm/disarm** like AAP (single keypress, no code required)
+   - `arm_away()` → sends KEY_ARM (→ ARM_AWAY_PENDING state)
+   - `arm_stay()` → sends KEY_STAY (→ ARM_STAY_PENDING state)
 
-2. **Code-based arm/disarm** like IP (for users wanting passcode protection)
-   - `arm_away()` → send digit sequence + ENTER
-   - `disarm(code)` → send digit sequence + ENTER
+2. **Code-based arm** like IP (code + terminal key)
+   - `arm_away(code)` → code digits + KEY_ARM
+   - `arm_stay(code)` → code digits + KEY_STAY
 
-3. **OUTPUT-select** like IP (for users with remote output control)
-   - Sequence: OUTPUT → digit → ENTER (full lock-step state machine)
+3. **Code-based disarm** (code always required — no no-code toggle path)
+   - `disarm(code)` → code digits + KEY_ENTER
 
-4. **Multi-keypad state sync**
-   - Receive Command broadcasts from other keypads
-   - Update local display/UI based on state changes from any keypad
-   - Never interfere with other keypad sequences (no collision)
+4. **OUTPUT-select** like IP (full lock-step state machine)
+   - `set_output(n, state)` → KEY_OUTPUT → digits → KEY_ENTER
+
+5. **Multi-keypad state sync**
+   - Receives Command broadcasts from other keypads
+   - Updates state from ARMED_STATE (0x11) and ZONE_STATE (0x12) messages
 
 ---
 
-## Recommendations
+## Current Status
 
-### Immediate (HIGH PRIORITY)
-1. **Implement state machines** for OUTPUT and ARM/DISARM to prevent cascading ACKs
-   - OUTPUT: lock-step synchronization (OUTPUT → ACK → CMD → DIGIT → CMD → ENTER → CMD)
-   - ARM: direct single-key option + code-entry option with Command gating
+All three state machines (output-select, arm/disarm direct, arm/disarm code-sequence) are
+implemented with Command-gating and 1 s watchdog timeouts.
 
-2. **Fix cascading ACK issue** on ESPHome keypad
-   - Root cause: queuing keypresses faster than controller can process
-   - Fix: gate keypress queue on message responses, not on timer
-
-3. **Optimize inter-digit timing**
-   - Current code: 500ms (too slow, 5-10x slower than real hardware)
-   - Target: 100–150ms per digit based on Command receipt timing
-
-### Medium Priority
-1. **Add direct-ARM option** to C++ implementation (toggle ARM/DISARM without code)
-2. **Capture Control4 keypad traces** for protocol verification
-3. **Test AAP code-entry issue** (why does 5-digit code cause 14s delay?)
-
-### Documentation
-1. Update integration README with keypad-type behaviors
-2. Document configuration options: direct-arm vs code-based vs OUTPUT support per keypad type
-3. Add state machine diagrams to protocol docs
+### Open questions
+1. **Confirm `0xAA` semantics** — observed during arming countdown on multiple keypads; likely exit-delay/countdown indicator
+2. **Verify `0x7E` in payload** — no payload byte equal to `0x7E` has been observed; unknown whether the protocol reserves this value or byte-stuffing exists for unseen message types
+3. **Capture Armed-Stay state encoding** — `0x11` armed_stay variant has not been observed (assumed to use a fourth `armed`/`arming` byte combination)
 
 ---
 
@@ -232,7 +239,7 @@ The ESPHome keypad should support:
 
 | File | Keypad | Content |
 |------|--------|---------|
-| esphome-aap-keypad-monitor-logs-3.txt | IP (0x07) | ARM (4286), DISARM (4286), OUTPUT(4) |
+| esphome-aap-keypad-monitor-logs-3.txt | IP (0x07) | ARM (redacted code), DISARM (redacted code), OUTPUT(4) |
 | esphome-aap-keypad-monitor-logs-4.txt | AAP (0x00) | Direct ARM, immediate DISARM |
-| esphome-aap-keypad-monitor-logs-5.txt | AAP (0x00) | Direct ARM, then 57s later code-based DISARM (84421) with timing issues |
-
+| esphome-aap-keypad-monitor-logs-5.txt | AAP (0x00) | Direct ARM, then 57s later code-based DISARM (redacted 5-digit) with timing issues |
+| esphome-aap-keypad-monitor-logs-25.txt | Control4 (0x06), ESPHome (0x05) | Control4 ARM + 28s arming delay + code DISARM (redacted); ESPHome ARM + 28s arming delay + code DISARM (redacted) |

@@ -40,6 +40,17 @@ Each child platform is thin Python glue that looks up a parent instance via `cro
 
 `crow_alarm_panel_test.yaml` is the canonical end-to-end fixture for local validation. It uses `external_components` with `type: local` and `path: components`, so it exercises the repo the same way ESPHome users consume it during development.
 
+## Protocol documentation
+
+`components/crow_alarm_panel/docs/` contains detailed protocol reverse-engineering notes. Before modifying bus-level C++ code, consult:
+
+- `protocol_wire_format.md` — frame structure, bit encoding, boundary bytes
+- `arm_disarm_state_machine.md` / `output_select_state_machine.md` — state machine design rationale
+- `keypad_protocol_types.md` — packet type catalogue with known/inferred meanings
+- `protocol_investigations.md` — raw observations and open questions
+
+`traces/` holds CSV and raw captures used during reverse-engineering. Cross-reference these when interpreting ambiguous packet types.
+
 ## Key conventions
 
 - Treat the Python files under `components/crow_alarm_panel/**/__init__.py` as schema/codegen glue, not the place for protocol logic. Bus parsing, timing, queueing, and state transitions belong in the C++ implementation.
@@ -48,5 +59,6 @@ Each child platform is thin Python glue that looks up a parent instance via `cro
 - Arm/disarm flows are intentionally funneled through queued keypress logic in `CrowAlarmPanel` instead of sending packets directly from buttons or the alarm control panel. Preserve that pattern so bus-idle checks, spacing, and in-progress guards continue to work.
 - `CrowAlarmPanel::setup()` auto-adds a `"Virtual Keypad"` entry for the configured keypad address if it was not listed in YAML. Do not duplicate that behavior elsewhere; rely on the parent setup path for keypad-name fallback.
 - `AUTO_LOAD` and `MULTI_CONF = True` in the parent module are part of the integration shape. If you add or remove child platforms, keep `AUTO_LOAD`, the Python package layout, and the parent registration API in sync.
+- Child platform `to_code` functions are inconsistently styled: some use `async def` + `await` (`button`, `alarm_control_panel`), others use generator-style `yield` (`binary_sensor`, `text_sensor`, `switch`). New platforms should use `async def` + `await`; do not mix both styles in a single function.
 - This repository keeps Python tooling under `uv`, including `commitlint` in the `dev` dependency group. Prefer `uv run commitlint ...` instead of introducing separate Node-based commit-message tooling.
 - The repo includes a local `.pre-commit-config.yaml` commit-msg hook that shells out to `uv run commitlint --file`. If commit-message linting should run automatically, install it with `uv run pre-commit install --hook-type commit-msg`.

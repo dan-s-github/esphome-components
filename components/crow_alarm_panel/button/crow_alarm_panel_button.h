@@ -21,9 +21,9 @@ class CrowAlarmPanelButton : public button::Button, public Component {
      return;
    }
    if (this->button_type_ == "arm_away") {
-      this->parent_->arm_away();
+      this->parent_->arm_away(this->code_);
     } else if (this->button_type_ == "arm_stay") {
-      this->parent_->arm_stay();
+      this->parent_->arm_stay(this->code_);
     } else if (this->button_type_ == "disarm") {
       if (!this->parent_->is_armed()) {
         ESP_LOGW("crow_alarm_panel.button", "Cannot disarm - alarm is not armed");

@@ -4,7 +4,7 @@
 
 ARM, STAY, and DISARM sequences use a simpler model than OUTPUT-select: they are **fire-and-forget code sequences** where each digit waits for a Command response before the next digit is sent. Unlike OUTPUT, there are no ACK barriers or state confirmation requirements per digit—only a final state transition (ARMING → ARMED_AWAY, or ARMED_AWAY → DISARMED).
 
-This document derives the state machine from observed traces (real IP Keypad behavior).
+This document derives the state machine from observed traces (IP, AAP, Control4, and ESPHome keypad behavior).
 
 ## Sequences from Traces
 
@@ -66,51 +66,58 @@ This document derives the state machine from observed traces (real IP Keypad beh
 
 ## States for ARM/STAY/DISARM
 
+Enum: `ArmDisarmState` (`crow_alarm_panel.h`)
+
 ```
 IDLE
-├─ on keypress(ARM) or keypress(STAY) from button/API
-│  └─> ARM_PENDING (single keypress, no queue)
-├─ on disarm(code) from API
-│  └─> DISARM_DIGIT_PENDING (queue all code digits + ENTER)
+├─ on arm_away() / arm_stay() with no code
+│  └─> ARM_AWAY_PENDING / ARM_STAY_PENDING (single keypress sent)
+├─ on arm_away(code) / arm_stay(code) with non-empty code
+│  └─> CODE_DIGIT_PENDING (first digit sent immediately)
+├─ on disarm(code)
+│  └─> CODE_DIGIT_PENDING (first digit sent immediately)
 
-ARM_PENDING (waiting for Command after ARM keypress)
-├─ on Command(0x14) received
-│  └─> IDLE (state machine done; ARMED_STATE message follows separately)
+ARM_AWAY_PENDING / ARM_STAY_PENDING (KEY_ARM or KEY_STAY sent, waiting for Command)
+├─ on Command(0x14) addressed to us
+│  └─> IDLE (sequence done; ARMED_STATE 0x11 follows independently)
 ├─ on timeout (>1s)
 │  └─> IDLE (abort)
 
-STAY_PENDING (waiting for Command after STAY keypress)
-├─ on Command(0x14) received
-│  └─> IDLE
+CODE_DIGIT_PENDING (a code digit sent, waiting for Command)
+├─ on Command(0x14) addressed to us, more digits remain
+│  └─> CODE_DIGIT_PENDING (next digit sent immediately; no intermediate READY state)
+├─ on Command(0x14) addressed to us, no more digits
+│  └─> CODE_ENTER_PENDING (terminal key sent: KEY_ARM, KEY_STAY, or KEY_ENTER)
 ├─ on timeout (>1s)
-│  └─> IDLE
+│  └─> IDLE (abort)
 
-DISARM_DIGIT_PENDING (digit sent, waiting for Command)
-├─ on Command(0x14) received
-│  └─> DISARM_DIGIT_READY (ready for next digit or ENTER)
+CODE_ENTER_PENDING (terminal key sent, waiting for final Command)
+├─ on Command(0x14) addressed to us
+│  └─> IDLE (sequence done; ARMED_STATE 0x11 follows independently)
 ├─ on timeout (>1s)
-│  └─> IDLE (abort sequence)
+│  └─> IDLE (abort)
 
-DISARM_DIGIT_READY (can send next digit or ENTER)
-├─ on more digits queued
-│  └─> DISARM_DIGIT_PENDING (send next digit)
-├─ on ENTER queued
-│  └─> DISARM_ENTER_PENDING
-
-DISARM_ENTER_PENDING (ENTER sent, waiting for Command and state update)
-├─ on Command(0x14) received
-│  └─> IDLE (state machine done; ARMED_STATE message follows)
-├─ on timeout (>1s)
-│  └─> IDLE
-
-[Note: ARMED_STATE (0x11) messages and ARMED_STATE state updates happen automatically
-in the message handler; the state machine doesn't gate them. They confirm completion
-but don't control the sequence flow.]
+[Note: ARMED_STATE (0x11) messages are dispatched by the message handler independently;
+the state machine does not gate on them.]
 ```
+
+### Two paths per operation
+
+| Operation | No-code path | Code path |
+|---|---|---|
+| `arm_away()` | KEY_ARM → ARM_AWAY_PENDING | CODE_DIGIT_PENDING → … → CODE_ENTER_PENDING (terminal: KEY_ARM) |
+| `arm_stay()` | KEY_STAY → ARM_STAY_PENDING | CODE_DIGIT_PENDING → … → CODE_ENTER_PENDING (terminal: KEY_STAY) |
+| `disarm(code)` | not supported — code always required | CODE_DIGIT_PENDING → … → CODE_ENTER_PENDING (terminal: KEY_ENTER) |
+
+### Code validation
+
+`start_code_sequence_()` filters to numeric characters only and aborts if the result is
+empty. **No length validation is performed in the C++ code** — the controller enforces
+digit count (typically 4) and times out (~10 s) if the wrong number of digits is entered.
 
 ## Keypad Type Variations
 
-Based on trace analysis (logs-3 through logs-5), the ARM/DISARM state machine supports two implementations per keypad type:
+Based on trace analysis (logs-3 through logs-5 and logs-25), the ARM/DISARM state machine supports two implementations per keypad type:
 
 ### IP Keypad (Address 0x07) — Code-based only
 - ARM: Enter code → ENTER → Arming (~600ms)
@@ -124,22 +131,33 @@ Based on trace analysis (logs-3 through logs-5), the ARM/DISARM state machine su
 - **Code-based DISARM:** Enter code → ENTER → Disarming (~1.5s for 4 digits)
 - Code validation: Same as IP, timeout ~10s for invalid length
 
-### Implementation Note
-ESPHome keypad (0x05) should prioritize simplicity:
-1. **arm_away()** → Send KEY_ARM (direct, ~100ms)
-2. **disarm()** → Send KEY_ARM again (toggle, ~100ms)
-3. **disarm(code)** → Send code digits + ENTER (validated path, ~600-1500ms)
+### Control4 Keypad (Address 0x06) — Direct ARM + code DISARM
+- **Direct ARM:** Single KEY_ARM (0x0D) press → Arming
+- **Arming delay:** ~28.2s before ARMED_AWAY
+- **Countdown marker:** `Command [14.06.AA.00.00.01.80]` appears during the arming delay
+- **Code-based DISARM:** Enter code → ENTER → Disarming (captured sample redacted)
 
-Direct ARM/DISARM (single keypress) provides fastest and simplest user experience.
-Code-entry path available if controller requires authentication but less frequently used.
+### Implementation (ESPHome keypad, address 0x05)
+Current C++ implementation in `CrowAlarmPanel`:
+1. **arm_away() / arm_stay()** → Direct single keypress (no code), ~100ms
+2. **arm_away(code) / arm_stay(code)** → Code sequence + terminal key (KEY_ARM or KEY_STAY), ~600ms
+3. **disarm(code)** → Code sequence + KEY_ENTER, ~600ms (code is always required; no toggle path)
+
+Captured from `esphome-aap-keypad-monitor-logs-25.txt`:
+- **Arm:** `07:23:52.514` KEY_ARM (ESPHome keypad) → `07:23:52.616` Arming `[11.00.01.00.00]` → `07:24:17.229` `Command [14.05.AA.00.08.01.80]` → `07:24:21.083` Armed Away `[11.01.00.00.00]`
+- **Disarm with code:** `07:24:29.281..07:24:29.789` keys `<redacted>, ENTER` → `07:24:29.890` Disarmed `[11.00.00.00.00]`
+
+Direct ARM/DISARM (single keypress) provides fastest user experience.
+Code-entry path is available when the controller requires code authentication.
 
 ## Key Rules
 
 1. **Single command per keypress:** Each digit waits for Command(0x14) before allowing the next
-2. **Fire-and-forget for ARM/STAY:** Single keypress, no state machine after Command arrives
-3. **Code queue for DISARM:** All code digits are queued upfront, then sent one-by-one with Command gating
-4. **No ACK barrier:** Unlike OUTPUT, ARM/STAY/DISARM do not wait for ACK
-5. **Timeout recovery:** ~1s per state; if no Command received, abort to IDLE
+2. **Two paths for arm:** No-code → single keypress (ARM_AWAY_PENDING / ARM_STAY_PENDING); with code → code sequence (CODE_DIGIT_PENDING)
+3. **Code required for disarm:** `disarm()` always takes a code; there is no no-code toggle path
+4. **Shared code-sequence helper:** `start_code_sequence_(code, terminal_key)` handles arm-with-code and disarm identically; terminal key differs (KEY_ARM, KEY_STAY, or KEY_ENTER)
+5. **No ACK barrier:** Unlike OUTPUT, the code sequence does not wait for an ACK (0x1D)
+6. **Timeout recovery:** ~1s per state; if no Command received, abort to IDLE
 
 ## Timing Observations
 
@@ -149,90 +167,62 @@ Code-entry path available if controller requires authentication but less frequen
 | ENTER → Arming/Disarmed state | ~80–90ms |
 | State broadcast to other keypads | ~80–90ms |
 | Total sequence (4-digit code) | ~600–700ms |
+| Arming delay (logs-25, Control4 and ESPHome) | ~28.2–28.5s |
 
 ## Mapping to Current Code
 
-### Current Implementation (from crow_alarm_panel.cpp)
-```cpp
-void CrowAlarmPanel::arm_away() {
-  if (this->arm_in_progress_) return;
-  this->arm_in_progress_ = true;
-  this->arm_started_ms_ = millis();
-  this->keypress(KEY_ARM);  // Single keypress, sent immediately
-}
+State machine implemented in `crow_alarm_panel.cpp`. Key entry points:
 
-void CrowAlarmPanel::disarm(const std::string &code) {
-  if (this->disarm_in_progress_) return;
-  this->disarm_in_progress_ = true;
-  this->disarm_started_ms_ = millis();
-  for (char c : code) {
-    if (c >= '0' && c <= '9') {
-      this->keypress_queue_.push_back(c - '0');  // Queue digits
-    }
-  }
-  this->keypress_queue_.push_back(KEY_ENTER);  // Queue ENTER
-}
-
-// In loop()
-if (now_ms - this->last_keypress_sent_ms_ >= 500) {  // 500ms inter-keypress
-  uint8_t key = this->keypress_queue_.front();
-  this->keypress_queue_.erase(this->keypress_queue_.begin());
-  this->keypress(key);
-  this->last_keypress_sent_ms_ = now_ms;
-  
-  if (key == KEY_ENTER && this->disarm_in_progress_) {
-    this->disarm_in_progress_ = false;
-  }
-  if ((key == KEY_ARM || key == KEY_STAY) && this->arm_in_progress_) {
-    this->arm_in_progress_ = false;  // Clear flag after ARM sent
-  }
-}
-```
-
-### Issues with Current Code
-
-1. **500ms inter-keypress is too slow** — traces show ~100–110ms inter-digit
-2. **No Command-gating** — queue sends digits as fast as 500ms allows, ignoring Command responses
-3. **Flag cleared immediately** — `arm_in_progress_` cleared after KEY_ARM sent, not after Command received
-
-### Recommended Fix
-
-Use the same Command-gating as OUTPUT-select, but simpler (no ACK barrier):
-
-1. For ARM/STAY: Send single keypress, set flag, wait for Command, then clear flag
-2. For DISARM: Queue code digits, send first digit, set DIGIT_PENDING state, on each Command transition to DIGIT_READY and send next, until ENTER sent and final Command received
+- `arm_away(code)` / `arm_stay(code)` — selects direct or code path, sets initial state, sends first keypress
+- `arm_disarm_state_machine` driven in `loop()` under `case KEYPAD_COMMAND:` — transitions on each command addressed to our keypad address
+- `start_code_sequence_(code, terminal_key)` — shared helper for arm-with-code and disarm; sets `CODE_DIGIT_PENDING` and sends first digit immediately (idx=1 pre-advanced before the first keypress to avoid re-entry during `send_packet()` delays)
+- Watchdog in `loop()`: any non-IDLE state that exceeds 1 s without a `KEYPAD_COMMAND` aborts to IDLE
 
 ## Test Scenarios
 
-### Scenario 1: Arm Away
+### Scenario 1: Arm Away (no code)
 ```
 User calls: arm_away()
-→ state = ARM_PENDING, send KEY_ARM (0x0D)
+→ state = ARM_AWAY_PENDING, send KEY_ARM (0x0D)
   ↓ (after Command received ~100ms)
 → state = IDLE, wait for ARMED_STATE message to confirm
 ```
 
-### Scenario 2: Disarm with code "1234"
+### Scenario 2: Arm Away (with a 4-digit code)
 ```
-User calls: disarm("1234")
-→ state = DISARM_DIGIT_PENDING, send digit 1
+User calls: arm_away("<code>")
+→ state = CODE_DIGIT_PENDING, send digit 1
   ↓ (after Command received ~100ms)
-→ state = DISARM_DIGIT_READY, send digit 2
+→ CODE_DIGIT_PENDING: send digit 2
   ↓ (after Command received ~100ms)
-→ state = DISARM_DIGIT_READY, send digit 3
+→ CODE_DIGIT_PENDING: send digit 3
   ↓ (after Command received ~100ms)
-→ state = DISARM_DIGIT_READY, send digit 4
+→ CODE_DIGIT_PENDING: send digit 4, then terminal key KEY_ARM
+→ state = CODE_ENTER_PENDING
   ↓ (after Command received ~100ms)
-→ state = DISARM_DIGIT_READY, send KEY_ENTER
-  ↓ (after Command received ~100ms)
-→ state = IDLE, wait for DISARMED message to confirm
-Total: ~600ms (vs. current ~2.5s with 500ms pacing)
+→ state = IDLE, wait for ARMED_STATE message to confirm
 ```
 
-### Scenario 3: Bus error (no Command after 1s)
+### Scenario 3: Disarm with a 4-digit code
+```
+User calls: disarm("<code>")
+→ state = CODE_DIGIT_PENDING, send digit 1
+  ↓ (after Command received ~100ms)
+→ CODE_DIGIT_PENDING: send digit 2
+  ↓ (after Command received ~100ms)
+→ CODE_DIGIT_PENDING: send digit 3
+  ↓ (after Command received ~100ms)
+→ CODE_DIGIT_PENDING: send digit 4, then terminal key KEY_ENTER
+→ state = CODE_ENTER_PENDING
+  ↓ (after Command received ~100ms)
+→ state = IDLE, wait for DISARMED message to confirm
+Total: ~600ms
+```
+
+### Scenario 4: Bus error (no Command after 1s)
 ```
 User calls: arm_away()
-→ state = ARM_PENDING, send KEY_ARM
+→ state = ARM_AWAY_PENDING, send KEY_ARM
   ↓ (timeout after 1s, no Command)
 → state = IDLE, abort, log error
 ```
@@ -240,6 +230,8 @@ User calls: arm_away()
 ## Notes
 
 - ARM/STAY/DISARM sequences are simpler than OUTPUT because there's no ACK handshake
-- The main optimization is reducing inter-digit spacing from 500ms (current) to ~100–120ms (observed)
+- No-code arm_away()/arm_stay() complete after a single KEYPAD_COMMAND (~100ms total)
+- Code-based sequences share the same `CODE_DIGIT_PENDING` / `CODE_ENTER_PENDING` states regardless of whether the operation is arm or disarm
 - ARMED_STATE messages (0x11) and state confirmations happen independently; state machine doesn't wait for them
 - All three keypads receive Command broadcasts during arming/disarming; only the originating keypad controls the sequence
+- `disarm()` also guards against calling when already disarmed — it returns early if `is_armed()` is false
