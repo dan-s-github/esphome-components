@@ -75,3 +75,46 @@ This confirms the command/ACK exchange is tightly packed in normal operation, wi
 - `20260512.csv` contains additional noisy/partial decodes in places, but still shows the same core clock cadence and periodic `0x23` poll traffic.
 - `20260512v2.csv` is the cleaner reference for ACK turn-around behavior.
 - a clean `a1 -> 1d -> 14` output-select sequence was not recovered from `20260512.csv` using the same decode assumptions, so timing values above are taken from the v2 capture.
+
+---
+
+## Hardware ACK — bus-level discovery (2026-06-21)
+
+**Source:** `traces/20260621v1/esphome-aap-keypad-monitor-logs-18.txt`, `traces/20260512.csv`
+
+This is distinct from the application-level output-select ACK (0x1D) documented above.
+It is a physical bus-level signal produced by the **addressed keypad** immediately after
+the end boundary of any frame directed at it.
+
+### Observed behaviour
+
+In the raw CLK+DAT CSV traces, after the end `0x7E` boundary of an addressed frame, the
+DAT line stays LOW for **8–13 samples** (~416–677 µs) before rising. Broadcast frames
+(0x10, 0x11, 0x12, 0x50, 0x54) show only 4–5 samples of DAT-low (natural line release).
+The difference (~1 full clock cycle) is the hardware ACK.
+
+| Frame type | Post-end DAT-low samples | ACK present |
+|---|---|---|
+| 0x10, 0x11, 0x12, 0x50, 0x54 (broadcast) | 4–5 | No |
+| 0x14, 0x15, 0x1D (per-keypad) | 8–13 | Yes |
+| 0x23 KEYPAD_PING — absent keypad | 4–5 | No |
+| 0x23 KEYPAD_PING — present keypad | ~12 | Yes |
+
+### Consequence of missing ACK
+
+Without the hardware ACK the controller:
+1. Re-sends the frame up to **10×** (type 0x15 post-registration handshake observed)
+2. Falls back to **10× KEYPAD_PING flood**
+3. **Permanently removes** the keypad address from its poll table
+
+Confirmed in `esphome-aap-keypad-monitor-logs-17.txt` (no ACK → dropped) vs
+`esphome-aap-keypad-monitor-logs-18.txt` (ACK implemented → 1× type 0x15, stable polling).
+
+### Implementation
+
+Drive DAT OUTPUT LOW at the ISR call that detects the end boundary; release to INPUT on
+the very next falling-edge ISR call. This produces exactly one clock cycle of DAT-low
+(~416–833 µs) without any busy-wait — the bus clock cadence provides the timing naturally.
+
+See `CrowAlarmPanelStore::interrupt()` in `crow_alarm_panel.cpp` and the
+`ack_keypad_address_` / `ack_pending_` fields in `crow_alarm_panel.h`.

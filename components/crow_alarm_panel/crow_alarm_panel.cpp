@@ -77,6 +77,15 @@ const char *controller_status_state(uint8_t flags) {
 }
 
 void IRAM_ATTR HOT CrowAlarmPanelStore::interrupt(CrowAlarmPanelStore *arg) {
+  // Release hardware ACK on the falling edge immediately after we drove DAT low.
+  // This produces ~1 clock cycle (~416–833µs) of DAT-low — matching real keypad ACK behaviour.
+  if (arg->ack_pending_) {
+    arg->last_clock_time_ = micros();
+    arg->data_pin_.pin_mode(gpio::FLAG_INPUT);
+    arg->ack_pending_ = false;
+    return;
+  }
+
   uint32_t now = micros();
   arg->last_clock_time_ = now;  // Track last clock edge for bus idle detection
 
@@ -112,6 +121,14 @@ void IRAM_ATTR HOT CrowAlarmPanelStore::interrupt(CrowAlarmPanelStore *arg) {
       arg->inside_ = false;
       arg->num_bits_ = 0;
       arg->data = false;
+      // Hardware ACK: drive DAT low for one clock cycle if this frame is addressed to us.
+      // buffer2[0]=type, buffer2[1]=addr, buffer2[data_length-1]=end boundary (0x7E).
+      // data_length >= 3 ensures both type and addr bytes are present.
+      if (arg->data_length >= 3 && arg->buffer2[1] == arg->ack_keypad_address_) {
+        arg->data_pin_.pin_mode(gpio::FLAG_OUTPUT);
+        arg->data_pin_.digital_write(0);
+        arg->ack_pending_ = true;
+      }
       return;
     } else if (arg->num_bits_ >= BUFFER_LENGTH * 8) {
       // Wrong side of boundary.
@@ -130,6 +147,7 @@ void IRAM_ATTR HOT CrowAlarmPanelStore::interrupt(CrowAlarmPanelStore *arg) {
 }
 
 void CrowAlarmPanel::setup() {
+  this->store_.ack_keypad_address_ = this->keypad_address_;
   this->store_.setup(this->clock_pin_, this->data_pin_);
 
   // Ensure our configured keypad address is present for logging/lookup
@@ -465,30 +483,137 @@ void CrowAlarmPanel::loop() {
     }
     this->on_message_trigger_->trigger(type, data);
   }
+
+  // After a startup delay, announce ourselves to the controller as a registered keypad.
+  // Payload {0x00} → A0 <addr> 00  (physical keypad style).
+  const uint32_t now_ms = millis();
+  if (!this->registration_sent_ && now_ms >= this->registration_after_ms_ && this->is_bus_idle_()) {
+    CrowAlarmPanelKeypad keypad = this->find_keypad_(this->keypad_address_);
+    ESP_LOGI(TAG, "[%s] Sending registration announce", keypad_label(keypad, this->keypad_address_).c_str());
+    this->send_packet(KEYPAD_REGISTRATION, {0x00});
+    this->registration_sent_ = true;
+  }
 }
 
 void CrowAlarmPanel::arm_away() {
-  ESP_LOGW(TAG, "arm_away: TX disabled in listen-only mode");
+  ESP_LOGW(TAG, "arm_away: not implemented yet");
 }
 
 void CrowAlarmPanel::arm_stay() {
-  ESP_LOGW(TAG, "arm_stay: TX disabled in listen-only mode");
+  ESP_LOGW(TAG, "arm_stay: not implemented yet");
 }
 
 void CrowAlarmPanel::disarm(const std::string &code) {
-  ESP_LOGW(TAG, "disarm: TX disabled in listen-only mode");
+  ESP_LOGW(TAG, "disarm: not implemented yet");
 }
 
 void CrowAlarmPanel::set_output(uint8_t output, bool state) {
-  ESP_LOGW(TAG, "set_output(%u, %s): TX disabled in listen-only mode", output, state ? "on" : "off");
+  ESP_LOGW(TAG, "set_output(%u, %s): not implemented yet", output, state ? "on" : "off");
 }
 
 void CrowAlarmPanel::send_packet(uint8_t type, const std::vector<uint8_t> &data) {
-  ESP_LOGW(TAG, "send_packet(0x%02x): TX disabled in listen-only mode", type);
+  std::vector<uint8_t> packet;
+  packet.push_back(BOUNDARY);
+  packet.push_back(type);
+  packet.push_back(this->keypad_address_);
+  packet.insert(packet.end(), data.begin(), data.end());
+  packet.push_back(BOUNDARY);
+
+  uint32_t start_ms = millis();
+  while (!this->is_bus_idle_()) {
+    if (millis() - start_ms > 5000) {
+      ESP_LOGW(TAG, "Timeout waiting for bus idle before sending packet");
+      return;
+    }
+    delay(2);
+    yield();
+  }
+
+  ESP_LOGI(TAG, "Sending packet: [%s]", format_hex_pretty(packet).c_str());
+  this->send_packet_blocking_(packet);
+  ESP_LOGI(TAG, "Packet sent");
 }
 
 void CrowAlarmPanel::keypress(uint8_t key) {
-  ESP_LOGW(TAG, "keypress(%s): TX disabled in listen-only mode", KEYS[key]);
+  ESP_LOGW(TAG, "keypress(%s): not implemented yet", KEYS[key]);
+}
+
+bool CrowAlarmPanel::is_bus_idle_() {
+  if (this->store_.inside_) {
+    ESP_LOGV(TAG, "Bus not idle: inside message boundary");
+    return false;
+  }
+
+  if (!this->data_pin_->digital_read()) {
+    ESP_LOGV(TAG, "Bus not idle: data line low");
+    return false;
+  }
+
+  uint32_t now_us = micros();
+  uint32_t elapsed_us = now_us - this->store_.last_clock_time_;
+  if (elapsed_us < CrowAlarmPanelStore::BUS_IDLE_TIMEOUT_US) {
+    ESP_LOGV(TAG, "Bus not idle: %uus since last clock edge (need %uus)", elapsed_us,
+             CrowAlarmPanelStore::BUS_IDLE_TIMEOUT_US);
+    return false;
+  }
+
+  uint32_t elapsed_ms = millis() - this->store_.last_transmission_time_;
+  if (elapsed_ms < CrowAlarmPanelStore::MIN_TX_INTERVAL_MS) {
+    ESP_LOGV(TAG, "Bus not idle: %ums since last TX (need %ums)", elapsed_ms,
+             CrowAlarmPanelStore::MIN_TX_INTERVAL_MS);
+    return false;
+  }
+
+  return true;
+}
+
+bool CrowAlarmPanel::wait_for_clock_edge_(bool wait_for_state, uint32_t timeout_us) {
+  const uint32_t start = micros();
+  while (this->clock_pin_->digital_read() != wait_for_state) {
+    if (micros() - start >= timeout_us) {
+      return false;
+    }
+    delayMicroseconds(10);
+  }
+  return true;
+}
+
+void IRAM_ATTR CrowAlarmPanel::send_packet_blocking_(const std::vector<uint8_t> &packet) {
+  InterruptLock lock;
+
+  bool bits[200];
+  uint16_t bit_count = 0;
+  for (uint8_t byte : packet) {
+    for (uint8_t j = 0; j < 8; j++) {
+      bits[bit_count++] = (byte >> j) & 1;
+    }
+  }
+
+  if (!this->wait_for_clock_edge_(HIGH, CrowAlarmPanelStore::TX_START_TIMEOUT_US) ||
+      !this->wait_for_clock_edge_(LOW, CrowAlarmPanelStore::TX_START_TIMEOUT_US) ||
+      !this->wait_for_clock_edge_(HIGH, CrowAlarmPanelStore::TX_START_TIMEOUT_US)) {
+    this->data_pin_->pin_mode(gpio::FLAG_INPUT);
+    return;
+  }
+
+  for (uint16_t i = 0; i < bit_count; i++) {
+    if (bits[i]) {
+      this->data_pin_->pin_mode(gpio::FLAG_INPUT);
+    } else {
+      this->data_pin_->pin_mode(gpio::FLAG_OUTPUT);
+      this->data_pin_->digital_write(LOW);
+    }
+
+    if (!this->wait_for_clock_edge_(LOW, CrowAlarmPanelStore::TX_BIT_TIMEOUT_US)) {
+      break;
+    }
+    if (!this->wait_for_clock_edge_(HIGH, CrowAlarmPanelStore::TX_BIT_TIMEOUT_US)) {
+      break;
+    }
+  }
+
+  this->data_pin_->pin_mode(gpio::FLAG_INPUT);
+  this->store_.last_transmission_time_ = millis();
 }
 
 bool CrowAlarmPanel::is_armed() const {

@@ -96,6 +96,12 @@ class CrowAlarmPanelStore {
   uint8_t boundary_buffer_{0};
 
  public:
+  // Hardware ACK: set from CrowAlarmPanel::setup() before interrupts attach.
+  // ack_pending_ is set in the ISR when a frame addressed to us ends, and cleared on the next
+  // falling edge after driving DAT low for one clock cycle (~1 bus clock, ~416–833µs).
+  uint8_t ack_keypad_address_{0};
+  volatile bool ack_pending_{false};
+
   static const uint32_t BUS_IDLE_TIMEOUT_US = 180;           // Allow takeover between bit bursts
   static const uint32_t MIN_TX_INTERVAL_MS = 5;              // Allow keypad-like key burst cadence (conservative)
   /**
@@ -186,6 +192,14 @@ class CrowAlarmPanel : public Component {
 
  protected:
   CrowAlarmPanelKeypad find_keypad_(uint8_t address);
+  bool is_bus_idle_();
+
+  void send_packet_blocking_(const std::vector<uint8_t> &packet);
+  bool wait_for_clock_edge_(bool wait_for_state, uint32_t timeout_us);
+
+  // One-shot registration announce sent after boot delay.
+  bool registration_sent_{false};
+  uint32_t registration_after_ms_{15000};
 
   CrowAlarmPanelStore store_;
   InternalGPIOPin *clock_pin_;

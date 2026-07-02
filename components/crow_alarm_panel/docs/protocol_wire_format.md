@@ -2,7 +2,9 @@
 
 **Sources:** `traces/20260512.csv`, `traces/20260512v2.csv`, `traces/ESPHome Keypad.txt`,
 `traces/IP Keypad.txt`, `traces/esphome-aap-alarm-interface-logs-3.txt`,
-`traces/esphome-aap-keypad-monitor-logs-3..9.txt`, `components/crow_alarm_panel/crow_alarm_panel.cpp`
+`traces/esphome-aap-keypad-monitor-logs-3..9.txt`,
+`traces/20260621v1/esphome-aap-keypad-monitor-logs-18.txt`,
+`components/crow_alarm_panel/crow_alarm_panel.cpp`
 
 **Confidence key:** High = 5+ independent captures; Medium = 2–4 captures; Low = single observation or code-only.
 
@@ -20,8 +22,26 @@
 | Bus arbitration | None — turn-taking by convention | Medium |
 | Glitch filter | Falling edges < 700 µs apart are ignored | High |
 | Inter-frame gap | ~28 falling-edge slots after frame end (see `protocol_trace_2026-05-12_ack_timing.md`) | Medium |
+| **Hardware ACK** | After the end boundary of any **addressed** frame the addressed keypad drives DAT LOW for ~1 clock cycle (~416–833 µs, 8–13 samples at 19.2 kHz). Broadcast frames produce no ACK (4–5 samples of natural line release only). The controller uses ACK presence to confirm a keypad is alive — absence triggers repeated re-sends and eventually drops the address from its poll cycle. | **High** |
 
-**Bit accumulation rule** (from `CrowAlarmPanelStore::interrupt`):
+### Hardware ACK detail
+
+```
+Clock:  ___↓___↓___↓___↓___↓___↓___↓_______↓___↓___
+Data:   ═══╪end boundary═╪ DAT driven LOW  ╪ released
+              (ISR fires)  ← ~1 clock cycle →
+                            (~416–833 µs)
+```
+
+- Addressed frame types that require an ACK: **0x14, 0x15, 0x1D, 0x23** (all per-keypad frames).
+- Broadcast frame types produce no ACK: **0x10, 0x11, 0x12, 0x50, 0x54**.
+- The ACK is driven by the **addressed keypad** (or the controller for keypad-originated frames).
+- Without ACK: controller sends up to **10× re-sends**, then **10× KEYPAD_PING flood**, then permanently removes the address from its poll table.
+- Implementation: drive DAT OUTPUT LOW on the ISR call that detects the end boundary; release to INPUT on the very next falling-edge ISR call. No busy-wait needed — the clock cadence sets the duration naturally.
+
+---
+
+
 
 ```cpp
 buffer[idx] = (buffer[idx] >> 1) | ((data_bit ? 1 : 0) << 7);
@@ -213,17 +233,29 @@ current mode is broadcast.
 
 ### 0x15 — KEYPAD_STATE
 
-*Direction:* Keypad → controller  
-*Trigger:* Keypad announces operating mode (normal, installer, programming)  
+*Direction:* **Controller → per-keypad** *(confirmed 2026-06-21 — see note below)*
+*Trigger:* Post-registration handshake; periodic keepalive (~every 90–120 s per keypad)
 *Min length:* 2 payload bytes (5 bytes in practice)
 
 | Offset | Size | Name | Description | Confidence |
 |---|---|---|---|---|
-| 0 | 1 | `keypad_addr` | Originating keypad address | High |
+| 0 | 1 | `keypad_addr` | Target keypad address | High |
 | 1 | 1 | `mode` | `0x00`=normal, `0x02`=installer, `0x03`=programming | High |
 | 2 | 1 | `UNKNOWN_01` | Always `0x00` | Low |
 | 3 | 1 | `UNKNOWN_02` | Always `0x00` | Low |
 | 4 | 1 | `UNKNOWN_03` | Always `0x03` | Low |
+
+**Directionality note:** Earlier versions of this document listed this as keypad → controller.
+Hardware testing on 2026-06-21 confirmed the opposite: an ESPHome device that sends *zero*
+software responses to type 0x15 (only hardware ACK) remains stably in the controller poll
+cycle indefinitely. Additionally, only one 0x15 frame per keypad per cycle appears in bus
+monitor captures — if keypads responded in software there would be two. Type 0x15 is therefore
+**unidirectional: controller → keypad. The keypad replies with a hardware ACK bit only.**
+
+**Post-registration handshake:** The controller sends exactly **1× type 0x15** to the newly
+registered keypad ~400 ms after receiving its `KEYPAD_REGISTRATION` frame, then begins
+normal KEYPAD_PING polling ~85 ms later. Without hardware ACK the controller re-sends up to
+10× before giving up.
 
 **Examples:**
 ```
@@ -449,7 +481,7 @@ A1 00 0D   → [AAP Keypad] ARM
 |---|---|---|---|
 | `CONTROLLER_STATUS.UNKNOWN_01` | 0x10 data[1] | `0x00`, `0x01` | Correlated with zone/armed state? |
 | `KEYPAD_COMMAND.UNKNOWN_02` | 0x14 data[5] | `0x80` (usual), `0x40` (rare) | Possible parity or flag byte |
-| `KEYPAD_STATE.UNKNOWN_03` | 0x15 data[4] | Always `0x03` | Possibly keypad model/version |
+| `KEYPAD_STATE.UNKNOWN_03` | 0x15 data[4] | Always `0x03` | Possibly keypad model/version; field name may be misleading now direction is confirmed controller→keypad |
 | `KEYPAD_PING` Variant B payload | 0x23 data[1..7] | `03 44 81 00 80 11 07` | Seen with invalid RTC; possible capability flags |
 | `OUTPUT_SELECT_ACK` data[1..4] | 0x1D data[1..4] | Mostly `0x00`; data[1] can be `0x08` | data[1] appears to be current output state at ACK time |
 
@@ -462,6 +494,7 @@ A1 00 0D   → [AAP Keypad] ARM
 | Output-select state machine | `output_select_state_machine.md` |
 | Arm/disarm state machine | `arm_disarm_state_machine.md` |
 | Keypad behavioral differences | `keypad_protocol_types.md` |
-| ACK turn-around timing | `protocol_trace_2026-05-12_ack_timing.md` |
+| ACK turn-around timing (output-select) | `protocol_trace_2026-05-12_ack_timing.md` |
+| Hardware ACK bus-level discovery | `protocol_trace_2026-05-12_ack_timing.md` (physical layer section) |
 | RTC time-setting traces | `protocol_trace_2026-04-12_time_setting.md` |
 | Standard protocol comparison | `protocol_standard_comparison.md` |
