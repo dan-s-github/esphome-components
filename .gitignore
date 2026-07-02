@@ -18,3 +18,15 @@ __pycache__/
 
 # deployment secrets
 /secrets.yaml
+
+# uv / Python virtual environment
+.venv/
+uv.lock
+
+# home configuration
+esphome_*.yaml
+
+# Python egg-info build artifacts
+*.egg-info/
+
+traces/
