@@ -321,8 +321,14 @@ void CrowAlarmPanel::loop() {
           break;
         }
         CrowAlarmPanelKeypad keypad = this->find_keypad_(data[0]);
-        ESP_LOGD(TAG, "[%s] Output-select ack [%02x.%s]", keypad_label(keypad, data[0]).c_str(), type,
+        ESP_LOGD(TAG, "[%s] Output-select ACK [%02x.%s]", keypad_label(keypad, data[0]).c_str(), type,
                  format_hex_pretty(data).c_str());
+        if (data[0] == this->keypad_address_ &&
+            this->output_select_state_ == OutputSelectState::OUTPUT_PENDING) {
+          ESP_LOGD(TAG, "Output-select: ACK received, awaiting KEYPAD_COMMAND");
+          this->output_select_state_ = OutputSelectState::AWAIT_COMMAND;
+          this->output_select_state_enter_ms_ = millis();
+        }
         break;
       }
       case KEYPRESS: {
@@ -388,6 +394,32 @@ void CrowAlarmPanel::loop() {
         CrowAlarmPanelKeypad keypad = this->find_keypad_(data[0]);
         ESP_LOGD(TAG, "[%s] Command [%02x.%s]", keypad_label(keypad, data[0]).c_str(), type,
                  format_hex_pretty(data).c_str());
+        // Drive output-select state machine forward when command is addressed to us.
+        if (data[0] == this->keypad_address_) {
+          switch (this->output_select_state_) {
+            case OutputSelectState::AWAIT_COMMAND:
+            case OutputSelectState::DIGIT_PENDING:
+              if (this->output_select_key_idx_ < this->output_select_keys_.size()) {
+                uint8_t key = this->output_select_keys_[this->output_select_key_idx_++];
+                ESP_LOGD(TAG, "Output-select: sending digit %u", key);
+                this->keypress(key);
+                this->output_select_state_ = OutputSelectState::DIGIT_PENDING;
+                this->output_select_state_enter_ms_ = millis();
+              } else {
+                ESP_LOGD(TAG, "Output-select: sending ENTER");
+                this->keypress(KEY_ENTER);
+                this->output_select_state_ = OutputSelectState::ENTER_PENDING;
+                this->output_select_state_enter_ms_ = millis();
+              }
+              break;
+            case OutputSelectState::ENTER_PENDING:
+              ESP_LOGI(TAG, "Output-select: sequence complete");
+              this->output_select_state_ = OutputSelectState::IDLE;
+              break;
+            default:
+              break;
+          }
+        }
         break;
       }
       case KEYPAD_STATE: {
@@ -484,6 +516,18 @@ void CrowAlarmPanel::loop() {
     this->on_message_trigger_->trigger(type, data);
   }
 
+  // Output-select watchdog: abort if any non-IDLE state exceeds 1s without progress.
+  if (this->output_select_state_ != OutputSelectState::IDLE) {
+    const uint32_t now_ms = millis();
+    if (now_ms - this->output_select_state_enter_ms_ > 1000) {
+      ESP_LOGW(TAG, "Output-select: timeout in state %u, aborting",
+               static_cast<uint8_t>(this->output_select_state_));
+      this->output_select_state_ = OutputSelectState::IDLE;
+      this->output_select_keys_.clear();
+      this->output_select_key_idx_ = 0;
+    }
+  }
+
   // After a startup delay, announce ourselves to the controller as a registered keypad.
   // Payload {0x00} → A0 <addr> 00  (physical keypad style).
   const uint32_t now_ms = millis();
@@ -507,8 +551,30 @@ void CrowAlarmPanel::disarm(const std::string &code) {
   ESP_LOGW(TAG, "disarm: not implemented yet");
 }
 
+void CrowAlarmPanel::keypress(uint8_t key) {
+  this->send_packet(KEYPRESS, {key});
+}
+
 void CrowAlarmPanel::set_output(uint8_t output, bool state) {
-  ESP_LOGW(TAG, "set_output(%u, %s): not implemented yet", output, state ? "on" : "off");
+  if (this->output_select_state_ != OutputSelectState::IDLE) {
+    ESP_LOGW(TAG, "set_output(%u, %s): output-select sequence already in progress", output, state ? "on" : "off");
+    return;
+  }
+  // Build digit queue consumed one per KEYPAD_COMMAND received after the ACK.
+  this->output_select_keys_.clear();
+  if (output >= 10) {
+    this->output_select_keys_.push_back(output / 10);
+  }
+  this->output_select_keys_.push_back(output % 10);
+  this->output_select_key_idx_ = 0;
+
+  ESP_LOGI(TAG, "Output-select: starting sequence for output %u (%s)", output, state ? "on" : "off");
+  // Set state BEFORE the keypress call. send_packet() uses delay()/yield() internally
+  // which re-enters loop(). If the ACK (0x1D) arrives during that yield, loop() must
+  // see OUTPUT_PENDING to correctly transition to AWAIT_COMMAND.
+  this->output_select_state_ = OutputSelectState::OUTPUT_PENDING;
+  this->output_select_state_enter_ms_ = millis();
+  this->keypress(KEY_OUTPUT);
 }
 
 void CrowAlarmPanel::send_packet(uint8_t type, const std::vector<uint8_t> &data) {
@@ -532,10 +598,6 @@ void CrowAlarmPanel::send_packet(uint8_t type, const std::vector<uint8_t> &data)
   ESP_LOGI(TAG, "Sending packet: [%s]", format_hex_pretty(packet).c_str());
   this->send_packet_blocking_(packet);
   ESP_LOGI(TAG, "Packet sent");
-}
-
-void CrowAlarmPanel::keypress(uint8_t key) {
-  ESP_LOGW(TAG, "keypress(%s): not implemented yet", KEYS[key]);
 }
 
 bool CrowAlarmPanel::is_bus_idle_() {

@@ -57,6 +57,14 @@ static const uint8_t RESPONSE_TIME = 0x19;
 
 static const char *DAYS[7] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
 
+enum class OutputSelectState : uint8_t {
+  IDLE,
+  OUTPUT_PENDING,  // sent OUTPUT keypress, waiting for 0x1D ACK addressed to us
+  AWAIT_COMMAND,   // got 0x1D, waiting for first 0x14 KEYPAD_COMMAND
+  DIGIT_PENDING,   // sent a digit, waiting for 0x14 KEYPAD_COMMAND confirmation
+  ENTER_PENDING,   // sent ENTER, waiting for final 0x14 KEYPAD_COMMAND confirmation
+};
+
 struct CrowAlarmPanelMessage {
   uint8_t type;
   uint8_t data_buffer[BUFFER_LENGTH];
@@ -200,6 +208,12 @@ class CrowAlarmPanel : public Component {
   // One-shot registration announce sent after boot delay.
   bool registration_sent_{false};
   uint32_t registration_after_ms_{15000};
+
+  // Output-select state machine.
+  OutputSelectState output_select_state_{OutputSelectState::IDLE};
+  uint32_t output_select_state_enter_ms_{0};
+  std::vector<uint8_t> output_select_keys_;  // digit(s) to send, consumed one per KEYPAD_COMMAND
+  uint8_t output_select_key_idx_{0};
 
   CrowAlarmPanelStore store_;
   InternalGPIOPin *clock_pin_;
