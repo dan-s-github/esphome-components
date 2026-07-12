@@ -79,11 +79,20 @@ const char *controller_status_state(uint8_t flags) {
 void IRAM_ATTR HOT CrowAlarmPanelStore::interrupt(CrowAlarmPanelStore *arg) {
   // Release hardware ACK on the falling edge immediately after we drove DAT low.
   // This produces ~1 clock cycle (~416–833µs) of DAT-low — matching real keypad ACK behaviour.
+  //
+  // Deliberately does NOT return here: this same edge can carry the first bit of an immediate
+  // controller retransmission. Trace: logs-11/36 (2026-07-12) show the controller resending the
+  // same KEYPAD_COMMAND to us ~10x within ~1s (it isn't seeing our ACK land), and our own
+  // receiver decoding that burst as garbage (`Unknown [ff.]`/`[fe.]`) while a passive monitor on
+  // the same bus decodes it cleanly. Previously this edge was discarded outright — the bit it
+  // carried never reached boundary_buffer_/num_bits_ below, silently shifting alignment for
+  // whatever frame followed by one bit (the same class of corruption documented for the
+  // CURRENT_TIME glitch in protocol_investigations.md, but compounding across a whole retry
+  // burst instead of one field). Falling through lets this edge's bit feed the same
+  // glitch-filter/boundary-detection path as any other edge instead of leaving a hole in it.
   if (arg->ack_pending_) {
-    arg->last_clock_time_ = micros();
     arg->data_pin_.pin_mode(gpio::FLAG_INPUT);
     arg->ack_pending_ = false;
-    return;
   }
 
   // On dual-core ESP32-S3, InterruptLock is core-local: the ISR runs on core 0
@@ -372,6 +381,18 @@ void CrowAlarmPanel::loop() {
             ESP_LOGD(TAG, "Armed state unknown [%02x.%s]", type, format_hex_pretty(data).c_str());
           }
         }
+        // ARMED_STATE is the controller's own authoritative state broadcast, independent of the
+        // arm/disarm state machine below — this is the only signal CODE_ENTER_PENDING treats as
+        // proof of success (see the enum comment in crow_alarm_panel.h for why the KEYPAD_COMMAND
+        // byte[1] value below isn't trusted for this). Any recognized ARMED_STATE broadcast while
+        // a terminal key is outstanding settles it, regardless of which of the three it is —
+        // "Arming" confirms an arm-with-code request as much as "Armed Away"/"Disarmed" would.
+        if (this->arm_disarm_state_ == ArmDisarmState::CODE_ENTER_PENDING &&
+            ((data[0] == 0x00 && data[1] == 0x01) || (data[0] == 0x01 && data[1] == 0x00) ||
+             (data[0] == 0x00 && data[1] == 0x00))) {
+          ESP_LOGD(TAG, "Code sequence: complete (confirmed via ARMED_STATE broadcast)");
+          this->arm_disarm_state_ = ArmDisarmState::IDLE;
+        }
         break;
       }
       case OUTPUT_SELECT_ACK: {
@@ -497,7 +518,28 @@ void CrowAlarmPanel::loop() {
               ESP_LOGD(TAG, "Arm/stay: CMD received, sequence complete");
               this->arm_disarm_state_ = ArmDisarmState::IDLE;
               break;
-            case ArmDisarmState::CODE_DIGIT_PENDING:
+            case ArmDisarmState::CODE_DIGIT_PENDING: {
+              uint8_t cmd_byte = (data.size() > 1) ? data[1] : 0;
+              if (!this->arm_disarm_digit_ack_byte_set_) {
+                // Learn this sequence's "digit accepted, more expected" display_code from the
+                // first digit's response. Trace: logs-7/logs-33 (2026-07-08) show address 0x05
+                // consistently getting 0x07 here — never 0x01 — across four separate arm and
+                // disarm attempts with a code independently confirmed correct via the physical
+                // IP keypad (0x07), while address 0x07 consistently got 0x01. The controller
+                // does not validate code correctness per digit (only at ENTER), so this is a
+                // per-keypad-type display quirk, not a rejection.
+                this->arm_disarm_digit_ack_byte_ = cmd_byte;
+                this->arm_disarm_digit_ack_byte_set_ = true;
+              } else if (cmd_byte != this->arm_disarm_digit_ack_byte_) {
+                // A change mid-sequence from the established baseline is still treated as an
+                // anomaly (e.g. logs-6's mid-sequence rejection case).
+                ESP_LOGW(TAG, "Arm/disarm: CMD byte changed from 0x%02X to 0x%02X in CODE_DIGIT_PENDING, aborting",
+                         this->arm_disarm_digit_ack_byte_, cmd_byte);
+                this->arm_disarm_state_ = ArmDisarmState::IDLE;
+                this->arm_disarm_code_digits_.clear();
+                this->arm_disarm_code_idx_ = 0;
+                break;
+              }
               if (this->arm_disarm_code_idx_ < this->arm_disarm_code_digits_.size()) {
                 uint8_t digit = this->arm_disarm_code_digits_[this->arm_disarm_code_idx_++];
                 ESP_LOGD(TAG, "Code sequence: sending digit %u (index %u)", digit,
@@ -512,10 +554,18 @@ void CrowAlarmPanel::loop() {
                 this->arm_disarm_state_enter_ms_ = millis();
               }
               break;
-            case ArmDisarmState::CODE_ENTER_PENDING:
-              ESP_LOGD(TAG, "Code sequence: complete");
-              this->arm_disarm_state_ = ArmDisarmState::IDLE;
+            }
+            case ArmDisarmState::CODE_ENTER_PENDING: {
+              // byte[1] here is deliberately not used to judge success/failure — see the enum
+              // comment in crow_alarm_panel.h for why (logs-10/35, logs-12/37, 2026-07-12). This
+              // KEYPAD_COMMAND only proves the controller is still responding; only the
+              // independent ARMED_STATE broadcast (below) or the shared 1s watchdog resolves
+              // this state.
+              uint8_t cmd_byte = (data.size() > 1) ? data[1] : 0;
+              ESP_LOGD(TAG, "Code sequence: CMD 0x%02X after terminal key, awaiting ARMED_STATE confirmation",
+                       cmd_byte);
               break;
+            }
             default:
               break;
           }
@@ -780,6 +830,7 @@ void CrowAlarmPanel::start_code_sequence_(const std::string &code, uint8_t termi
   this->arm_disarm_code_idx_ = 1;
   this->arm_disarm_state_ = ArmDisarmState::CODE_DIGIT_PENDING;
   this->arm_disarm_state_enter_ms_ = millis();
+  this->arm_disarm_digit_ack_byte_set_ = false;
   this->keypress(this->arm_disarm_code_digits_[0]);
 }
 

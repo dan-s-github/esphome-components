@@ -74,7 +74,14 @@ enum class ArmDisarmState : uint8_t {
   ARM_AWAY_PENDING,   // sent KEY_ARM (no code), waiting for KEYPAD_COMMAND
   ARM_STAY_PENDING,   // sent KEY_STAY (no code), waiting for KEYPAD_COMMAND
   CODE_DIGIT_PENDING, // sent a code digit (arm-with-code or disarm), waiting for KEYPAD_COMMAND
-  CODE_ENTER_PENDING, // sent terminal key (KEY_ARM/KEY_STAY/KEY_ENTER), waiting for KEYPAD_COMMAND
+  // Sent terminal key (KEY_ARM/KEY_STAY/KEY_ENTER). KEYPAD_COMMAND byte[1] here is NOT used to
+  // decide success/failure — logs-10/35 and logs-12/37 (2026-07-12) show it's unreliable in both
+  // directions: a 0x01 ack can precede a sequence that succeeds moments later, AND a fully clean
+  // run of non-0x01 acks (no ambiguity at all) can still silently not disarm the panel. Any
+  // KEYPAD_COMMAND received here just proves the controller is alive; the sequence only resolves
+  // to IDLE via the independent ARMED_STATE broadcast (ground truth) or the shared 1s watchdog
+  // timing out (treated as failure). See arm_disarm_state_machine.md.
+  CODE_ENTER_PENDING,
 };
 
 // BYPASS → zone digit(s) → ENTER, each key confirmed by KEYPAD_COMMAND (0x14) like the
@@ -279,6 +286,12 @@ class CrowAlarmPanel : public Component {
   std::vector<uint8_t> arm_disarm_code_digits_;  // code digits consumed one per KEYPAD_COMMAND
   uint8_t arm_disarm_code_idx_{0};
   uint8_t arm_disarm_terminal_key_{KEY_ENTER};  // KEY_ENTER (disarm), KEY_ARM or KEY_STAY (arm-with-code)
+  // "Digit accepted" display_code (KEYPAD_COMMAND byte[1]) learned from the first digit's
+  // response each sequence. Physical keypad types disagree on this value (0x01 is common,
+  // but address 0x05 has been observed sending 0x07 for the same "more digits expected"
+  // semantic — see docs/arm_disarm_state_machine.md), so it can't be hardcoded to 0x01.
+  uint8_t arm_disarm_digit_ack_byte_{0};
+  bool arm_disarm_digit_ack_byte_set_{false};
 
   CrowAlarmPanelStore store_;
   InternalGPIOPin *clock_pin_{nullptr};
