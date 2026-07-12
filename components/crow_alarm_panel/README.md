@@ -115,12 +115,14 @@ panel's zone-state bitmap, never set optimistically. The bypass sequence is
 
 ### `binary_sensor`
 
-Standalone zone sensor or bypass state indicator for zones not using `zones:`.
+Standalone zone sensor for zones not using `zones:`. For bypass state, use the
+`switch` platform's `type: bypass` (or the `zones:` parent config) instead — the
+bypass switch is both the control and the state indicator.
 
 ```yaml
 binary_sensor:
   - platform: crow_alarm_panel
-    type: zone       # or: bypass
+    type: zone
     zone: 3
     name: "Back Door"
     device_class: door
@@ -128,7 +130,7 @@ binary_sensor:
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `type` | yes | `zone` — active state sensor; `bypass` — bypass state sensor (read-only) |
+| `type` | yes | `zone` — active state sensor |
 | `zone` | yes | Zone number (1–16) |
 
 All standard binary sensor options (`name`, `device_class`, `icon`, etc.) are supported.

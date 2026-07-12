@@ -84,9 +84,9 @@ enum class ArmDisarmState : uint8_t {
   CODE_ENTER_PENDING,
 };
 
-// BYPASS → zone digit(s) → ENTER, each key confirmed by KEYPAD_COMMAND (0x14) like the
-// arm/disarm code sequence. INFERRED from physical keypad usage — no captured trace yet;
-// see docs/zone_bypass_state_machine.md.
+// BYPASS → zone digit(s) → ENTER. TRACE-VERIFIED (see docs/zone_bypass_state_machine.md):
+// unlike the arm/disarm code sequence, the digits and ENTER are sent back-to-back after the
+// first KEYPAD_COMMAND (0x14) rather than waiting for a confirmation per key.
 enum class ZoneBypassState : uint8_t {
   IDLE,
   BYPASS_PENDING,  // sent KEY_BYPASS + first digit, waiting for KEYPAD_COMMAND

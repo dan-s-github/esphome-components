@@ -331,16 +331,20 @@ void CrowAlarmPanel::loop() {
           bool triggered_alarmed = (alarmed_idx < data.size()) && ((data[alarmed_idx] & bit_mask) != 0);
           bool bypassed = (bypassed_idx < data.size()) && ((data[bypassed_idx] & bit_mask) != 0);
 
+          // No `break` after a match: register_zone()/register_zone_bypass_switch() normally
+          // merge into a single zones_ entry per zone number, but don't rely on that holding
+          // for every possible YAML combination (e.g. `zones:` plus a standalone binary_sensor/
+          // switch for the same zone) — update every matching entry so none is silently skipped.
           for (CrowAlarmPanelZone &zone : this->zones_) {
-            if (zone.zone != zone_number)
+            if (zone.zone != zone_number) {
               continue;
+            }
             if (zone.motion_binary_sensor != nullptr) {
               zone.motion_binary_sensor->publish_state(triggered | triggered_alarmed);
             }
             if (zone.bypass_switch != nullptr && !is_full_broadcast) {
               zone.bypass_switch->publish_state(bypassed);
             }
-            break;
           }
 
           if (triggered) {
