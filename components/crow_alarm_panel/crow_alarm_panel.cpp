@@ -175,22 +175,25 @@ void IRAM_ATTR HOT CrowAlarmPanelStore::interrupt(CrowAlarmPanelStore *arg) {
 }
 
 void CrowAlarmPanel::setup() {
-  this->store_.ack_keypad_address_ = this->keypad_address_;
+  // In passive monitor mode (no address configured) the ISR must not ACK any packet.
+  this->store_.ack_keypad_address_ = this->keypad_address_;  // 0xFF when not configured
   this->store_.setup(this->clock_pin_, this->data_pin_);
 
-  // Ensure our configured keypad address is present for logging/lookup
-  bool have_self = false;
-  for (const auto &kp : this->keypads_) {
-    if (kp.address == this->keypad_address_) {
-      have_self = true;
-      break;
+  if (this->is_active_keypad()) {
+    // Ensure our configured keypad address is present for logging/lookup
+    bool have_self = false;
+    for (const auto &kp : this->keypads_) {
+      if (kp.address == this->keypad_address_) {
+        have_self = true;
+        break;
+      }
     }
-  }
-  if (!have_self) {
-    this->keypads_.push_back(CrowAlarmPanelKeypad{
-        .name = "Virtual Keypad",
-        .address = this->keypad_address_,
-    });
+    if (!have_self) {
+      this->keypads_.push_back(CrowAlarmPanelKeypad{
+          .name = "Virtual Keypad",
+          .address = this->keypad_address_,
+      });
+    }
   }
 
   if (this->armed_state_ != nullptr) {
@@ -739,21 +742,23 @@ void CrowAlarmPanel::loop() {
     }
   }
 
-  // After a startup delay, announce ourselves to the controller as a registered keypad.
-  // Payload {0x00} → A0 <addr> 00  (physical keypad style).
-  const uint32_t now_ms = millis();
-  // Watchdog: if we were being polled but haven't heard from the controller in 60 s,
-  // re-send registration (handles controller resets where physical keypads re-register).
-  if (this->registration_sent_ && this->last_ping_ms_ != 0 &&
-      (now_ms - this->last_ping_ms_) >= 60000) {
-    ESP_LOGW(TAG, "No ping for 60 s, re-sending registration announce");
-    this->registration_sent_ = false;
-  }
-  if (!this->registration_sent_ && now_ms >= this->registration_after_ms_ && this->is_bus_idle_()) {
-    CrowAlarmPanelKeypad keypad = this->find_keypad_(this->keypad_address_);
-    ESP_LOGW(TAG, "[%s] Sending registration announce", keypad_label(keypad, this->keypad_address_).c_str());
-    this->send_packet(KEYPAD_REGISTRATION, {0x00});
-    this->registration_sent_ = true;
+  if (this->is_active_keypad()) {
+    // After a startup delay, announce ourselves to the controller as a registered keypad.
+    // Payload {0x00} → A0 <addr> 00  (physical keypad style).
+    const uint32_t now_ms = millis();
+    // Watchdog: if we were being polled but haven't heard from the controller in 60 s,
+    // re-send registration (handles controller resets where physical keypads re-register).
+    if (this->registration_sent_ && this->last_ping_ms_ != 0 &&
+        (now_ms - this->last_ping_ms_) >= 60000) {
+      ESP_LOGW(TAG, "No ping for 60 s, re-sending registration announce");
+      this->registration_sent_ = false;
+    }
+    if (!this->registration_sent_ && now_ms >= this->registration_after_ms_ && this->is_bus_idle_()) {
+      CrowAlarmPanelKeypad keypad = this->find_keypad_(this->keypad_address_);
+      ESP_LOGW(TAG, "[%s] Sending registration announce", keypad_label(keypad, this->keypad_address_).c_str());
+      this->send_packet(KEYPAD_REGISTRATION, {0x00});
+      this->registration_sent_ = true;
+    }
   }
 }
 
@@ -906,6 +911,10 @@ void CrowAlarmPanel::set_zone_bypass(uint8_t zone, bool state) {
 }
 
 void CrowAlarmPanel::send_packet(uint8_t type, const std::vector<uint8_t> &data) {
+  if (!this->is_active_keypad()) {
+    ESP_LOGW(TAG, "No keypad address configured — cannot send packet (passive monitor mode)");
+    return;
+  }
   std::vector<uint8_t> packet;
   packet.push_back(BOUNDARY);
   packet.push_back(type);

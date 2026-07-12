@@ -128,7 +128,7 @@ class CrowAlarmPanelStore {
   // Hardware ACK: set from CrowAlarmPanel::setup() before interrupts attach.
   // ack_pending_ is set in the ISR when a frame addressed to us ends, and cleared on the next
   // falling edge after driving DAT low for one clock cycle (~1 bus clock, ~416–833µs).
-  uint8_t ack_keypad_address_{0};
+  uint8_t ack_keypad_address_{0xFF};  // set from setup(); 0xFF = never ACK (passive mode)
   volatile bool ack_pending_{false};
   // Timestamp (micros) when ack_pending_ was set. Used by loop() to release the ACK pin
   // if the next clock edge never arrives (e.g. clock stops between packets).
@@ -183,6 +183,7 @@ class CrowAlarmPanel : public Component {
   void set_clock_pin(InternalGPIOPin *clock) { this->clock_pin_ = clock; }
   void set_data_pin(InternalGPIOPin *data) { this->data_pin_ = data; }
   void set_keypad_address(uint8_t address) { this->keypad_address_ = address; }
+  bool is_active_keypad() const { return this->keypad_address_ <= 7; }
   void add_keypad(const std::string &name, uint8_t address) {
     this->keypads_.push_back(std::move(CrowAlarmPanelKeypad{
         .name = name,
@@ -279,7 +280,7 @@ class CrowAlarmPanel : public Component {
   CrowAlarmPanelStore store_;
   InternalGPIOPin *clock_pin_{nullptr};
   InternalGPIOPin *data_pin_{nullptr};
-  uint8_t keypad_address_{0};
+  uint8_t keypad_address_{0xFF};  // 0xFF = not configured (passive monitor mode)
   text_sensor::TextSensor *armed_state_{nullptr};
   alarm_control_panel::AlarmControlPanel *alarm_control_panel_{nullptr};
   Trigger<uint8_t, std::vector<uint8_t>> *on_message_trigger_{new Trigger<uint8_t, std::vector<uint8_t>>()};
