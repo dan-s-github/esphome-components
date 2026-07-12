@@ -305,6 +305,9 @@ class CrowAlarmPanel : public Component {
   std::vector<CrowAlarmPanelZone> zones_;
   std::vector<CrowAlarmPanelKeypad> keypads_;
   std::vector<CrowAlarmPanelOutput> outputs_;
+  // Longest configured keypad label, computed once in setup(); pads the "[label]" prefix in
+  // log messages so the text after it lines up regardless of which keypad is logging.
+  uint8_t keypad_label_width_{0};
 };
 
 // Bypass toggle switch created by the parent's `zones:` config. Lives here (not in switch/)

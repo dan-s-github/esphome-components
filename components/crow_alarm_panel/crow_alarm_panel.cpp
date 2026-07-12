@@ -10,6 +10,9 @@ namespace esphome {
 namespace crow_alarm_panel {
 
 static const char *TAG = "crow_alarm_panel";
+// Log prefix for panel-wide broadcasts that carry no keypad address (OUTPUT_STATE, ZONE_STATE,
+// ARMED_STATE, CURRENT_TIME, RESPONSE_TIME, SETTING_VALUE*, MEMORY_EVENT, unknown types).
+static const char *CONTROLLER_LABEL = "Controller";
 
 void CrowAlarmPanelStore::setup(InternalGPIOPin *clock_pin, InternalGPIOPin *data_pin) {
   clock_pin->setup();
@@ -205,6 +208,17 @@ void CrowAlarmPanel::setup() {
     }
   }
 
+  // Widest configured name, or the "Keypad 0xNN" fallback used for unrecognized addresses,
+  // whichever is longer — keeps log text aligned after the "[label]" prefix either way.
+  // "Keypad 0xFF" (11 chars) is also always >= "Controller" (10 chars), so that fallback
+  // covers the CONTROLLER_LABEL width too without a separate comparison.
+  this->keypad_label_width_ = strlen("Keypad 0xFF");
+  for (const auto &kp : this->keypads_) {
+    if (kp.name.size() > this->keypad_label_width_) {
+      this->keypad_label_width_ = kp.name.size();
+    }
+  }
+
   if (this->armed_state_ != nullptr) {
     this->armed_state_->publish_state("disarmed");
   }
@@ -269,19 +283,22 @@ void CrowAlarmPanel::loop() {
         if (bits.empty()) {
           bits = "none";
         }
-        ESP_LOGD(TAG, "[%s] Controller status: b1=0x%02X flags=0x%02X bits=%s b3=0x%02X b4=0x%02X profile:%s state:%s "
-                      "[%02x.%s]",
-                 keypad_label(keypad, data[0]).c_str(), data[1], data[2], bits.c_str(), data[3], data[4],
+        ESP_LOGD(TAG,
+                 "[%-*s] Controller status: b1=0x%02X flags=0x%02X bits=%s b3=0x%02X b4=0x%02X profile:%s state:%s "
+                 "[%02x.%s]",
+                 this->keypad_label_width_, keypad_label(keypad, data[0]).c_str(), data[1], data[2], bits.c_str(),
+                 data[3], data[4],
                  controller_status_profile(data[2]), controller_status_state(data[2]), type,
                  format_hex_pretty(data).c_str());
         break;
       }
       case OUTPUT_STATE:
         if (data.size() < 1) {
-          ESP_LOGW(TAG, "Output state too short, discarding");
+          ESP_LOGW(TAG, "[%-*s] Output state too short, discarding", this->keypad_label_width_, CONTROLLER_LABEL);
           break;
         }
-        ESP_LOGD(TAG, "Output state [%s]", format_hex_pretty(data).c_str());
+        ESP_LOGD(TAG, "[%-*s] Output state [%s]", this->keypad_label_width_, CONTROLLER_LABEL,
+                 format_hex_pretty(data).c_str());
         for (CrowAlarmPanelOutput output : this->outputs_) {
           bool on = ((data[0] >> (output.number - 1)) & 0x01);
           output.the_switch->publish_state(on);
@@ -289,15 +306,15 @@ void CrowAlarmPanel::loop() {
         break;
       case ZONE_STATE: {
         if (data.size() < 6) {
-          ESP_LOGW(TAG, "Zone state invalid length, discarding");
+          ESP_LOGW(TAG, "[%-*s] Zone state invalid length, discarding", this->keypad_label_width_, CONTROLLER_LABEL);
           break;
         }
         // broadcast_type: 0x00 = incremental, 0x01 = full broadcast (sent after registration).
         // Full broadcasts carry accurate active/alarmed bitmaps but always have bypassed=0x00,
         // even when zones are actually bypassed. Skip bypass updates for full broadcasts.
         const bool is_full_broadcast = (data[0] == 0x01);
-        ESP_LOGD(TAG, "Zone state received [%s]%s", format_hex_pretty(data).c_str(),
-                 is_full_broadcast ? " (full broadcast, bypass skipped)" : "");
+        ESP_LOGD(TAG, "[%-*s] Zone state received [%s]%s", this->keypad_label_width_, CONTROLLER_LABEL,
+                 format_hex_pretty(data).c_str(), is_full_broadcast ? " (full broadcast, bypass skipped)" : "");
         // Walk every zone slot the bitmap can represent (2 banks x 8 bits), not just zones
         // declared under `zones:` in YAML. Otherwise activity on an unconfigured zone is
         // silently swallowed and every message logs as "All zones clear".
@@ -327,7 +344,7 @@ void CrowAlarmPanel::loop() {
           }
 
           if (triggered) {
-            ESP_LOGD(TAG, "Zone %d active", zone_number);
+            ESP_LOGD(TAG, "[%-*s] Zone %d active", this->keypad_label_width_, CONTROLLER_LABEL, zone_number);
             if (this->armed_state_ != nullptr && this->armed_state_->state != "arming") {
               this->armed_state_->publish_state("disarmed");  // Assume disarmed if motion detected in this byte
             }
@@ -344,41 +361,46 @@ void CrowAlarmPanel::loop() {
             if (this->alarm_control_panel_ != nullptr) {
               this->alarm_control_panel_->publish_state(alarm_control_panel::ACP_STATE_PENDING);
             }
-            ESP_LOGD(TAG, "Alarm pending from zone %d", zone_number);
+            ESP_LOGD(TAG, "[%-*s] Alarm pending from zone %d", this->keypad_label_width_, CONTROLLER_LABEL,
+                     zone_number);
             clear = false;
           }
         }
         if (clear) {
-          ESP_LOGD(TAG, "All zones clear");
+          ESP_LOGD(TAG, "[%-*s] All zones clear", this->keypad_label_width_, CONTROLLER_LABEL);
         }
         break;
       }
       case ARMED_STATE: {
         if (data.size() < 2) {
-          ESP_LOGW(TAG, "Armed state too short, discarding");
+          ESP_LOGW(TAG, "[%-*s] Armed state too short, discarding", this->keypad_label_width_, CONTROLLER_LABEL);
           break;
         }
         if (armed_state_ != nullptr) {
           if (data[0] == 0x00 && data[1] == 0x01) {
             this->armed_state_->publish_state("arming");
-            ESP_LOGD(TAG, "Arming [%02x.%s]", type, format_hex_pretty(data).c_str());
+            ESP_LOGD(TAG, "[%-*s] Arming [%02x.%s]", this->keypad_label_width_, CONTROLLER_LABEL, type,
+                     format_hex_pretty(data).c_str());
             if (this->alarm_control_panel_ != nullptr) {
               this->alarm_control_panel_->publish_state(alarm_control_panel::ACP_STATE_ARMING);
             }
           } else if (data[0] == 0x01 && data[1] == 0x00) {
             this->armed_state_->publish_state("armed_away");
-            ESP_LOGD(TAG, "Armed Away [%02x.%s]", type, format_hex_pretty(data).c_str());
+            ESP_LOGD(TAG, "[%-*s] Armed Away [%02x.%s]", this->keypad_label_width_, CONTROLLER_LABEL, type,
+                     format_hex_pretty(data).c_str());
             if (this->alarm_control_panel_ != nullptr) {
               this->alarm_control_panel_->publish_state(alarm_control_panel::ACP_STATE_ARMED_AWAY);
             }
           } else if (data[0] == 0x00 && data[1] == 0x00) {
             this->armed_state_->publish_state("disarmed");
-            ESP_LOGD(TAG, "Disarmed [%02x.%s]", type, format_hex_pretty(data).c_str());
+            ESP_LOGD(TAG, "[%-*s] Disarmed [%02x.%s]", this->keypad_label_width_, CONTROLLER_LABEL, type,
+                     format_hex_pretty(data).c_str());
             if (this->alarm_control_panel_ != nullptr) {
               this->alarm_control_panel_->publish_state(alarm_control_panel::ACP_STATE_DISARMED);
             }
           } else {
-            ESP_LOGD(TAG, "Armed state unknown [%02x.%s]", type, format_hex_pretty(data).c_str());
+            ESP_LOGD(TAG, "[%-*s] Armed state unknown [%02x.%s]", this->keypad_label_width_, CONTROLLER_LABEL, type,
+                     format_hex_pretty(data).c_str());
           }
         }
         // ARMED_STATE is the controller's own authoritative state broadcast, independent of the
@@ -401,8 +423,8 @@ void CrowAlarmPanel::loop() {
           break;
         }
         CrowAlarmPanelKeypad keypad = this->find_keypad_(data[0]);
-        ESP_LOGD(TAG, "[%s] Output-select ACK [%02x.%s]", keypad_label(keypad, data[0]).c_str(), type,
-                 format_hex_pretty(data).c_str());
+        ESP_LOGD(TAG, "[%-*s] Output-select ACK [%02x.%s]", this->keypad_label_width_,
+                 keypad_label(keypad, data[0]).c_str(), type, format_hex_pretty(data).c_str());
         if (data[0] == this->keypad_address_ &&
             this->output_select_state_ == OutputSelectState::OUTPUT_PENDING) {
           ESP_LOGD(TAG, "Output-select: ACK received, awaiting KEYPAD_COMMAND");
@@ -422,17 +444,19 @@ void CrowAlarmPanel::loop() {
           break;
         }
         CrowAlarmPanelKeypad keypad = this->find_keypad_(data[0]);
-        ESP_LOGD(TAG, "[%s] Key %s (%d) pressed [%02x.%s]", keypad_label(keypad, data[0]).c_str(), KEYS[key], key, type,
-                 format_hex_pretty(data).c_str());
+        ESP_LOGD(TAG, "[%-*s] Key %s (%d) pressed [%02x.%s]", this->keypad_label_width_,
+                 keypad_label(keypad, data[0]).c_str(), KEYS[key], key, type, format_hex_pretty(data).c_str());
         break;
       }
       case CURRENT_TIME: {
         if (data.size() < 7) {
-          ESP_LOGW(TAG, "Current time too short, discarding");
+          ESP_LOGW(TAG, "[%-*s] Current time too short, discarding [%02x.%s]", this->keypad_label_width_,
+                   CONTROLLER_LABEL, type, format_hex_pretty(data).c_str());
           break;
         }
         if (data[0] == 0 || data[0] > 7) {
-          ESP_LOGW(TAG, "Current time has invalid day index %d", data[0]);
+          ESP_LOGW(TAG, "[%-*s] Current time has invalid day index %d [%02x.%s]", this->keypad_label_width_,
+                   CONTROLLER_LABEL, data[0], type, format_hex_pretty(data).c_str());
           break;
         }
         const char *day_of_week = DAYS[data[0] - 1];
@@ -440,31 +464,38 @@ void CrowAlarmPanel::loop() {
         uint8_t hour = minutes_since_midnight / 60;
         uint8_t minute = minutes_since_midnight % 60;
         if (hour >= 24) {
-          ESP_LOGW(TAG, "Current time has invalid minutes-since-midnight value %u", minutes_since_midnight);
+          ESP_LOGW(TAG, "[%-*s] Current time has invalid minutes-since-midnight value %u [%02x.%s]",
+                   this->keypad_label_width_, CONTROLLER_LABEL, minutes_since_midnight, type,
+                   format_hex_pretty(data).c_str());
           break;
         }
         if (data[3] >= 60) {
-          ESP_LOGW(TAG, "Current time has invalid seconds value %u", data[3]);
+          ESP_LOGW(TAG, "[%-*s] Current time has invalid seconds value %u [%02x.%s]", this->keypad_label_width_,
+                   CONTROLLER_LABEL, data[3], type, format_hex_pretty(data).c_str());
           break;
         }
         if (data[4] == 0 || data[4] > 31) {
-          ESP_LOGW(TAG, "Current time has invalid day-of-month value %u", data[4]);
+          ESP_LOGW(TAG, "[%-*s] Current time has invalid day-of-month value %u [%02x.%s]", this->keypad_label_width_,
+                   CONTROLLER_LABEL, data[4], type, format_hex_pretty(data).c_str());
           break;
         }
         if (data[5] == 0 || data[5] > 12) {
-          ESP_LOGW(TAG, "Current time has invalid month value %u", data[5]);
+          ESP_LOGW(TAG, "[%-*s] Current time has invalid month value %u [%02x.%s]", this->keypad_label_width_,
+                   CONTROLLER_LABEL, data[5], type, format_hex_pretty(data).c_str());
           break;
         }
-        ESP_LOGD(TAG, "Controller time update: %s 20%02d-%02d-%02d %02d:%02d:%02d", day_of_week, data[6], data[5],
-                 data[4], hour, minute, data[3]);
+        ESP_LOGD(TAG, "[%-*s] Controller time update: %s 20%02d-%02d-%02d %02d:%02d:%02d",
+                 this->keypad_label_width_, CONTROLLER_LABEL, day_of_week, data[6], data[5], data[4], hour, minute,
+                 data[3]);
         break;
       }
       case RESPONSE_TIME:
         if (data.size() < 3) {
-          ESP_LOGW(TAG, "Response time too short, discarding");
+          ESP_LOGW(TAG, "[%-*s] Response time too short, discarding", this->keypad_label_width_, CONTROLLER_LABEL);
           break;
         }
-        ESP_LOGD(TAG, "Current time setting received [%d]", (data[1] << 8) | data[2]);
+        ESP_LOGD(TAG, "[%-*s] Current time setting received [%d]", this->keypad_label_width_, CONTROLLER_LABEL,
+                 (data[1] << 8) | data[2]);
         break;
       case KEYPAD_COMMAND: {
         if (data.empty()) {
@@ -472,8 +503,8 @@ void CrowAlarmPanel::loop() {
           break;
         }
         CrowAlarmPanelKeypad keypad = this->find_keypad_(data[0]);
-        ESP_LOGD(TAG, "[%s] Command [%02x.%s]", keypad_label(keypad, data[0]).c_str(), type,
-                 format_hex_pretty(data).c_str());
+        ESP_LOGD(TAG, "[%-*s] Command [%02x.%s]", this->keypad_label_width_, keypad_label(keypad, data[0]).c_str(),
+                 type, format_hex_pretty(data).c_str());
         // Drive output-select state machine forward when command is addressed to us.
         if (data[0] == this->keypad_address_) {
           switch (this->output_select_state_) {
@@ -582,8 +613,9 @@ void CrowAlarmPanel::loop() {
               // and ENTER back-to-back; the physical keypad does the same and traces confirm
               // the panel processes them correctly without a second KC wait.
               this->zone_bypass_initial_bitmap_ = (data.size() > 3) ? data[3] : 0;
-              ESP_LOGD(TAG, "[%s] Zone-bypass: KC received (BB=0x%02x), sending digits+ENTER",
-                       keypad_label(keypad, data[0]).c_str(), this->zone_bypass_initial_bitmap_);
+              ESP_LOGD(TAG, "[%-*s] Zone-bypass: KC received (BB=0x%02x), sending digits+ENTER",
+                       this->keypad_label_width_, keypad_label(keypad, data[0]).c_str(),
+                       this->zone_bypass_initial_bitmap_);
               while (this->zone_bypass_key_idx_ < this->zone_bypass_keys_.size()) {
                 this->keypress(this->zone_bypass_keys_[this->zone_bypass_key_idx_++]);
               }
@@ -592,8 +624,9 @@ void CrowAlarmPanel::loop() {
               this->zone_bypass_state_enter_ms_ = millis();
               break;
             case ZoneBypassState::ENTER_PENDING:
-              ESP_LOGD(TAG, "[%s] Zone-bypass: sequence complete for zone %u (KEYPAD_COMMAND after ENTER)",
-                       keypad_label(keypad, data[0]).c_str(), this->zone_bypass_target_zone_);
+              ESP_LOGD(TAG, "[%-*s] Zone-bypass: sequence complete for zone %u (KEYPAD_COMMAND after ENTER)",
+                       this->keypad_label_width_, keypad_label(keypad, data[0]).c_str(),
+                       this->zone_bypass_target_zone_);
               this->zone_bypass_state_ = ZoneBypassState::IDLE;
               break;
             default:
@@ -609,21 +642,21 @@ void CrowAlarmPanel::loop() {
         }
         CrowAlarmPanelKeypad keypad = this->find_keypad_(data[0]);
         if (data[1] == 00) {
-          ESP_LOGD(TAG, "[%s] In normal state [%02x.%s]", keypad_label(keypad, data[0]).c_str(), type,
-                   format_hex_pretty(data).c_str());
+          ESP_LOGD(TAG, "[%-*s] In normal state [%02x.%s]", this->keypad_label_width_,
+                   keypad_label(keypad, data[0]).c_str(), type, format_hex_pretty(data).c_str());
         } else if (data[1] == 02) {
-          ESP_LOGD(TAG, "[%s] In installer mode [%02x.%s]", keypad_label(keypad, data[0]).c_str(), type,
-                   format_hex_pretty(data).c_str());
+          ESP_LOGD(TAG, "[%-*s] In installer mode [%02x.%s]", this->keypad_label_width_,
+                   keypad_label(keypad, data[0]).c_str(), type, format_hex_pretty(data).c_str());
         } else if (data[1] == 03) {
           if (data.size() < 3) {
             ESP_LOGW(TAG, "Keypad programming state too short, discarding");
             break;
           }
-          ESP_LOGD(TAG, "[%s] Programming %d [%02x.%s]", keypad_label(keypad, data[0]).c_str(), data[2], type,
-                   format_hex_pretty(data).c_str());
+          ESP_LOGD(TAG, "[%-*s] Programming %d [%02x.%s]", this->keypad_label_width_,
+                   keypad_label(keypad, data[0]).c_str(), data[2], type, format_hex_pretty(data).c_str());
         } else {
-          ESP_LOGD(TAG, "[%s] State unknown [%02x.%s]", keypad_label(keypad, data[0]).c_str(), type,
-                   format_hex_pretty(data).c_str());
+          ESP_LOGD(TAG, "[%-*s] State unknown [%02x.%s]", this->keypad_label_width_,
+                   keypad_label(keypad, data[0]).c_str(), type, format_hex_pretty(data).c_str());
         }
         break;
       }
@@ -633,7 +666,7 @@ void CrowAlarmPanel::loop() {
           break;
         }
         CrowAlarmPanelKeypad keypad = this->find_keypad_(data[0]);
-        ESP_LOGD(TAG, "[%s] Ping [%02x.%s]", keypad_label(keypad, data[0]).c_str(), type,
+        ESP_LOGD(TAG, "[%-*s] Ping [%02x.%s]", this->keypad_label_width_, keypad_label(keypad, data[0]).c_str(), type,
                  format_hex_pretty(data).c_str());
         if (data[0] == this->keypad_address_)
           this->last_ping_ms_ = millis();
@@ -645,8 +678,8 @@ void CrowAlarmPanel::loop() {
           break;
         }
         CrowAlarmPanelKeypad keypad = this->find_keypad_(data[0]);
-        ESP_LOGI(TAG, "[%s] Registration [%02x.%s]", keypad_label(keypad, data[0]).c_str(), type,
-                 format_hex_pretty(data).c_str());
+        ESP_LOGI(TAG, "[%-*s] Registration [%02x.%s]", this->keypad_label_width_,
+                 keypad_label(keypad, data[0]).c_str(), type, format_hex_pretty(data).c_str());
         // Other keypads re-registering indicates a controller reset. We intentionally do NOT
         // re-register here: if 0x05 is not pre-programmed in the controller, registering causes
         // a crash loop (controller adds 0x05 to polls, we can't respond inline, crash repeats).
@@ -655,40 +688,40 @@ void CrowAlarmPanel::loop() {
       }
       case SETTING_VALUE: {
         if (data.size() < 5) {
-          ESP_LOGW(TAG, "Setting value too short, discarding");
+          ESP_LOGW(TAG, "[%-*s] Setting value too short, discarding", this->keypad_label_width_, CONTROLLER_LABEL);
           break;
         }
-        ESP_LOGD(TAG, "Address %d-%d has options: %s [%02x.%s]", data[3], data[4], binary_indices(data[2]).c_str(),
-                 type, format_hex_pretty(data).c_str());
+        ESP_LOGD(TAG, "[%-*s] Address %d-%d has options: %s [%02x.%s]", this->keypad_label_width_, CONTROLLER_LABEL,
+                 data[3], data[4], binary_indices(data[2]).c_str(), type, format_hex_pretty(data).c_str());
         break;
       }
       case SETTING_VALUE2: {
         if (data.size() < 4) {
-          ESP_LOGW(TAG, "Setting value 2 too short, discarding");
+          ESP_LOGW(TAG, "[%-*s] Setting value 2 too short, discarding", this->keypad_label_width_, CONTROLLER_LABEL);
           break;
         }
         // CrowAlarmPanelKeypad keypad = this->find_keypad_(data[0]);
-        ESP_LOGD(TAG, "Address %d-%d has value %d [%02x.%s]", data[2], data[3], data[1], type,
-                 format_hex_pretty(data).c_str());
+        ESP_LOGD(TAG, "[%-*s] Address %d-%d has value %d [%02x.%s]", this->keypad_label_width_, CONTROLLER_LABEL,
+                 data[2], data[3], data[1], type, format_hex_pretty(data).c_str());
         break;
       }
       case SETTING_VALUE3: {
         if (data.size() < 5) {
-          ESP_LOGW(TAG, "Setting value 3 too short, discarding");
+          ESP_LOGW(TAG, "[%-*s] Setting value 3 too short, discarding", this->keypad_label_width_, CONTROLLER_LABEL);
           break;
         }
         // CrowAlarmPanelKeypad keypad = this->find_keypad_(data[0]);
-        ESP_LOGD(TAG, "Address %d-%d has value %d [%02x.%s]", data[3], data[4], (data[1] << 8) | data[2], type,
-                 format_hex_pretty(data).c_str());
+        ESP_LOGD(TAG, "[%-*s] Address %d-%d has value %d [%02x.%s]", this->keypad_label_width_, CONTROLLER_LABEL,
+                 data[3], data[4], (data[1] << 8) | data[2], type, format_hex_pretty(data).c_str());
         break;
       }
       case MEMORY_EVENT: {
         if (data.size() < 2) {
-          ESP_LOGW(TAG, "Memory event too short, discarding");
+          ESP_LOGW(TAG, "[%-*s] Memory event too short, discarding", this->keypad_label_width_, CONTROLLER_LABEL);
           break;
         }
         // CrowAlarmPanelKeypad keypad = this->find_keypad_(data[0]);
-        ESP_LOGD(TAG, "Memory event #%d ", data[1]);
+        ESP_LOGD(TAG, "[%-*s] Memory event #%d ", this->keypad_label_width_, CONTROLLER_LABEL, data[1]);
         break;
       }
       case BYPASS_STATUS: {
@@ -698,19 +731,20 @@ void CrowAlarmPanel::loop() {
         }
         {
           CrowAlarmPanelKeypad bs_keypad = this->find_keypad_(data[0]);
-          ESP_LOGD(TAG, "[%s] Bypass status: bitmap=0x%02x [%02x.%s]", keypad_label(bs_keypad, data[0]).c_str(),
-                   data[1], type, format_hex_pretty(data).c_str());
+          ESP_LOGD(TAG, "[%-*s] Bypass status: bitmap=0x%02x [%02x.%s]", this->keypad_label_width_,
+                   keypad_label(bs_keypad, data[0]).c_str(), data[1], type, format_hex_pretty(data).c_str());
         }
         // After ENTER the controller may send BYPASS_STATUS before KEYPAD_COMMAND (CC=0x15).
         // Use it as a fallback completion signal for ENTER_PENDING — but only when the bitmap
         // has actually changed. An unchanged bitmap means the bypass sequence didn't land
         // (e.g. digits arrived late and were ignored by the controller).
-        if (data[0] == this->keypad_address_ && this->zone_bypass_state_ == ZoneBypassState::ENTER_PENDING &&
+        if (data[0] == this->keypad_address_ &&
+            this->zone_bypass_state_ == ZoneBypassState::ENTER_PENDING &&
             data[1] != this->zone_bypass_initial_bitmap_) {
           CrowAlarmPanelKeypad my_keypad = this->find_keypad_(this->keypad_address_);
-          ESP_LOGD(TAG, "[%s] Zone-bypass: sequence complete for zone %u (BYPASS_STATUS bitmap 0x%02x→0x%02x)",
-                   keypad_label(my_keypad, this->keypad_address_).c_str(), this->zone_bypass_target_zone_,
-                   this->zone_bypass_initial_bitmap_, data[1]);
+          ESP_LOGD(TAG, "[%-*s] Zone-bypass: sequence complete for zone %u (BYPASS_STATUS bitmap 0x%02x→0x%02x)",
+                   this->keypad_label_width_, keypad_label(my_keypad, this->keypad_address_).c_str(),
+                   this->zone_bypass_target_zone_, this->zone_bypass_initial_bitmap_, data[1]);
           this->zone_bypass_state_ = ZoneBypassState::IDLE;
         }
         break;
@@ -771,7 +805,7 @@ void CrowAlarmPanel::loop() {
     const uint32_t now_ms = millis();
     if (now_ms - this->zone_bypass_state_enter_ms_ > 1000) {
       CrowAlarmPanelKeypad my_keypad = this->find_keypad_(this->keypad_address_);
-      ESP_LOGW(TAG, "[%s] Zone-bypass: timeout in state %u for zone %u, aborting",
+      ESP_LOGW(TAG, "[%-*s] Zone-bypass: timeout in state %u for zone %u, aborting", this->keypad_label_width_,
                keypad_label(my_keypad, this->keypad_address_).c_str(),
                static_cast<uint8_t>(this->zone_bypass_state_), this->zone_bypass_target_zone_);
       this->zone_bypass_state_ = ZoneBypassState::IDLE;
@@ -805,7 +839,8 @@ void CrowAlarmPanel::loop() {
     }
     if (!this->registration_sent_ && now_ms >= this->registration_after_ms_ && this->is_bus_idle_()) {
       CrowAlarmPanelKeypad keypad = this->find_keypad_(this->keypad_address_);
-      ESP_LOGW(TAG, "[%s] Sending registration announce", keypad_label(keypad, this->keypad_address_).c_str());
+      ESP_LOGW(TAG, "[%-*s] Sending registration announce", this->keypad_label_width_,
+               keypad_label(keypad, this->keypad_address_).c_str());
       this->send_packet(KEYPAD_REGISTRATION, {0x00});
       this->registration_sent_ = true;
     }
@@ -908,18 +943,21 @@ void CrowAlarmPanel::set_output(uint8_t output, bool state) {
 
 void CrowAlarmPanel::set_zone_bypass(uint8_t zone, bool state) {
   if (this->zone_bypass_state_ != ZoneBypassState::IDLE) {
-    ESP_LOGW(TAG, "set_zone_bypass(%u, %s): bypass sequence already in progress, ignoring", zone, ONOFF(state));
+    ESP_LOGW(TAG, "set_zone_bypass(%u, %s): bypass sequence already in progress, ignoring", zone,
+             ONOFF(state));
     return;
   }
   // All three keypress state machines advance on the same KEYPAD_COMMAND frames; running
   // two at once would double-consume confirmations.
-  if (this->output_select_state_ != OutputSelectState::IDLE || this->arm_disarm_state_ != ArmDisarmState::IDLE) {
-    ESP_LOGW(TAG, "set_zone_bypass(%u, %s): another keypress sequence in progress, ignoring", zone, ONOFF(state));
+  if (this->output_select_state_ != OutputSelectState::IDLE ||
+      this->arm_disarm_state_ != ArmDisarmState::IDLE) {
+    ESP_LOGW(TAG, "set_zone_bypass(%u, %s): another keypress sequence in progress, ignoring", zone,
+             ONOFF(state));
     return;
   }
   if (this->is_armed()) {
-    ESP_LOGW(TAG, "set_zone_bypass(%u, %s): panel is armed, bypass can only be toggled while disarmed", zone,
-             ONOFF(state));
+    ESP_LOGW(TAG, "set_zone_bypass(%u, %s): panel is armed, bypass can only be toggled while disarmed",
+             zone, ONOFF(state));
     return;
   }
   // The keypad sequence toggles bypass. Skip if the switch already reports the requested
@@ -930,7 +968,8 @@ void CrowAlarmPanel::set_zone_bypass(uint8_t zone, bool state) {
       continue;
     }
     if (z.bypass_switch != nullptr && z.bypass_switch->state == state) {
-      ESP_LOGD(TAG, "set_zone_bypass(%u, %s): switch already reports requested state, skipping", zone, ONOFF(state));
+      ESP_LOGD(TAG, "set_zone_bypass(%u, %s): switch already reports requested state, skipping",
+               zone, ONOFF(state));
       return;
     }
     break;
@@ -944,7 +983,7 @@ void CrowAlarmPanel::set_zone_bypass(uint8_t zone, bool state) {
   this->zone_bypass_target_zone_ = zone;
 
   CrowAlarmPanelKeypad my_keypad = this->find_keypad_(this->keypad_address_);
-  ESP_LOGD(TAG, "[%s] Zone-bypass: starting toggle sequence for zone %u (want %s)",
+  ESP_LOGD(TAG, "[%-*s] Zone-bypass: starting toggle sequence for zone %u (want %s)", this->keypad_label_width_,
            keypad_label(my_keypad, this->keypad_address_).c_str(), zone, ONOFF(state));
   // Set state BEFORE the keypress calls — send_packet() delays/yields internally, which
   // re-enters loop(); a KEYPAD_COMMAND arriving during that yield must see BYPASS_PENDING.
