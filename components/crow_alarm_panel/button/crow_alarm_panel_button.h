@@ -20,16 +20,18 @@ class CrowAlarmPanelButton : public button::Button, public Component {
      ESP_LOGE("crow_alarm_panel.button", "Parent not set, ignoring button press");
      return;
    }
+   // Entity-level code if set, else the parent panel's code.
+   const std::string &code = this->code_.empty() ? this->parent_->get_code() : this->code_;
    if (this->button_type_ == "arm_away") {
-      this->parent_->arm_away(this->code_);
+      this->parent_->arm_away(code);
     } else if (this->button_type_ == "arm_stay") {
-      this->parent_->arm_stay(this->code_);
+      this->parent_->arm_stay(code);
     } else if (this->button_type_ == "disarm") {
       if (!this->parent_->is_armed()) {
         ESP_LOGW("crow_alarm_panel.button", "Cannot disarm - alarm is not armed");
         return;
       }
-      this->parent_->disarm(this->code_);
+      this->parent_->disarm(code);
     }
   }
 

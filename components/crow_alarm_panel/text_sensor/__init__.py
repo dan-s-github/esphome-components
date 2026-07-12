@@ -20,11 +20,11 @@ CONFIG_SCHEMA = text_sensor.text_sensor_schema().extend(
 ).extend(cv.COMPONENT_SCHEMA)
 
 
-def to_code(config):
-    paren = yield cg.get_variable(config[CONF_CROW_ALARM_PANEL_ID])
+async def to_code(config):
+    paren = await cg.get_variable(config[CONF_CROW_ALARM_PANEL_ID])
     var = cg.new_Pvariable(config[CONF_ID])
 
-    yield text_sensor.register_text_sensor(var, config)
+    await text_sensor.register_text_sensor(var, config)
 
     if config[CONF_TYPE] == "armed_state":
         cg.add(paren.register_armed_state(var))
