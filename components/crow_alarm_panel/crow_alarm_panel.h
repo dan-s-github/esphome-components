@@ -184,6 +184,9 @@ class CrowAlarmPanel : public Component {
   void set_data_pin(InternalGPIOPin *data) { this->data_pin_ = data; }
   void set_keypad_address(uint8_t address) { this->keypad_address_ = address; }
   bool is_active_keypad() const { return this->keypad_address_ <= 7; }
+  // Panel-level alarm code; entities without their own code fall back to this.
+  void set_code(const std::string &code) { this->code_ = code; }
+  const std::string &get_code() const { return this->code_; }
   void add_keypad(const std::string &name, uint8_t address) {
     this->keypads_.push_back(std::move(CrowAlarmPanelKeypad{
         .name = name,
@@ -281,6 +284,7 @@ class CrowAlarmPanel : public Component {
   InternalGPIOPin *clock_pin_{nullptr};
   InternalGPIOPin *data_pin_{nullptr};
   uint8_t keypad_address_{0xFF};  // 0xFF = not configured (passive monitor mode)
+  std::string code_;
   text_sensor::TextSensor *armed_state_{nullptr};
   alarm_control_panel::AlarmControlPanel *alarm_control_panel_{nullptr};
   Trigger<uint8_t, std::vector<uint8_t>> *on_message_trigger_{new Trigger<uint8_t, std::vector<uint8_t>>()};
@@ -322,6 +326,8 @@ class CrowAlarmControlPanel : public alarm_control_panel::AlarmControlPanel, pub
 
  protected:
   void control(const alarm_control_panel::AlarmControlPanelCall &call) override;
+  // Entity-level code if set, else the parent panel's code. Only valid once parent_ is set.
+  const std::string &effective_code_() const { return this->code_.empty() ? this->parent_->get_code() : this->code_; }
 
   CrowAlarmPanel *parent_{nullptr};
   std::string code_;

@@ -10,6 +10,7 @@ from esphome.components import binary_sensor as binary_sensor_component
 from esphome.components import switch as switch_component
 from esphome.const import (
     CONF_ADDRESS,
+    CONF_CODE,
     CONF_ENTITY_CATEGORY,
     CONF_ID,
     CONF_CLOCK_PIN,
@@ -108,6 +109,9 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Required(CONF_CLOCK_PIN): pins.internal_gpio_input_pin_schema,
         cv.Required(CONF_DATA_PIN): pins.internal_gpio_input_pin_schema,
         cv.Optional(CONF_ADDRESS): cv.int_range(min=0, max=7),
+        # Panel-level alarm code; entities (disarm button, alarm control panel)
+        # fall back to it when they don't set their own.
+        cv.Optional(CONF_CODE): cv.string,
         cv.Optional(CONF_KEYPADS, default=[]): cv.ensure_list(
             cv.Schema(
                 {
@@ -136,6 +140,9 @@ async def to_code(config):
 
     if CONF_ADDRESS in config:
         cg.add(var.set_keypad_address(config[CONF_ADDRESS]))
+
+    if CONF_CODE in config:
+        cg.add(var.set_code(config[CONF_CODE]))
 
     for keypad in config[CONF_KEYPADS]:
         cg.add(var.add_keypad(keypad[CONF_NAME], keypad[CONF_ADDRESS]))

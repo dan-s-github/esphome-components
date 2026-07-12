@@ -37,6 +37,9 @@ crow_alarm_panel:
   clock_pin: GPIO18
   data_pin: GPIO19
   address: 7
+  # Panel-level alarm code; the disarm button and alarm control panel use it
+  # unless they set their own `code:`.
+  code: !secret alarm_code
 
   keypads:
     # Optional: label other keypads for logging
@@ -90,7 +93,6 @@ button:
   - platform: crow_alarm_panel
     name: "Disarm"
     type: disarm
-    code: !secret alarm_code
 
 switch:
   - platform: crow_alarm_panel

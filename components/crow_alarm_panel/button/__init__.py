@@ -1,7 +1,7 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome.components import button
-from esphome.const import CONF_ID, CONF_TYPE
+from esphome.const import CONF_CODE, CONF_ID, CONF_TYPE
 from .. import crow_alarm_panel_ns, CrowAlarmPanel, CONF_CROW_ALARM_PANEL_ID
 
 DEPENDENCIES = ["crow_alarm_panel"]
@@ -12,13 +12,13 @@ CrowAlarmPanelButton = crow_alarm_panel_ns.class_(
 
 TYPES = ["arm_away", "arm_stay", "disarm"]
 
-CONF_CODE = "code"
-
 CONFIG_SCHEMA = button.button_schema(CrowAlarmPanelButton).extend(
     {
         cv.GenerateID(CONF_CROW_ALARM_PANEL_ID): cv.use_id(CrowAlarmPanel),
         cv.Required(CONF_TYPE): cv.one_of(*TYPES, lower=True),
-        cv.Optional(CONF_CODE): cv.string,  # Only needed for disarm
+        # Overrides the parent panel's `code:`; only meaningful for disarm
+        # (and arm-with-code).
+        cv.Optional(CONF_CODE): cv.string,
     }
 ).extend(cv.COMPONENT_SCHEMA)
 
