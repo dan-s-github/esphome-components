@@ -56,6 +56,7 @@ crow_alarm_panel:
       icon: mdi:motion-sensor
     - zone: 2
       name: "Front Door"    # entities: "Front Door" sensor, "Bypass Front Door" switch
+      device_class: door
 
   on_message:
     - lambda: |-
