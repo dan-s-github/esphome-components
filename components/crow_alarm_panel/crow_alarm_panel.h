@@ -26,6 +26,8 @@ static const uint8_t SETTING_VALUE = 0x16;   // for locking LEDs
 static const uint8_t SETTING_VALUE2 = 0x17;  // for flashing LEDs < 255
 static const uint8_t SETTING_VALUE3 = 0x18;  // for flashing LEDs > 255
 
+static const uint8_t BYPASS_STATUS = 0x1B;  // Bypass status; byte 1 = bypass bitmap (sent on BYPASS press and after each zone toggle)
+
 static const uint8_t MEMORY_EVENT = 0x20;
 
 static const uint8_t OUTPUT_SELECT_ACK = 0x1D;
@@ -73,6 +75,15 @@ enum class ArmDisarmState : uint8_t {
   ARM_STAY_PENDING,   // sent KEY_STAY (no code), waiting for KEYPAD_COMMAND
   CODE_DIGIT_PENDING, // sent a code digit (arm-with-code or disarm), waiting for KEYPAD_COMMAND
   CODE_ENTER_PENDING, // sent terminal key (KEY_ARM/KEY_STAY/KEY_ENTER), waiting for KEYPAD_COMMAND
+};
+
+// BYPASS → zone digit(s) → ENTER, each key confirmed by KEYPAD_COMMAND (0x14) like the
+// arm/disarm code sequence. INFERRED from physical keypad usage — no captured trace yet;
+// see docs/zone_bypass_state_machine.md.
+enum class ZoneBypassState : uint8_t {
+  IDLE,
+  BYPASS_PENDING,  // sent KEY_BYPASS + first digit, waiting for KEYPAD_COMMAND
+  ENTER_PENDING,   // sent remaining digit + ENTER, waiting for final KEYPAD_COMMAND
 };
 
 struct CrowAlarmPanelMessage {
@@ -151,7 +162,7 @@ class CrowAlarmPanelStore {
 
 struct CrowAlarmPanelZone {
   binary_sensor::BinarySensor *motion_binary_sensor;
-  binary_sensor::BinarySensor *bypass_binary_sensor;
+  switch_::Switch *bypass_switch;  // bypass state indicator AND control (no separate sensor)
   uint8_t zone;
 };
 
@@ -167,6 +178,7 @@ class CrowAlarmPanel : public Component {
   void loop() override;
 
   void set_output(uint8_t output, bool state);
+  void set_zone_bypass(uint8_t zone, bool state);
 
   void set_clock_pin(InternalGPIOPin *clock) { this->clock_pin_ = clock; }
   void set_data_pin(InternalGPIOPin *data) { this->data_pin_ = data; }
@@ -187,20 +199,20 @@ class CrowAlarmPanel : public Component {
     }
     this->zones_.push_back(CrowAlarmPanelZone{
         .motion_binary_sensor = binary_sensor,
-        .bypass_binary_sensor = nullptr,
+        .bypass_switch = nullptr,
         .zone = zone,
     });
   }
-  void register_zone_bypass(binary_sensor::BinarySensor *binary_sensor, uint8_t zone) {
+  void register_zone_bypass_switch(switch_::Switch *bypass_switch, uint8_t zone) {
     for (auto &z : this->zones_) {
       if (z.zone == zone) {
-        z.bypass_binary_sensor = binary_sensor;
+        z.bypass_switch = bypass_switch;
         return;
       }
     }
     this->zones_.push_back(CrowAlarmPanelZone{
         .motion_binary_sensor = nullptr,
-        .bypass_binary_sensor = binary_sensor,
+        .bypass_switch = bypass_switch,
         .zone = zone,
     });
   }
@@ -247,6 +259,16 @@ class CrowAlarmPanel : public Component {
   uint8_t output_select_key_idx_{0};
   uint8_t output_select_retry_count_{0};  // max 1 automatic retry before aborting
 
+  // Zone-bypass state machine. The panel toggles bypass per BYPASS/digits/ENTER sequence,
+  // so the switch state is only published from ZONE_STATE bypass-bitmap broadcasts, never
+  // optimistically.
+  ZoneBypassState zone_bypass_state_{ZoneBypassState::IDLE};
+  uint32_t zone_bypass_state_enter_ms_{0};
+  std::vector<uint8_t> zone_bypass_keys_;
+  uint8_t zone_bypass_key_idx_{0};
+  uint8_t zone_bypass_target_zone_{0};   // for logging only
+  uint8_t zone_bypass_initial_bitmap_{0};  // BB from the first KEYPAD_COMMAND after BYPASS
+
   // Arm/disarm state machine.
   ArmDisarmState arm_disarm_state_{ArmDisarmState::IDLE};
   uint32_t arm_disarm_state_enter_ms_{0};
@@ -265,6 +287,23 @@ class CrowAlarmPanel : public Component {
   std::vector<CrowAlarmPanelZone> zones_;
   std::vector<CrowAlarmPanelKeypad> keypads_;
   std::vector<CrowAlarmPanelOutput> outputs_;
+};
+
+// Bypass toggle switch created by the parent's `zones:` config. Lives here (not in switch/)
+// because zone entities are instantiated from the parent component, which must compile even
+// when no `switch:` platform entry exists in YAML.
+class CrowAlarmPanelZoneBypassSwitch : public switch_::Switch, public Component {
+ public:
+  void dump_config() override;
+
+  void set_parent(CrowAlarmPanel *parent) { this->parent_ = parent; }
+  void set_zone_number(uint8_t zone_number) { this->zone_number_ = zone_number; }
+
+ protected:
+  void write_state(bool state) override;
+
+  CrowAlarmPanel *parent_{nullptr};
+  uint8_t zone_number_{0};
 };
 
 class CrowAlarmControlPanel : public alarm_control_panel::AlarmControlPanel, public Component {

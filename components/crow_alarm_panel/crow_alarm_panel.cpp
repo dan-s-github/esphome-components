@@ -149,7 +149,7 @@ void IRAM_ATTR HOT CrowAlarmPanelStore::interrupt(CrowAlarmPanelStore *arg) {
       if (arg->data_length >= 3) {
         const uint8_t type = arg->buffer2[0];
         const bool addressed_type = (type == KEYPAD_COMMAND || type == KEYPAD_STATE || type == OUTPUT_SELECT_ACK ||
-                                     type == KEYPAD_PING);
+                                     type == KEYPAD_PING || type == BYPASS_STATUS);
         if (addressed_type && arg->buffer2[1] == arg->ack_keypad_address_) {
           arg->data_pin_.pin_mode(gpio::FLAG_OUTPUT);
           arg->data_pin_.digital_write(0);
@@ -280,10 +280,18 @@ void CrowAlarmPanel::loop() {
           ESP_LOGW(TAG, "Zone state invalid length, discarding");
           break;
         }
-        ESP_LOGD(TAG, "Zone state received [%s]", format_hex_pretty(data).c_str());
+        // broadcast_type: 0x00 = incremental, 0x01 = full broadcast (sent after registration).
+        // Full broadcasts carry accurate active/alarmed bitmaps but always have bypassed=0x00,
+        // even when zones are actually bypassed. Skip bypass updates for full broadcasts.
+        const bool is_full_broadcast = (data[0] == 0x01);
+        ESP_LOGD(TAG, "Zone state received [%s]%s", format_hex_pretty(data).c_str(),
+                 is_full_broadcast ? " (full broadcast, bypass skipped)" : "");
+        // Walk every zone slot the bitmap can represent (2 banks x 8 bits), not just zones
+        // declared under `zones:` in YAML. Otherwise activity on an unconfigured zone is
+        // silently swallowed and every message logs as "All zones clear".
         bool clear = true;
-        for (CrowAlarmPanelZone zone : this->zones_) {
-          const uint8_t zone_index = zone.zone - 1;
+        for (uint8_t zone_index = 0; zone_index < 16; zone_index++) {
+          const uint8_t zone_number = zone_index + 1;
           const uint8_t bit_mask = static_cast<uint8_t>(1U << (zone_index % 8));
           const bool high_bank = zone_index >= 8;
           const size_t active_idx = high_bank ? 4 : 1;
@@ -294,15 +302,20 @@ void CrowAlarmPanel::loop() {
           bool triggered_alarmed = (alarmed_idx < data.size()) && ((data[alarmed_idx] & bit_mask) != 0);
           bool bypassed = (bypassed_idx < data.size()) && ((data[bypassed_idx] & bit_mask) != 0);
 
-          if (zone.motion_binary_sensor != nullptr) {
-            zone.motion_binary_sensor->publish_state(triggered | triggered_alarmed);
-          }
-          if (zone.bypass_binary_sensor != nullptr) {
-            zone.bypass_binary_sensor->publish_state(bypassed);
+          for (CrowAlarmPanelZone &zone : this->zones_) {
+            if (zone.zone != zone_number)
+              continue;
+            if (zone.motion_binary_sensor != nullptr) {
+              zone.motion_binary_sensor->publish_state(triggered | triggered_alarmed);
+            }
+            if (zone.bypass_switch != nullptr && !is_full_broadcast) {
+              zone.bypass_switch->publish_state(bypassed);
+            }
+            break;
           }
 
           if (triggered) {
-            ESP_LOGD(TAG, "Zone %d active", zone.zone);
+            ESP_LOGD(TAG, "Zone %d active", zone_number);
             if (this->armed_state_ != nullptr && this->armed_state_->state != "arming") {
               this->armed_state_->publish_state("disarmed");  // Assume disarmed if motion detected in this byte
             }
@@ -319,7 +332,7 @@ void CrowAlarmPanel::loop() {
             if (this->alarm_control_panel_ != nullptr) {
               this->alarm_control_panel_->publish_state(alarm_control_panel::ACP_STATE_PENDING);
             }
-            ESP_LOGD(TAG, "Alarm pending from zone %d", zone.zone);
+            ESP_LOGD(TAG, "Alarm pending from zone %d", zone_number);
             clear = false;
           }
         }
@@ -503,6 +516,36 @@ void CrowAlarmPanel::loop() {
             default:
               break;
           }
+          // Drive zone-bypass state machine forward.
+          // See docs/zone_bypass_state_machine.md for observed timing.
+          switch (this->zone_bypass_state_) {
+            case ZoneBypassState::BYPASS_PENDING:
+              // Only advance on our own keypad's KEYPAD_COMMAND. Other keypads carry their
+              // own per-keypad BB values (e.g. the IP keypad always shows BB=0x08) that are
+              // unrelated to our bypass session state.
+              if (data[0] != this->keypad_address_) break;
+              // Capture the session BB from this KC (reflects existing bypasses when started
+              // within the panel's session-preservation window, ~20–30 s). Send all digits
+              // and ENTER back-to-back; the physical keypad does the same and traces confirm
+              // the panel processes them correctly without a second KC wait.
+              this->zone_bypass_initial_bitmap_ = (data.size() > 3) ? data[3] : 0;
+              ESP_LOGD(TAG, "[%s] Zone-bypass: KC received (BB=0x%02x), sending digits+ENTER",
+                       keypad_label(keypad, data[0]).c_str(), this->zone_bypass_initial_bitmap_);
+              while (this->zone_bypass_key_idx_ < this->zone_bypass_keys_.size()) {
+                this->keypress(this->zone_bypass_keys_[this->zone_bypass_key_idx_++]);
+              }
+              this->keypress(KEY_ENTER);
+              this->zone_bypass_state_ = ZoneBypassState::ENTER_PENDING;
+              this->zone_bypass_state_enter_ms_ = millis();
+              break;
+            case ZoneBypassState::ENTER_PENDING:
+              ESP_LOGD(TAG, "[%s] Zone-bypass: sequence complete for zone %u (KEYPAD_COMMAND after ENTER)",
+                       keypad_label(keypad, data[0]).c_str(), this->zone_bypass_target_zone_);
+              this->zone_bypass_state_ = ZoneBypassState::IDLE;
+              break;
+            default:
+              break;
+          }
         }
         break;
       }
@@ -595,6 +638,30 @@ void CrowAlarmPanel::loop() {
         ESP_LOGD(TAG, "Memory event #%d ", data[1]);
         break;
       }
+      case BYPASS_STATUS: {
+        if (data.size() < 2) {
+          ESP_LOGW(TAG, "Bypass status too short, discarding");
+          break;
+        }
+        {
+          CrowAlarmPanelKeypad bs_keypad = this->find_keypad_(data[0]);
+          ESP_LOGD(TAG, "[%s] Bypass status: bitmap=0x%02x [%02x.%s]", keypad_label(bs_keypad, data[0]).c_str(),
+                   data[1], type, format_hex_pretty(data).c_str());
+        }
+        // After ENTER the controller may send BYPASS_STATUS before KEYPAD_COMMAND (CC=0x15).
+        // Use it as a fallback completion signal for ENTER_PENDING — but only when the bitmap
+        // has actually changed. An unchanged bitmap means the bypass sequence didn't land
+        // (e.g. digits arrived late and were ignored by the controller).
+        if (data[0] == this->keypad_address_ && this->zone_bypass_state_ == ZoneBypassState::ENTER_PENDING &&
+            data[1] != this->zone_bypass_initial_bitmap_) {
+          CrowAlarmPanelKeypad my_keypad = this->find_keypad_(this->keypad_address_);
+          ESP_LOGD(TAG, "[%s] Zone-bypass: sequence complete for zone %u (BYPASS_STATUS bitmap 0x%02x→0x%02x)",
+                   keypad_label(my_keypad, this->keypad_address_).c_str(), this->zone_bypass_target_zone_,
+                   this->zone_bypass_initial_bitmap_, data[1]);
+          this->zone_bypass_state_ = ZoneBypassState::IDLE;
+        }
+        break;
+      }
       default:
         ESP_LOGD(TAG, "Unknown [%02x.%s]", type, format_hex_pretty(data).c_str());
         break;
@@ -641,6 +708,22 @@ void CrowAlarmPanel::loop() {
         this->output_select_key_idx_ = 0;
         this->output_select_retry_count_ = 0;
       }
+    }
+  }
+
+  // Zone-bypass watchdog: abort if any non-IDLE state exceeds 1s without progress.
+  // No automatic retry — the sequence toggles panel state, so a blind retry could
+  // undo a toggle that actually landed (same reasoning as post-fire output states).
+  if (this->zone_bypass_state_ != ZoneBypassState::IDLE) {
+    const uint32_t now_ms = millis();
+    if (now_ms - this->zone_bypass_state_enter_ms_ > 1000) {
+      CrowAlarmPanelKeypad my_keypad = this->find_keypad_(this->keypad_address_);
+      ESP_LOGW(TAG, "[%s] Zone-bypass: timeout in state %u for zone %u, aborting",
+               keypad_label(my_keypad, this->keypad_address_).c_str(),
+               static_cast<uint8_t>(this->zone_bypass_state_), this->zone_bypass_target_zone_);
+      this->zone_bypass_state_ = ZoneBypassState::IDLE;
+      this->zone_bypass_keys_.clear();
+      this->zone_bypass_key_idx_ = 0;
     }
   }
 
@@ -767,6 +850,61 @@ void CrowAlarmPanel::set_output(uint8_t output, bool state) {
   this->keypress(KEY_OUTPUT);
 }
 
+void CrowAlarmPanel::set_zone_bypass(uint8_t zone, bool state) {
+  if (this->zone_bypass_state_ != ZoneBypassState::IDLE) {
+    ESP_LOGW(TAG, "set_zone_bypass(%u, %s): bypass sequence already in progress, ignoring", zone, ONOFF(state));
+    return;
+  }
+  // All three keypress state machines advance on the same KEYPAD_COMMAND frames; running
+  // two at once would double-consume confirmations.
+  if (this->output_select_state_ != OutputSelectState::IDLE || this->arm_disarm_state_ != ArmDisarmState::IDLE) {
+    ESP_LOGW(TAG, "set_zone_bypass(%u, %s): another keypress sequence in progress, ignoring", zone, ONOFF(state));
+    return;
+  }
+  if (this->is_armed()) {
+    ESP_LOGW(TAG, "set_zone_bypass(%u, %s): panel is armed, bypass can only be toggled while disarmed", zone,
+             ONOFF(state));
+    return;
+  }
+  // The keypad sequence toggles bypass. Skip if the switch already reports the requested
+  // state. The switch mirrors the ZONE_STATE bypass bitmap but defaults to off at boot,
+  // so before the first broadcast an "off" request is treated as already satisfied.
+  for (auto &z : this->zones_) {
+    if (z.zone != zone) {
+      continue;
+    }
+    if (z.bypass_switch != nullptr && z.bypass_switch->state == state) {
+      ESP_LOGD(TAG, "set_zone_bypass(%u, %s): switch already reports requested state, skipping", zone, ONOFF(state));
+      return;
+    }
+    break;
+  }
+
+  // Zone number is always entered as two digits, zero-padded (zone 2 → "0", "2").
+  this->zone_bypass_keys_.clear();
+  this->zone_bypass_keys_.push_back(zone / 10);
+  this->zone_bypass_keys_.push_back(zone % 10);
+  this->zone_bypass_key_idx_ = 0;
+  this->zone_bypass_target_zone_ = zone;
+
+  CrowAlarmPanelKeypad my_keypad = this->find_keypad_(this->keypad_address_);
+  ESP_LOGD(TAG, "[%s] Zone-bypass: starting toggle sequence for zone %u (want %s)",
+           keypad_label(my_keypad, this->keypad_address_).c_str(), zone, ONOFF(state));
+  // Set state BEFORE the keypress calls — send_packet() delays/yields internally, which
+  // re-enters loop(); a KEYPAD_COMMAND arriving during that yield must see BYPASS_PENDING.
+  this->zone_bypass_state_ = ZoneBypassState::BYPASS_PENDING;
+  this->zone_bypass_state_enter_ms_ = millis();
+  this->keypress(KEY_BYPASS);
+  // Send digit[0] (= zone / 10, always "0" for zones 1–9) immediately, before KC arrives.
+  // The physical keypad generates the entire bypass sequence (BYPASS + 0 + zone_digit +
+  // ENTER) from a single zone key press. BYPASS and "0" are sent first (~17–43ms), then
+  // zone_digit + ENTER follow after KC. Only send if still BYPASS_PENDING — a KC during
+  // the yield above already advanced state and consumed all remaining digits inline.
+  if (this->zone_bypass_state_ == ZoneBypassState::BYPASS_PENDING) {
+    this->keypress(this->zone_bypass_keys_[this->zone_bypass_key_idx_++]);
+  }
+}
+
 void CrowAlarmPanel::send_packet(uint8_t type, const std::vector<uint8_t> &data) {
   std::vector<uint8_t> packet;
   packet.push_back(BOUNDARY);
@@ -882,6 +1020,21 @@ bool CrowAlarmPanel::is_armed() const {
     return this->alarm_control_panel_->get_state() != alarm_control_panel::ACP_STATE_DISARMED;
   }
   return false;
+}
+
+void CrowAlarmPanelZoneBypassSwitch::write_state(bool state) {
+  if (this->parent_ == nullptr) {
+    ESP_LOGE(TAG, "Parent not set, ignoring zone bypass switch command");
+    return;
+  }
+  // No optimistic publish: bypass is a toggle sequence on the panel, so the switch state
+  // is only published from the ZONE_STATE bypass bitmap once the panel confirms it.
+  this->parent_->set_zone_bypass(this->zone_number_, state);
+}
+
+void CrowAlarmPanelZoneBypassSwitch::dump_config() {
+  LOG_SWITCH("", "Crow Alarm Panel Zone Bypass Switch", this);
+  ESP_LOGCONFIG(TAG, "  Zone number %d", this->zone_number_);
 }
 }  // namespace crow_alarm_panel
 }  // namespace esphome

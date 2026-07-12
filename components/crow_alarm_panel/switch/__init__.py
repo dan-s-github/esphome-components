@@ -2,9 +2,17 @@ import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome.components import switch
 from esphome.const import CONF_ID, CONF_TYPE, CONF_OUTPUT
-from .. import crow_alarm_panel_ns, CrowAlarmPanel, CONF_CROW_ALARM_PANEL_ID
+from .. import (
+    crow_alarm_panel_ns,
+    CrowAlarmPanel,
+    CrowAlarmPanelZoneBypassSwitch,
+    CONF_CROW_ALARM_PANEL_ID,
+    CONF_ZONE,
+)
 
 DEPENDENCIES = ["crow_alarm_panel"]
+
+CONF_BYPASS = "bypass"
 
 CrowAlarmPanelSwitch = crow_alarm_panel_ns.class_(
     "CrowAlarmPanelSwitch", switch.Switch, cg.Component
@@ -29,18 +37,28 @@ CONFIG_SCHEMA = cv.typed_schema(
                 cv.Required(CONF_OUTPUT): cv.int_range(min=1, max=8),
             }
         ),
+        CONF_BYPASS: CROW_SWITCH_SCHEMA.extend(
+            {
+                cv.GenerateID(): cv.declare_id(CrowAlarmPanelZoneBypassSwitch),
+                cv.Required(CONF_ZONE): cv.int_range(min=1, max=16),
+            }
+        ),
     }
 )
 
 
-def to_code(config):
-    paren = yield cg.get_variable(config[CONF_CROW_ALARM_PANEL_ID])
+async def to_code(config):
+    paren = await cg.get_variable(config[CONF_CROW_ALARM_PANEL_ID])
+    var = cg.new_Pvariable(config[CONF_ID])
     type = config[CONF_TYPE]
-    if type == "output":
-        var = cg.new_Pvariable(config[CONF_ID])
+    if type == CONF_OUTPUT:
         cg.add(var.set_crow_alarm_panel_parent(paren))
         cg.add(var.set_output_number(config[CONF_OUTPUT]))
         cg.add(paren.register_output_switch(var, config[CONF_OUTPUT]))
+    elif type == CONF_BYPASS:
+        cg.add(var.set_parent(paren))
+        cg.add(var.set_zone_number(config[CONF_ZONE]))
+        cg.add(paren.register_zone_bypass_switch(var, config[CONF_ZONE]))
 
-    yield switch.register_switch(var, config)
-    yield cg.register_component(var, config)
+    await switch.register_switch(var, config)
+    await cg.register_component(var, config)

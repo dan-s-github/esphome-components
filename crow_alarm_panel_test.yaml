@@ -45,6 +45,15 @@ crow_alarm_panel:
     - name: "Control 4 Keypad"
       address: 7
 
+  # Each zone entry creates a zone binary sensor and a switch that toggles bypass
+  # via the keypad BYPASS sequence (the switch state mirrors the panel's bypass bitmap).
+  zones:
+    - zone: 1
+      device_class: motion  # entities: "Zone 1" sensor, "Bypass 1" switch
+      icon: mdi:motion-sensor
+    - zone: 2
+      name: "Front Door"    # entities: "Front Door" sensor, "Bypass Front Door" switch
+
   on_message:
     - lambda: |-
         ESP_LOGI("crow_alarm_panel", "%02x - %s", type, format_hex_pretty(data).c_str());
@@ -54,18 +63,15 @@ text_sensor:
     name: "Alarm Armed State"
     type: armed_state
 
+# Standalone zone sensors remain supported for zones that don't need
+# the full auto-generated entity set.
 binary_sensor:
   - platform: crow_alarm_panel
     device_class: motion
     icon: mdi:motion-sensor
-    name: "Zone 1"
+    name: "Zone 3"
     type: zone
-    zone: 1
-
-  - platform: crow_alarm_panel
-    name: "Zone 1 Bypassed"
-    type: bypass
-    zone: 1
+    zone: 3
 
 alarm_control_panel:
   - platform: crow_alarm_panel
@@ -95,3 +101,8 @@ switch:
     type: output
     output: 4
     name: "Garage Door"
+  # Standalone bypass switch (state + control) for a zone not using `zones:`.
+  - platform: crow_alarm_panel
+    type: bypass
+    zone: 3
+    name: "Zone 3 Bypass"
