@@ -82,7 +82,7 @@ That makes the installer flow look much more like:
 3. edit **date** as `DDMMYY`
 4. edit **day-of-week** as a single digit
 
-The clean trace also shows only valid decoded `Controller time update` timestamps during the interaction, which strengthens the idea that the malformed `0x54` frames are a separate variant rather than a problem with the HHMM decode itself.
+The clean trace also shows only valid decoded `Controller time update` timestamps during the interaction, which strengthens the idea that the malformed `0x54` frames are a separate variant rather than a problem with the HHMM decode itself. (Superseded — see the resolved note further down and `protocol_investigations.md`: the malformed frames are a bit-corruption glitch in the same `CURRENT_TIME` frame, not a separate packet variant.)
 
 ## Addendum from the settings-navigation trace
 
@@ -231,6 +231,8 @@ The longer trace confirms the mixed-frame behavior seen earlier:
   - `12:44:08 -> Sunday 20104-16-48 10:36:31`
 
 So the `data[1:2]` minutes-since-midnight interpretation still looks plausible for the good frames, but some `0x54` frames clearly carry different or malformed date/seconds fields.
+
+**Update (resolved, see `protocol_investigations.md`):** a later session with `ESP_LOGV` enabled captured the raw bytes of a malformed frame and confirmed this is a single-bit-insertion glitch right after the `seconds` byte, recurring deterministically once per minute at the `seconds = 15` broadcast — not a second packet variant sharing `0x54`. It corrupts `day`/`month`/`year` only; `day_of_week`/`minutes`/`seconds` stay correct. The `20104-16-48` example above (a 4-digit year with an impossible day) is consistent with a deeper corruption of the same kind — the number of spurious bits inserted appears to vary between sessions even though the insertion point is fixed.
 
 ## Time-setting interaction
 
@@ -407,7 +409,7 @@ That suggests the panel applies the edited values quickly and resets seconds clo
    - `0x1F` installer transition packet
    - `0xAB` menu field packet
    - `0x26` menu field-list / layout packet
-3. In `CURRENT_TIME` logging, treat malformed date/seconds combinations as invalid variants instead of presenting them as authoritative controller timestamps.
+3. In `CURRENT_TIME` logging, treat malformed date/seconds combinations as invalid variants instead of presenting them as authoritative controller timestamps. (Done — see per-field validation in `crow_alarm_panel.cpp` and the root-cause writeup in `protocol_investigations.md`.)
 4. Extend controller-status logging to call out `b3=0x10` as an installer-related context bit/value when `0x15` simultaneously reports installer mode.
 5. Consider logging `PROGRAM` as `PROGRAM/BACK` when it occurs inside installer context, or at least document that it may represent back-navigation rather than only the physical Program button.
 
@@ -417,4 +419,4 @@ That suggests the panel applies the edited values quickly and resets seconds clo
 2. What do `1A.01`, `1A.02`, and `1A.03` correspond to: time, date, weekday, active cursor, or field-transition markers?
 3. Is `0x26` describing on-screen editable fields, and does `0xAB` identify the active field?
 4. Do the `down` / `time&date` touchscreen navigation actions use a packet family we still are not decoding, or are they handled locally on the keypad until the `Time&Date` editor is entered?
-5. Are the malformed `0x54` time frames emitted by the panel itself, or are they a decoding artifact caused by a second time-related packet variant that shares type `0x54`?
+5. ~~Are the malformed `0x54` time frames emitted by the panel itself, or are they a decoding artifact caused by a second time-related packet variant that shares type `0x54`?~~ **Resolved:** neither — it's a single-bit-insertion glitch after the `seconds` byte in an otherwise-normal `CURRENT_TIME` frame, recurring once per minute. See `protocol_investigations.md`. Whether the bit originates on the panel's bus driver or in our own ISR sampling is still open.
