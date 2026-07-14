@@ -159,6 +159,16 @@ Armed Stay encoding not yet observed. Assumed to use a fourth combination.
 | 4 | 1 | `UNKNOWN_01` | Always `0x00` | Low |
 | 5 | 1 | `UNKNOWN_02` | Always `0x00` | Low |
 
+All observations above come from a standard 8-zone ESL-2. Bytes 4–5 have only ever
+been seen as `0x00`, which is equally consistent with "reserved/unused" and with
+"zones 9–16 active/alarmed bitmap, always empty on 8-zone hardware" — the two
+hypotheses are indistinguishable without a 16-zone panel's traces. The C++ parser
+optimistically reads bytes 4/5 as a second active/alarmed bank for zones 9–16 (see
+`crow_alarm_panel.cpp`'s `ZONE_STATE` handler), but this is unverified and the
+bypass bank for zones 9–16 (`UNKNOWN_02` + 1 = offset 6) doesn't even exist in a
+6-byte payload, so bypass can never be reported for zones above 8 as currently
+parsed. Treat zones 9–16 as untested until traced against real hardware.
+
 **Zone bitmap (applies to `active`, `alarmed`, `bypassed`):**
 
 | Bit (0-indexed) | Zone |

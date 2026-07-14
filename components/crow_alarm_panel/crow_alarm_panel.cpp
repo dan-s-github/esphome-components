@@ -318,6 +318,8 @@ void CrowAlarmPanel::loop() {
         // Walk every zone slot the bitmap can represent (2 banks x 8 bits), not just zones
         // declared under `zones:` in YAML. Otherwise activity on an unconfigured zone is
         // silently swallowed and every message logs as "All zones clear".
+        // The high bank (zones 9-16, offsets 4/5) is an unverified extrapolation — only
+        // tested against a standard 8-zone ESL-2. See docs/protocol_wire_format.md.
         bool clear = true;
         for (uint8_t zone_index = 0; zone_index < 16; zone_index++) {
           const uint8_t zone_number = zone_index + 1;

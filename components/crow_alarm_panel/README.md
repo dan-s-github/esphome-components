@@ -98,7 +98,7 @@ crow_alarm_panel:
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `zone` | yes | — | Zone number (1–16) |
+| `zone` | yes | — | Zone number (1–16). Only zones 1–8 have been tested against real hardware (a standard 8-zone ESL-2); zones 9–16 rely on an unverified extrapolation of the wire format — see [`protocol_wire_format.md`](docs/protocol_wire_format.md#0x12--zone_state). |
 | `name` | no | `"Zone {n}"` | Name for the zone sensor; bypass switch is named `"Bypass {name}"` or `"Bypass {n}"` |
 | `device_class` | no | — | Binary sensor device class (e.g. `motion`, `door`, `smoke`) |
 | `icon` | no | — | Icon for the zone sensor |
