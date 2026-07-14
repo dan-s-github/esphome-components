@@ -333,7 +333,8 @@ class CrowAlarmControlPanel : public alarm_control_panel::AlarmControlPanel, pub
   uint32_t get_supported_features() const override {
     return alarm_control_panel::ACP_FEAT_ARM_AWAY | alarm_control_panel::ACP_FEAT_ARM_HOME;
   }
-  bool get_requires_code() const override { return true; }
+  // No default code configured means the user must supply one when disarming.
+  bool get_requires_code() const override { return this->effective_code_().empty(); }
   bool get_requires_code_to_arm() const override { return this->requires_code_to_arm_; }
 
   void set_parent(CrowAlarmPanel *parent) { this->parent_ = parent; }
