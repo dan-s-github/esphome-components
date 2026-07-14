@@ -874,6 +874,10 @@ void CrowAlarmPanel::start_code_sequence_(const std::string &code, uint8_t termi
 }
 
 void CrowAlarmPanel::arm_away(const std::string &code) {
+  if (!this->is_active_keypad()) {
+    ESP_LOGW(TAG, "arm_away: passive monitor mode, ignoring");
+    return;
+  }
   if (this->arm_disarm_state_ != ArmDisarmState::IDLE) {
     ESP_LOGW(TAG, "arm_away: ARM/DISARM already in progress, ignoring");
     return;
@@ -890,6 +894,10 @@ void CrowAlarmPanel::arm_away(const std::string &code) {
 }
 
 void CrowAlarmPanel::arm_stay(const std::string &code) {
+  if (!this->is_active_keypad()) {
+    ESP_LOGW(TAG, "arm_stay: passive monitor mode, ignoring");
+    return;
+  }
   if (this->arm_disarm_state_ != ArmDisarmState::IDLE) {
     ESP_LOGW(TAG, "arm_stay: ARM/DISARM already in progress, ignoring");
     return;
@@ -906,6 +914,10 @@ void CrowAlarmPanel::arm_stay(const std::string &code) {
 }
 
 void CrowAlarmPanel::disarm(const std::string &code) {
+  if (!this->is_active_keypad()) {
+    ESP_LOGW(TAG, "disarm: passive monitor mode, ignoring");
+    return;
+  }
   if (!this->is_armed()) {
     ESP_LOGW(TAG, "disarm: not armed, ignoring");
     return;
@@ -923,6 +935,10 @@ void CrowAlarmPanel::keypress(uint8_t key) {
 }
 
 void CrowAlarmPanel::set_output(uint8_t output, bool state) {
+  if (!this->is_active_keypad()) {
+    ESP_LOGW(TAG, "set_output(%u, %s): passive monitor mode, ignoring", output, state ? "on" : "off");
+    return;
+  }
   if (this->output_select_state_ != OutputSelectState::IDLE) {
     ESP_LOGW(TAG, "set_output(%u, %s): output-select sequence already in progress", output, state ? "on" : "off");
     return;
@@ -946,6 +962,10 @@ void CrowAlarmPanel::set_output(uint8_t output, bool state) {
 }
 
 void CrowAlarmPanel::set_zone_bypass(uint8_t zone, bool state) {
+  if (!this->is_active_keypad()) {
+    ESP_LOGW(TAG, "set_zone_bypass(%u, %s): passive monitor mode, ignoring", zone, ONOFF(state));
+    return;
+  }
   if (this->zone_bypass_state_ != ZoneBypassState::IDLE) {
     ESP_LOGW(TAG, "set_zone_bypass(%u, %s): bypass sequence already in progress, ignoring", zone,
              ONOFF(state));

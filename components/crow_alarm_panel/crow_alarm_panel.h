@@ -343,8 +343,14 @@ class CrowAlarmControlPanel : public alarm_control_panel::AlarmControlPanel, pub
 
  protected:
   void control(const alarm_control_panel::AlarmControlPanelCall &call) override;
-  // Entity-level code if set, else the parent panel's code. Only valid once parent_ is set.
-  const std::string &effective_code_() const { return this->code_.empty() ? this->parent_->get_code() : this->code_; }
+  // Entity-level code if set, else the parent panel's code (or empty if parent_ isn't set yet).
+  const std::string &effective_code_() const {
+    if (!this->code_.empty()) {
+      return this->code_;
+    }
+    static const std::string empty_code;
+    return this->parent_ != nullptr ? this->parent_->get_code() : empty_code;
+  }
   // The API always sends a code field (empty string when the user didn't enter one), so an empty
   // call code must fall back to the configured default rather than shadow it.
   std::string resolve_code_(const alarm_control_panel::AlarmControlPanelCall &call) const {
