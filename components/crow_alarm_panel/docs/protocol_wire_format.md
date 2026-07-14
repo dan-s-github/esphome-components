@@ -159,6 +159,16 @@ Armed Stay encoding not yet observed. Assumed to use a fourth combination.
 | 4 | 1 | `UNKNOWN_01` | Always `0x00` | Low |
 | 5 | 1 | `UNKNOWN_02` | Always `0x00` | Low |
 
+All observations above come from a standard 8-zone ESL-2. Bytes 4–5 have only ever
+been seen as `0x00`, which is equally consistent with "reserved/unused" and with
+"zones 9–16 active/alarmed bitmap, always empty on 8-zone hardware" — the two
+hypotheses are indistinguishable without a 16-zone panel's traces. The C++ parser
+optimistically reads bytes 4/5 as a second active/alarmed bank for zones 9–16 (see
+`crow_alarm_panel.cpp`'s `ZONE_STATE` handler), but this is unverified and the
+bypass bank for zones 9–16 (`UNKNOWN_02` + 1 = offset 6) doesn't even exist in a
+6-byte payload, so bypass can never be reported for zones above 8 as currently
+parsed. Treat zones 9–16 as untested until traced against real hardware.
+
 **Zone bitmap (applies to `active`, `alarmed`, `bypassed`):**
 
 | Bit (0-indexed) | Zone |
@@ -172,8 +182,11 @@ Armed Stay encoding not yet observed. Assumed to use a fourth combination.
 | 6 (`0x40`) | Zone 7 |
 | 7 (`0x80`) | Zone 8 |
 
-The full broadcast (`broadcast_type=0x01`) is sent immediately after a
-`KEYPAD_REGISTRATION` announce and provides a complete snapshot rather than a delta.
+The full broadcast (`broadcast_type=0x01`) is sent periodically and after
+`KEYPAD_REGISTRATION` announces. **Observed behavior:** the `bypassed` field is always
+`0x00` in full broadcasts even when zones are actually bypassed — only incremental packets
+(`broadcast_type=0x00`) carry accurate bypass state. The `active` and `alarmed` fields
+appear reliable in both variants. Code must not update bypass state from full broadcasts.
 
 **Examples:**
 ```
@@ -397,8 +410,17 @@ minute = minutes_since_midnight % 60
 ```
 
 **Garbage time values** (seconds ≥ 60, day = 0 or > 31, month = 0 or > 12)
-are commonly seen when the controller RTC has not been set. All fields must
-be validated individually before use.
+occur regularly and are not (only) an unset-RTC symptom. One confirmed cause,
+reproduced across multiple sessions: a single spurious bit gets clocked into
+the bitstream right after the `seconds` byte, shifting every following byte's
+alignment by one position for the rest of the frame — for `day`/`month`/`year`
+(none of which ever set bit 7) this is bit-for-bit indistinguishable from each
+of those three bytes being doubled. It recurs deterministically once per
+minute, at the `seconds = 15` broadcast. See `protocol_investigations.md`
+("`CURRENT_TIME` (0x54) periodic bit-corruption glitch") for the full
+byte-level analysis. All fields must be validated individually before use,
+and corrupted frames should be discarded rather than corrected (a doubled
+value can coincidentally land back in a valid range).
 
 **Verified example:**
 ```

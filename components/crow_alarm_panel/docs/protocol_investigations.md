@@ -205,3 +205,54 @@ Notes:
 - Both Control4 and ESPHome keypads show ~28s arming delay between `Arming` and `Armed Away`.
 - `0x14 ... AA ...` appears during this delay on both keypads, consistent with a countdown/exit-delay marker.
 - Disarm remains code-entry + ENTER; captured code samples are intentionally redacted.
+
+## `CURRENT_TIME` (0x54) periodic bit-corruption glitch
+
+Source trace: `../../../traces/esphome-aap-alarm-interface-logs-8.txt` (`ESP_LOGV` enabled, so raw frame bytes are visible).
+
+This resolves open question 5 in `protocol_trace_2026-04-12_time_setting.md` ("Are the malformed `0x54` time frames emitted by the panel itself, or are they a decoding artifact...").
+
+### Snippet
+
+```sh
+[15:42:55.689][V][crow_alarm_panel:250]: Received raw frame [54.06.03.AF.00.0A.07.1A (7)]
+[15:42:55.702][D][crow_alarm_panel:429]: Controller time update: Friday 2026-07-10 15:43:00
+
+[15:43:10.667][V][crow_alarm_panel:250]: Received raw frame [54.06.03.AF.0F.14.0E.34 (7)]
+[15:43:10.671][W][crow_alarm_panel:426]: Current time has invalid month value 14
+
+[15:43:25.691][V][crow_alarm_panel:250]: Received raw frame [54.06.03.AF.1E.0A.07.1A (7)]
+[15:43:25.793][D][crow_alarm_panel:429]: Controller time update: Friday 2026-07-10 15:43:30
+```
+
+Two more occurrences later in the same session are byte-for-byte identical in their corruption pattern:
+
+```sh
+[15:44:10.747][V][crow_alarm_panel:250]: Received raw frame [54.06.03.B0.0F.14.0E.34 (7)]
+[15:45:10.688][V][crow_alarm_panel:250]: Received raw frame [54.06.03.B1.0F.14.0E.34 (7)]
+```
+
+### Findings (observed facts)
+
+- The malformed frame always occurs at the `seconds = 0x0F` (15s) broadcast — i.e. once per minute, one out of every four `CURRENT_TIME` broadcasts (the panel emits one every ~15s).
+- `day_of_week`, `minutes_since_midnight`, and `seconds` (offsets 0–3) decode identically and correctly compared to the neighboring good frames in the same cycle.
+- Only `day`, `month`, `year` (offsets 4–6) are wrong, and each is **exactly double** the correct value:
+  - `day`: `0x0A` (10) → `0x14` (20)
+  - `month`: `0x07` (7) → `0x0E` (14)
+  - `year`: `0x1A` (26) → `0x34` (52)
+- This exact corrupted byte sequence (`0F.14.0E.34`, modulo the minutes byte incrementing) repeated identically across three separate one-minute cycles in the same capture session.
+- A different capture session (`esphome-aap-keypad-monitor-logs-26.txt`) shows `month value 28` instead of 14 for the same failure mode — `28` does not fit a single doubling of any valid month (max would be `12*2=24`), suggesting the number of corrupted bits can vary between sessions even though the corruption always starts at the same field boundary.
+
+### Inference (high confidence)
+
+Doubling a byte whose true value never sets bit 7 (true for `day` 1–31, `month` 1–12, `year` 0–99) is bit-for-bit indistinguishable from: a single spurious `0` bit gets clocked into the bitstream exactly at the boundary between the `seconds` byte and the `day` byte, shifting every subsequent byte's bit alignment by one position for the remainder of the frame. Verified by reconstructing all three corrupted bytes bit-by-bit from the known-good values plus a leading phantom `0` bit — the reconstruction matches the observed `0x14 / 0x0E / 0x34` exactly.
+
+The closing `0x7E` boundary is still found at the expected byte count (`(7)` in both good and bad frames), which is consistent with the framer's boundary detector because it uses a raw sliding-bit window rather than byte-aligned matching (see `protocol_wire_format.md`).
+
+### Assumption (unverified)
+
+Whether the extra bit originates from the panel's own bus driver (e.g. a hiccup while it composes/shifts out this specific broadcast) or from our own ISR sampling (e.g. something else briefly delaying bit capture at a consistent point in the cycle) is not established. The fact that it recurs at the exact same *relative* position every session, across different panel installs and different ESP32 units, favors a controller-side cause, but this is not confirmed.
+
+### Practical takeaway
+
+Do not attempt to auto-correct by halving the bytes: a doubled value can coincidentally land in a valid range (e.g. true `month=6` → corrupted `12`), which would silently publish a wrong-but-plausible date. Discarding the frame with a warning (current behavior) is the safer choice. The `ESP_LOGW` branches in `CURRENT_TIME` handling now include the raw frame hex so future captures don't require `ESP_LOGV` to diagnose this.

@@ -22,30 +22,27 @@ void CrowAlarmControlPanel::control(const alarm_control_panel::AlarmControlPanel
 
   switch (*target_state) {
     case alarm_control_panel::ACP_STATE_ARMED_AWAY: {
-      if (this->requires_code_to_arm_ && !call.get_code().has_value() && this->code_.empty()) {
+      std::string code = this->requires_code_to_arm_ ? this->resolve_code_(call) : "";
+      if (this->requires_code_to_arm_ && code.empty()) {
         this->status_momentary_warning("Code required to arm", 2000);
         return;
       }
-      std::string code = this->requires_code_to_arm_ ? (call.get_code().has_value() ? call.get_code().value() : this->code_) : "";
       this->parent_->arm_away(code);
       this->publish_state(alarm_control_panel::ACP_STATE_ARMING);
       break;
     }
     case alarm_control_panel::ACP_STATE_ARMED_HOME: {
-      if (this->requires_code_to_arm_ && !call.get_code().has_value() && this->code_.empty()) {
+      std::string code = this->requires_code_to_arm_ ? this->resolve_code_(call) : "";
+      if (this->requires_code_to_arm_ && code.empty()) {
         this->status_momentary_warning("Code required to arm", 2000);
         return;
       }
-      std::string code = this->requires_code_to_arm_ ? (call.get_code().has_value() ? call.get_code().value() : this->code_) : "";
       this->parent_->arm_stay(code);
       this->publish_state(alarm_control_panel::ACP_STATE_ARMING);
       break;
     }
     case alarm_control_panel::ACP_STATE_DISARMED: {
-      std::string code = this->code_;
-      if (call.get_code().has_value()) {
-        code = call.get_code().value();
-      }
+      std::string code = this->resolve_code_(call);
       if (code.empty()) {
         this->status_momentary_warning("Code required to disarm", 2000);
         return;

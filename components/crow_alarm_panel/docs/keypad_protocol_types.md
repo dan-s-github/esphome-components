@@ -113,6 +113,33 @@ Total code-entry time: 1,558ms
 - Controller waited for 5th digit or timeout + retry
 - Second attempt with correct 4-digit code succeeded in ~1.5s (standard ~600ms timing)
 
+#### BYPASS — zone 1 (from alarm-interface-logs-4)
+
+```
+ 0ms   Key BYPASS (0x0F) pressed  [a1.00.0F]
+43ms   Key 0 pressed              [a1.00.00]
+307ms  KEYPAD_COMMAND             [14.00.01.00.00.00.80]  ← CC=0x01, BB=0x00 (no bypass yet)
+339ms  Key 1 pressed              [a1.00.01]
+544ms  ZONE_STATE                 [00.00.00.01.00.00]     ← bypass bitmap = 0x01
+614ms  KEYPAD_COMMAND             [14.00.01.00.01.00.80]  ← BB=0x01 (zone 1 bypassed)
+819ms  Key ENTER pressed          [a1.00.11]
+1023ms KEYPAD_COMMAND             [14.00.15.00.01.00.88]  ← CC=0x15, flags=0x88
+```
+
+Running this again with zone 1 already bypassed toggles it back off (bypass bitmap returns
+to 0x00, flags returns to 0x80). Sequence is identical — BYPASS → 0 → 1 → ENTER.
+
+**`0x1b` packet (`BYPASS_STATUS`):** appears 1–2× per bypass sequence.
+Format `[1b.00.BB.00.00.00.00.00.00.00]` (10 bytes). Byte 2 (`BB`) = current bypass bitmap,
+matching ZONE_STATE byte 3. The first occurrence (immediately after BYPASS press) reflects
+the pre-change state — it is a status report when the controller enters bypass mode, not a
+change event. A second occurrence appears after the zone digit updates the bitmap, showing
+the new state. Named `BYPASS_STATUS` in firmware (analogous to `KEYPAD_STATE` / `ARMED_STATE`).
+
+**Cumulative bypass:** bypassing a second zone while one is already bypassed uses the same
+sequence; the controller ORs the new zone bit into the existing bitmap. After bypassing
+zones 2 and 3 and then zone 1, ZONE_STATE byte 3 = 0x07 and flags = 0x88.
+
 ---
 
 ### 3. Control4 Keypad (Address 0x06)
@@ -232,6 +259,7 @@ implemented with Command-gating and 1 s watchdog timeouts.
 1. **Confirm `0xAA` semantics** — observed during arming countdown on multiple keypads; likely exit-delay/countdown indicator
 2. **Verify `0x7E` in payload** — no payload byte equal to `0x7E` has been observed; unknown whether the protocol reserves this value or byte-stuffing exists for unseen message types
 3. **Capture Armed-Stay state encoding** — `0x11` armed_stay variant has not been observed (assumed to use a fourth `armed`/`arming` byte combination)
+4. **Clarify `BYPASS_STATUS` (0x1b) scope** — observed only during bypass sequences; unknown whether it also appears in other contexts (e.g. on boot, or whenever bypass state is queried)
 
 ---
 
@@ -243,3 +271,5 @@ implemented with Command-gating and 1 s watchdog timeouts.
 | esphome-aap-keypad-monitor-logs-4.txt | AAP (0x00) | Direct ARM, immediate DISARM |
 | esphome-aap-keypad-monitor-logs-5.txt | AAP (0x00) | Direct ARM, then 57s later code-based DISARM (redacted 5-digit) with timing issues |
 | esphome-aap-keypad-monitor-logs-25.txt | Control4 (0x06), ESPHome (0x05) | Control4 ARM + 28s arming delay + code DISARM (redacted); ESPHome ARM + 28s arming delay + code DISARM (redacted) |
+| esphome-aap-alarm-interface-logs-4.txt | AAP (0x00) | Zone activity; bypass/unbypass zone 1 (toggle) |
+| esphome-aap-alarm-interface-logs-5.txt | AAP (0x00) | Zone activity; bypass zones 2, 3, then 1 cumulatively (all three simultaneously) |

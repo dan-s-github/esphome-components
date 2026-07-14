@@ -26,6 +26,8 @@ static const uint8_t SETTING_VALUE = 0x16;   // for locking LEDs
 static const uint8_t SETTING_VALUE2 = 0x17;  // for flashing LEDs < 255
 static const uint8_t SETTING_VALUE3 = 0x18;  // for flashing LEDs > 255
 
+static const uint8_t BYPASS_STATUS = 0x1B;  // Bypass status; byte 1 = bypass bitmap (sent on BYPASS press and after each zone toggle)
+
 static const uint8_t MEMORY_EVENT = 0x20;
 
 static const uint8_t OUTPUT_SELECT_ACK = 0x1D;
@@ -72,7 +74,23 @@ enum class ArmDisarmState : uint8_t {
   ARM_AWAY_PENDING,   // sent KEY_ARM (no code), waiting for KEYPAD_COMMAND
   ARM_STAY_PENDING,   // sent KEY_STAY (no code), waiting for KEYPAD_COMMAND
   CODE_DIGIT_PENDING, // sent a code digit (arm-with-code or disarm), waiting for KEYPAD_COMMAND
-  CODE_ENTER_PENDING, // sent terminal key (KEY_ARM/KEY_STAY/KEY_ENTER), waiting for KEYPAD_COMMAND
+  // Sent terminal key (KEY_ARM/KEY_STAY/KEY_ENTER). KEYPAD_COMMAND byte[1] here is NOT used to
+  // decide success/failure — logs-10/35 and logs-12/37 (2026-07-12) show it's unreliable in both
+  // directions: a 0x01 ack can precede a sequence that succeeds moments later, AND a fully clean
+  // run of non-0x01 acks (no ambiguity at all) can still silently not disarm the panel. Any
+  // KEYPAD_COMMAND received here just proves the controller is alive; the sequence only resolves
+  // to IDLE via the independent ARMED_STATE broadcast (ground truth) or the shared 1s watchdog
+  // timing out (treated as failure). See arm_disarm_state_machine.md.
+  CODE_ENTER_PENDING,
+};
+
+// BYPASS → zone digit(s) → ENTER. TRACE-VERIFIED (see docs/zone_bypass_state_machine.md):
+// unlike the arm/disarm code sequence, the digits and ENTER are sent back-to-back after the
+// first KEYPAD_COMMAND (0x14) rather than waiting for a confirmation per key.
+enum class ZoneBypassState : uint8_t {
+  IDLE,
+  BYPASS_PENDING,  // sent KEY_BYPASS + first digit, waiting for KEYPAD_COMMAND
+  ENTER_PENDING,   // sent remaining digit + ENTER, waiting for final KEYPAD_COMMAND
 };
 
 struct CrowAlarmPanelMessage {
@@ -117,7 +135,7 @@ class CrowAlarmPanelStore {
   // Hardware ACK: set from CrowAlarmPanel::setup() before interrupts attach.
   // ack_pending_ is set in the ISR when a frame addressed to us ends, and cleared on the next
   // falling edge after driving DAT low for one clock cycle (~1 bus clock, ~416–833µs).
-  uint8_t ack_keypad_address_{0};
+  uint8_t ack_keypad_address_{0xFF};  // set from setup(); 0xFF = never ACK (passive mode)
   volatile bool ack_pending_{false};
   // Timestamp (micros) when ack_pending_ was set. Used by loop() to release the ACK pin
   // if the next clock edge never arrives (e.g. clock stops between packets).
@@ -151,7 +169,7 @@ class CrowAlarmPanelStore {
 
 struct CrowAlarmPanelZone {
   binary_sensor::BinarySensor *motion_binary_sensor;
-  binary_sensor::BinarySensor *bypass_binary_sensor;
+  switch_::Switch *bypass_switch;  // bypass state indicator AND control (no separate sensor)
   uint8_t zone;
 };
 
@@ -167,10 +185,15 @@ class CrowAlarmPanel : public Component {
   void loop() override;
 
   void set_output(uint8_t output, bool state);
+  void set_zone_bypass(uint8_t zone, bool state);
 
   void set_clock_pin(InternalGPIOPin *clock) { this->clock_pin_ = clock; }
   void set_data_pin(InternalGPIOPin *data) { this->data_pin_ = data; }
   void set_keypad_address(uint8_t address) { this->keypad_address_ = address; }
+  bool is_active_keypad() const { return this->keypad_address_ <= 7; }
+  // Panel-level alarm code; entities without their own code fall back to this.
+  void set_code(const std::string &code) { this->code_ = code; }
+  const std::string &get_code() const { return this->code_; }
   void add_keypad(const std::string &name, uint8_t address) {
     this->keypads_.push_back(std::move(CrowAlarmPanelKeypad{
         .name = name,
@@ -187,20 +210,20 @@ class CrowAlarmPanel : public Component {
     }
     this->zones_.push_back(CrowAlarmPanelZone{
         .motion_binary_sensor = binary_sensor,
-        .bypass_binary_sensor = nullptr,
+        .bypass_switch = nullptr,
         .zone = zone,
     });
   }
-  void register_zone_bypass(binary_sensor::BinarySensor *binary_sensor, uint8_t zone) {
+  void register_zone_bypass_switch(switch_::Switch *bypass_switch, uint8_t zone) {
     for (auto &z : this->zones_) {
       if (z.zone == zone) {
-        z.bypass_binary_sensor = binary_sensor;
+        z.bypass_switch = bypass_switch;
         return;
       }
     }
     this->zones_.push_back(CrowAlarmPanelZone{
         .motion_binary_sensor = nullptr,
-        .bypass_binary_sensor = binary_sensor,
+        .bypass_switch = bypass_switch,
         .zone = zone,
     });
   }
@@ -247,17 +270,34 @@ class CrowAlarmPanel : public Component {
   uint8_t output_select_key_idx_{0};
   uint8_t output_select_retry_count_{0};  // max 1 automatic retry before aborting
 
+  // Zone-bypass state machine. The panel toggles bypass per BYPASS/digits/ENTER sequence,
+  // so the switch state is only published from ZONE_STATE bypass-bitmap broadcasts, never
+  // optimistically.
+  ZoneBypassState zone_bypass_state_{ZoneBypassState::IDLE};
+  uint32_t zone_bypass_state_enter_ms_{0};
+  std::vector<uint8_t> zone_bypass_keys_;
+  uint8_t zone_bypass_key_idx_{0};
+  uint8_t zone_bypass_target_zone_{0};   // for logging only
+  uint8_t zone_bypass_initial_bitmap_{0};  // BB from the first KEYPAD_COMMAND after BYPASS
+
   // Arm/disarm state machine.
   ArmDisarmState arm_disarm_state_{ArmDisarmState::IDLE};
   uint32_t arm_disarm_state_enter_ms_{0};
   std::vector<uint8_t> arm_disarm_code_digits_;  // code digits consumed one per KEYPAD_COMMAND
   uint8_t arm_disarm_code_idx_{0};
   uint8_t arm_disarm_terminal_key_{KEY_ENTER};  // KEY_ENTER (disarm), KEY_ARM or KEY_STAY (arm-with-code)
+  // "Digit accepted" display_code (KEYPAD_COMMAND byte[1]) learned from the first digit's
+  // response each sequence. Physical keypad types disagree on this value (0x01 is common,
+  // but address 0x05 has been observed sending 0x07 for the same "more digits expected"
+  // semantic — see docs/arm_disarm_state_machine.md), so it can't be hardcoded to 0x01.
+  uint8_t arm_disarm_digit_ack_byte_{0};
+  bool arm_disarm_digit_ack_byte_set_{false};
 
   CrowAlarmPanelStore store_;
   InternalGPIOPin *clock_pin_{nullptr};
   InternalGPIOPin *data_pin_{nullptr};
-  uint8_t keypad_address_{0};
+  uint8_t keypad_address_{0xFF};  // 0xFF = not configured (passive monitor mode)
+  std::string code_;
   text_sensor::TextSensor *armed_state_{nullptr};
   alarm_control_panel::AlarmControlPanel *alarm_control_panel_{nullptr};
   Trigger<uint8_t, std::vector<uint8_t>> *on_message_trigger_{new Trigger<uint8_t, std::vector<uint8_t>>()};
@@ -265,6 +305,26 @@ class CrowAlarmPanel : public Component {
   std::vector<CrowAlarmPanelZone> zones_;
   std::vector<CrowAlarmPanelKeypad> keypads_;
   std::vector<CrowAlarmPanelOutput> outputs_;
+  // Longest configured keypad label, computed once in setup(); pads the "[label]" prefix in
+  // log messages so the text after it lines up regardless of which keypad is logging.
+  uint8_t keypad_label_width_{0};
+};
+
+// Bypass toggle switch created by the parent's `zones:` config. Lives here (not in switch/)
+// because zone entities are instantiated from the parent component, which must compile even
+// when no `switch:` platform entry exists in YAML.
+class CrowAlarmPanelZoneBypassSwitch : public switch_::Switch, public Component {
+ public:
+  void dump_config() override;
+
+  void set_parent(CrowAlarmPanel *parent) { this->parent_ = parent; }
+  void set_zone_number(uint8_t zone_number) { this->zone_number_ = zone_number; }
+
+ protected:
+  void write_state(bool state) override;
+
+  CrowAlarmPanel *parent_{nullptr};
+  uint8_t zone_number_{0};
 };
 
 class CrowAlarmControlPanel : public alarm_control_panel::AlarmControlPanel, public Component {
@@ -273,7 +333,8 @@ class CrowAlarmControlPanel : public alarm_control_panel::AlarmControlPanel, pub
   uint32_t get_supported_features() const override {
     return alarm_control_panel::ACP_FEAT_ARM_AWAY | alarm_control_panel::ACP_FEAT_ARM_HOME;
   }
-  bool get_requires_code() const override { return true; }
+  // No default code configured means the user must supply one when disarming.
+  bool get_requires_code() const override { return this->effective_code_().empty(); }
   bool get_requires_code_to_arm() const override { return this->requires_code_to_arm_; }
 
   void set_parent(CrowAlarmPanel *parent) { this->parent_ = parent; }
@@ -282,6 +343,23 @@ class CrowAlarmControlPanel : public alarm_control_panel::AlarmControlPanel, pub
 
  protected:
   void control(const alarm_control_panel::AlarmControlPanelCall &call) override;
+  // Entity-level code if set, else the parent panel's code (or empty if parent_ isn't set yet).
+  const std::string &effective_code_() const {
+    if (!this->code_.empty()) {
+      return this->code_;
+    }
+    static const std::string empty_code;
+    return this->parent_ != nullptr ? this->parent_->get_code() : empty_code;
+  }
+  // The API always sends a code field (empty string when the user didn't enter one), so an empty
+  // call code must fall back to the configured default rather than shadow it.
+  std::string resolve_code_(const alarm_control_panel::AlarmControlPanelCall &call) const {
+    const auto &call_code = call.get_code();
+    if (call_code.has_value() && !call_code->empty()) {
+      return call_code.value();
+    }
+    return this->effective_code_();
+  }
 
   CrowAlarmPanel *parent_{nullptr};
   std::string code_;
