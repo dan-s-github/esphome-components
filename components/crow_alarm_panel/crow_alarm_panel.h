@@ -300,11 +300,13 @@ class CrowAlarmPanel : public Component {
   std::string code_;
   text_sensor::TextSensor *armed_state_{nullptr};
   alarm_control_panel::AlarmControlPanel *alarm_control_panel_{nullptr};
-  // Last state the controller itself confirmed via an ARMED_STATE broadcast — unlike
-  // alarm_control_panel_->get_state(), never overwritten by the optimistic ACP_STATE_ARMING /
-  // ACP_STATE_DISARMING publish in CrowAlarmControlPanel::control(). Used to restore the entity
-  // to ground truth if the arm/disarm watchdog aborts a sequence, so a failed disarm doesn't
-  // strand the entity in ACP_STATE_DISARMING forever (see arm_disarm_state_machine.md).
+  // Last state we're confident is ground truth — set from the controller's own ARMED_STATE
+  // broadcasts, and also from heuristic zone-activity publishes (zone motion -> DISARMED, zone
+  // alarm -> PENDING) in the ZONE_STATE handler. Unlike alarm_control_panel_->get_state(), never
+  // overwritten by the optimistic ACP_STATE_ARMING / ACP_STATE_DISARMING publish in
+  // CrowAlarmControlPanel::control(). Used to restore the entity to ground truth if the
+  // arm/disarm watchdog aborts a sequence, so a failed disarm doesn't strand the entity in
+  // ACP_STATE_DISARMING forever (see arm_disarm_state_machine.md).
   alarm_control_panel::AlarmControlPanelState last_confirmed_acp_state_{alarm_control_panel::ACP_STATE_DISARMED};
   Trigger<uint8_t, std::vector<uint8_t>> *on_message_trigger_{new Trigger<uint8_t, std::vector<uint8_t>>()};
 
