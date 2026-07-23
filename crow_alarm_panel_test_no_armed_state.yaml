@@ -1,0 +1,50 @@
+# Variant of crow_alarm_panel_test.yaml with no `armed_state` text_sensor configured.
+# Exercises the ARMED_STATE handler's alarm_control_panel_-only path (see
+# docs/arm_disarm_state_machine.md, logs-16/17 watchdog-abort fix) to confirm
+# last_confirmed_acp_state_ and alarm_control_panel_ still update correctly
+# when the optional armed_state text sensor isn't present.
+#
+# Usage:
+#   esphome config crow_alarm_panel_test_no_armed_state.yaml      # validate config
+#   esphome compile crow_alarm_panel_test_no_armed_state.yaml     # compile firmware
+
+esphome:
+  name: crow-alarm-panel-noarmedst
+  friendly_name: Crow Alarm Panel Test (No Armed State)
+
+esp32:
+  variant: esp32
+  framework:
+    type: esp-idf
+    advanced:
+      minimum_chip_revision: '3.1'
+
+# Enable logging
+logger:
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+external_components:
+  - source:
+      type: local
+      path: components
+
+crow_alarm_panel:
+  clock_pin: GPIO18
+  data_pin: GPIO19
+  address: 7
+  # Panel-level alarm code; the disarm button and alarm control panel use it
+  # unless they set their own `code:`.
+  code: !secret alarm_code
+
+alarm_control_panel:
+  - platform: crow_alarm_panel
+    name: "Crow Alarm"
+    requires_code_to_arm: false

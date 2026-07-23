@@ -356,6 +356,7 @@ void CrowAlarmPanel::loop() {
             }
             if (this->alarm_control_panel_ != nullptr &&
                 this->alarm_control_panel_->get_state() != alarm_control_panel::ACP_STATE_ARMING) {
+              this->last_confirmed_acp_state_ = alarm_control_panel::ACP_STATE_DISARMED;
               this->alarm_control_panel_->publish_state(alarm_control_panel::ACP_STATE_DISARMED);
             }
             clear = false;
@@ -365,6 +366,7 @@ void CrowAlarmPanel::loop() {
               this->armed_state_->publish_state("pending");
             }
             if (this->alarm_control_panel_ != nullptr) {
+              this->last_confirmed_acp_state_ = alarm_control_panel::ACP_STATE_PENDING;
               this->alarm_control_panel_->publish_state(alarm_control_panel::ACP_STATE_PENDING);
             }
             ESP_LOGD(TAG, "[%-*s] Alarm pending from zone %d", this->keypad_label_width_, CONTROLLER_LABEL,
@@ -382,32 +384,39 @@ void CrowAlarmPanel::loop() {
           ESP_LOGW(TAG, "[%-*s] Armed state too short, discarding", this->keypad_label_width_, CONTROLLER_LABEL);
           break;
         }
-        if (armed_state_ != nullptr) {
-          if (data[0] == 0x00 && data[1] == 0x01) {
+        if (data[0] == 0x00 && data[1] == 0x01) {
+          if (this->armed_state_ != nullptr) {
             this->armed_state_->publish_state("arming");
-            ESP_LOGD(TAG, "[%-*s] Arming [%02x.%s]", this->keypad_label_width_, CONTROLLER_LABEL, type,
-                     format_hex_pretty(data).c_str());
-            if (this->alarm_control_panel_ != nullptr) {
-              this->alarm_control_panel_->publish_state(alarm_control_panel::ACP_STATE_ARMING);
-            }
-          } else if (data[0] == 0x01 && data[1] == 0x00) {
-            this->armed_state_->publish_state("armed_away");
-            ESP_LOGD(TAG, "[%-*s] Armed Away [%02x.%s]", this->keypad_label_width_, CONTROLLER_LABEL, type,
-                     format_hex_pretty(data).c_str());
-            if (this->alarm_control_panel_ != nullptr) {
-              this->alarm_control_panel_->publish_state(alarm_control_panel::ACP_STATE_ARMED_AWAY);
-            }
-          } else if (data[0] == 0x00 && data[1] == 0x00) {
-            this->armed_state_->publish_state("disarmed");
-            ESP_LOGD(TAG, "[%-*s] Disarmed [%02x.%s]", this->keypad_label_width_, CONTROLLER_LABEL, type,
-                     format_hex_pretty(data).c_str());
-            if (this->alarm_control_panel_ != nullptr) {
-              this->alarm_control_panel_->publish_state(alarm_control_panel::ACP_STATE_DISARMED);
-            }
-          } else {
-            ESP_LOGD(TAG, "[%-*s] Armed state unknown [%02x.%s]", this->keypad_label_width_, CONTROLLER_LABEL, type,
-                     format_hex_pretty(data).c_str());
           }
+          ESP_LOGD(TAG, "[%-*s] Arming [%02x.%s]", this->keypad_label_width_, CONTROLLER_LABEL, type,
+                   format_hex_pretty(data).c_str());
+          this->last_confirmed_acp_state_ = alarm_control_panel::ACP_STATE_ARMING;
+          if (this->alarm_control_panel_ != nullptr) {
+            this->alarm_control_panel_->publish_state(alarm_control_panel::ACP_STATE_ARMING);
+          }
+        } else if (data[0] == 0x01 && data[1] == 0x00) {
+          if (this->armed_state_ != nullptr) {
+            this->armed_state_->publish_state("armed_away");
+          }
+          ESP_LOGD(TAG, "[%-*s] Armed Away [%02x.%s]", this->keypad_label_width_, CONTROLLER_LABEL, type,
+                   format_hex_pretty(data).c_str());
+          this->last_confirmed_acp_state_ = alarm_control_panel::ACP_STATE_ARMED_AWAY;
+          if (this->alarm_control_panel_ != nullptr) {
+            this->alarm_control_panel_->publish_state(alarm_control_panel::ACP_STATE_ARMED_AWAY);
+          }
+        } else if (data[0] == 0x00 && data[1] == 0x00) {
+          if (this->armed_state_ != nullptr) {
+            this->armed_state_->publish_state("disarmed");
+          }
+          ESP_LOGD(TAG, "[%-*s] Disarmed [%02x.%s]", this->keypad_label_width_, CONTROLLER_LABEL, type,
+                   format_hex_pretty(data).c_str());
+          this->last_confirmed_acp_state_ = alarm_control_panel::ACP_STATE_DISARMED;
+          if (this->alarm_control_panel_ != nullptr) {
+            this->alarm_control_panel_->publish_state(alarm_control_panel::ACP_STATE_DISARMED);
+          }
+        } else {
+          ESP_LOGD(TAG, "[%-*s] Armed state unknown [%02x.%s]", this->keypad_label_width_, CONTROLLER_LABEL, type,
+                   format_hex_pretty(data).c_str());
         }
         // ARMED_STATE is the controller's own authoritative state broadcast, independent of the
         // arm/disarm state machine below — this is the only signal CODE_ENTER_PENDING treats as
@@ -829,6 +838,15 @@ void CrowAlarmPanel::loop() {
       this->arm_disarm_state_ = ArmDisarmState::IDLE;
       this->arm_disarm_code_digits_.clear();
       this->arm_disarm_code_idx_ = 0;
+      // CrowAlarmControlPanel::control() optimistically publishes ACP_STATE_ARMING/DISARMING
+      // before this sequence resolves. On abort no ARMED_STATE broadcast is coming to correct
+      // that, so without this the entity would be stuck in the transitional state forever,
+      // rejecting both future arm and disarm calls (ESPHome's alarm_control_panel validate_()
+      // requires DISARMED to arm and an armed/pending state to disarm). Restore it to the last
+      // state the controller itself actually confirmed.
+      if (this->alarm_control_panel_ != nullptr) {
+        this->alarm_control_panel_->publish_state(this->last_confirmed_acp_state_);
+      }
     }
   }
 
