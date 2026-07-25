@@ -545,7 +545,7 @@ void CrowAlarmPanel::loop() {
                 // output-fire broadcast clears the bus — avoids the ISR was_transmitting_
                 // reset discarding the KEYPAD_COMMAND [15] (exit output-select) reply.
                 ESP_LOGD(TAG, "Output-select: digits done, waiting %u ms before ENTER",
-                         CrowAlarmPanelStore::OUTPUT_SELECT_ENTER_DELAY_MS);
+                         (unsigned) CrowAlarmPanelStore::OUTPUT_SELECT_ENTER_DELAY_MS);
                 this->output_select_state_ = OutputSelectState::ENTER_DELAY;
                 this->output_select_state_enter_ms_ = millis();
               }
@@ -1085,15 +1085,15 @@ bool CrowAlarmPanel::is_bus_idle_() {
   uint32_t now_us = micros();
   uint32_t elapsed_us = now_us - this->store_.last_clock_time_;
   if (elapsed_us < CrowAlarmPanelStore::BUS_IDLE_TIMEOUT_US) {
-    ESP_LOGV(TAG, "Bus not idle: %uus since last clock edge (need %uus)", elapsed_us,
-             CrowAlarmPanelStore::BUS_IDLE_TIMEOUT_US);
+    ESP_LOGV(TAG, "Bus not idle: %uus since last clock edge (need %uus)", (unsigned) elapsed_us,
+             (unsigned) CrowAlarmPanelStore::BUS_IDLE_TIMEOUT_US);
     return false;
   }
 
   uint32_t elapsed_ms = millis() - this->store_.last_transmission_time_;
   if (elapsed_ms < CrowAlarmPanelStore::MIN_TX_INTERVAL_MS) {
-    ESP_LOGV(TAG, "Bus not idle: %ums since last TX (need %ums)", elapsed_ms,
-             CrowAlarmPanelStore::MIN_TX_INTERVAL_MS);
+    ESP_LOGV(TAG, "Bus not idle: %ums since last TX (need %ums)", (unsigned) elapsed_ms,
+             (unsigned) CrowAlarmPanelStore::MIN_TX_INTERVAL_MS);
     return false;
   }
 

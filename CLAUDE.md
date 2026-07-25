@@ -8,7 +8,7 @@ An ESPHome external-components repository. The only component is `crow_alarm_pan
 
 ## Commands
 
-Local development uses `uv` on Python 3.13 (3.14+ lacks PlatformIO wheels).
+Local development uses `uv` on Python 3.12+ (verified working through 3.14 as of esphome 2026.7.2).
 
 | Task | Command |
 | --- | --- |
