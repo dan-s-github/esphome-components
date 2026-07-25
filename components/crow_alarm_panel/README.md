@@ -202,7 +202,7 @@ button:
 
 ### `switch`
 
-Output control or standalone bypass toggle.
+Output control, standalone bypass toggle, or raw-frame log toggle.
 
 ```yaml
 switch:
@@ -215,13 +215,23 @@ switch:
     type: bypass
     zone: 3
     name: "Bypass Back Door"
+
+  - platform: crow_alarm_panel
+    type: log_raw_frames
+    name: "Raw Frame Logging"
 ```
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `type` | yes | `output` — panel output relay; `bypass` — zone bypass toggle |
+| `type` | yes | `output` — panel output relay; `bypass` — zone bypass toggle; `log_raw_frames` — runtime raw-frame log toggle |
 | `output` | if `type: output` | Output number |
 | `zone` | if `type: bypass` | Zone number (1–16) |
+
+The `log_raw_frames` switch is a pure software toggle — no bus traffic, no restored state
+across reboots (always starts off). While on, it forces the raw-frame log line ("Received raw
+frame [...]") to also log at `INFO` instead of requiring `VERBOSE`, so raw traffic can be
+inspected at runtime without recompiling with a higher logger level. Defaults to the
+`mdi:text-box-search-outline` icon; set `icon:` to override.
 
 ---
 

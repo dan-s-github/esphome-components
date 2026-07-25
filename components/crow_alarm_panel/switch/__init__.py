@@ -1,7 +1,7 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome.components import switch
-from esphome.const import CONF_ID, CONF_TYPE, CONF_OUTPUT
+from esphome.const import CONF_ICON, CONF_ID, CONF_TYPE, CONF_OUTPUT
 from .. import (
     crow_alarm_panel_ns,
     CrowAlarmPanel,
@@ -13,12 +13,16 @@ from .. import (
 DEPENDENCIES = ["crow_alarm_panel"]
 
 CONF_BYPASS = "bypass"
+CONF_LOG_RAW_FRAMES = "log_raw_frames"
 
 CrowAlarmPanelSwitch = crow_alarm_panel_ns.class_(
     "CrowAlarmPanelSwitch", switch.Switch, cg.Component
 )
 CrowAlarmPanelOutputSwitch = crow_alarm_panel_ns.class_(
     "CrowAlarmPanelOutputSwitch", CrowAlarmPanelSwitch
+)
+CrowAlarmPanelRawLogSwitch = crow_alarm_panel_ns.class_(
+    "CrowAlarmPanelRawLogSwitch", CrowAlarmPanelSwitch
 )
 
 
@@ -43,6 +47,12 @@ CONFIG_SCHEMA = cv.typed_schema(
                 cv.Required(CONF_ZONE): cv.int_range(min=1, max=16),
             }
         ),
+        CONF_LOG_RAW_FRAMES: CROW_SWITCH_SCHEMA.extend(
+            {
+                cv.GenerateID(): cv.declare_id(CrowAlarmPanelRawLogSwitch),
+                cv.Optional(CONF_ICON, default="mdi:text-box-search-outline"): cv.icon,
+            }
+        ),
     }
 )
 
@@ -59,6 +69,8 @@ async def to_code(config):
         cg.add(var.set_parent(paren))
         cg.add(var.set_zone_number(config[CONF_ZONE]))
         cg.add(paren.register_zone_bypass_switch(var, config[CONF_ZONE]))
+    elif type == CONF_LOG_RAW_FRAMES:
+        cg.add(var.set_crow_alarm_panel_parent(paren))
 
     await switch.register_switch(var, config)
     await cg.register_component(var, config)

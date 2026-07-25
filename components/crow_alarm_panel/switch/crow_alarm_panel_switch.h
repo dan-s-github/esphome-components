@@ -29,5 +29,15 @@ class CrowAlarmPanelOutputSwitch : public CrowAlarmPanelSwitch {
   uint8_t output_number_{0};
 };
 
+// Pure software toggle: no bus traffic, just forces the parent's raw-frame log line to also
+// log at INFO regardless of the configured logger level. State isn't restored on boot since
+// it's a debug aid, not panel state.
+class CrowAlarmPanelRawLogSwitch : public CrowAlarmPanelSwitch {
+ public:
+  void dump_config() override;
+ protected:
+  void write_state(bool state) override;
+};
+
 }  // namespace crow_alarm_panel
 }  // namespace esphome

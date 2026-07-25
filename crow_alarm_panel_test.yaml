@@ -112,3 +112,7 @@ switch:
     type: bypass
     zone: 3
     name: "Zone 3 Bypass"
+  # Toggles raw-frame logging to INFO at runtime, without a VERBOSE logger level.
+  - platform: crow_alarm_panel
+    type: log_raw_frames
+    name: "Raw Frame Logging"

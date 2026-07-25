@@ -248,6 +248,10 @@ class CrowAlarmPanel : public Component {
 
   void keypress(uint8_t key);
 
+  // Forces the raw-frame log line (normally VERBOSE-only) to also log at INFO, so it can
+  // be toggled at runtime without recompiling with a higher logger level.
+  void set_raw_frame_logging_enabled(bool enabled) { this->raw_frame_logging_enabled_ = enabled; }
+
  protected:
   CrowAlarmPanelKeypad find_keypad_(uint8_t address);
   bool is_bus_idle_();
@@ -292,6 +296,8 @@ class CrowAlarmPanel : public Component {
   // semantic — see docs/arm_disarm_state_machine.md), so it can't be hardcoded to 0x01.
   uint8_t arm_disarm_digit_ack_byte_{0};
   bool arm_disarm_digit_ack_byte_set_{false};
+
+  bool raw_frame_logging_enabled_{false};
 
   CrowAlarmPanelStore store_;
   InternalGPIOPin *clock_pin_{nullptr};
