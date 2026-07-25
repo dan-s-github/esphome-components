@@ -98,12 +98,15 @@ CODE_DIGIT_PENDING (a code digit sent, waiting for Command)
 │  └─> IDLE (abort)
 
 CODE_ENTER_PENDING (terminal key sent, waiting for final Command)
-├─ on Command(0x14) addressed to us with byte[1] != 0x01
-│  └─> IDLE (sequence done; ARMED_STATE 0x11 follows independently)
-├─ on Command(0x14) addressed to us with byte[1] == 0x01
-│  └─> IDLE (abort; terminal key was lost — bus collision observed in logs-6)
+├─ on Command(0x14) addressed to us
+│  └─> CODE_ENTER_PENDING (logged only, proves the controller is still responding; byte[1] is
+│      not used to judge success or failure here — see "CODE_ENTER_PENDING success detection
+│      redesigned" below for why)
+├─ on ARMED_STATE (0x11) recognized as Arming/Armed Away/Disarmed (dispatched independently by
+│  the message handler, not gated on this state)
+│  └─> IDLE (success)
 ├─ on timeout (>1s)
-│  └─> IDLE (abort)
+│  └─> IDLE (abort; failure)
 
 [Note: ARMED_STATE (0x11) messages are dispatched by the message handler independently;
 the state machine does not gate on them.]
@@ -244,7 +247,7 @@ Three distinct failure patterns observed when arm/disarm doesn't work:
 
 **2. Controller rejects mid-sequence (`0x07` at digit 3):** The controller begins returning `0x07` instead of `0x01` starting part-way through the code sequence. Without command byte validation the state machine would silently advance through the remaining digits and terminal key, log "Code sequence: complete", but the panel would not arm/disarm. Originally fixed by aborting on any `data[1] != 0x01` in `CODE_DIGIT_PENDING`, later loosened to a learned-baseline comparison (2026-07-08 below), and the abort itself removed entirely (2026-07-25, logs-18, near the end of this document) once it was shown to cause more harm than the unverified anomaly it guarded against.
 
-**3. Terminal key lost in bus collision (`0x01` at ENTER):** ESPHome's terminal-key packet collides with the controller's concurrent periodic KEYPAD_COMMAND. The monitor shows a garbled packet `[14.A1.05.11]` (controller's `0x14` type byte wins bus arbitration but ESPHome's `A1.05.11` payload dominates). The controller never receives ENTER. ESPHome receives the collision's survivor KEYPAD_COMMAND (`0x01`) and mistakes it for the ENTER ACK, declaring the sequence done. Fixed by aborting in `CODE_ENTER_PENDING` when `data[1] == 0x01`.
+**3. Terminal key lost in bus collision (`0x01` at ENTER):** ESPHome's terminal-key packet collides with the controller's concurrent periodic KEYPAD_COMMAND. The monitor shows a garbled packet `[14.A1.05.11]` (controller's `0x14` type byte wins bus arbitration but ESPHome's `A1.05.11` payload dominates). The controller never receives ENTER. ESPHome receives the collision's survivor KEYPAD_COMMAND (`0x01`) and mistakes it for the ENTER ACK, declaring the sequence done. Originally fixed by aborting in `CODE_ENTER_PENDING` when `data[1] == 0x01`; superseded by the 2026-07-12 redesign below once byte[1] was shown to be unreliable in both directions — `CODE_ENTER_PENDING` no longer inspects it at all, relying solely on the `ARMED_STATE` broadcast or the shared 1s watchdog.
 
 ## Digit-ack byte is keypad-address-specific, not a validity signal (2026-07-08)
 
