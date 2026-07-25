@@ -24,5 +24,18 @@ void CrowAlarmPanelOutputSwitch::dump_config() {
   ESP_LOGCONFIG(TAG, "  Output number %d", this->output_number_);
 }
 
+void CrowAlarmPanelRawLogSwitch::write_state(bool state) {
+  if (this->parent_ == nullptr) {
+    ESP_LOGE(TAG, "Parent not set, ignoring raw log switch command");
+    return;
+  }
+  this->parent_->set_raw_frame_logging_enabled(state);
+  this->publish_state(state);
+}
+
+void CrowAlarmPanelRawLogSwitch::dump_config() {
+  LOG_SWITCH("", "Crow Alarm Panel Raw Log Switch", this);
+}
+
 }  // namespace crow_alarm_panel
 }  // namespace esphome

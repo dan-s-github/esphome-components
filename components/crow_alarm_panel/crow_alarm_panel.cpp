@@ -270,7 +270,11 @@ void CrowAlarmPanel::loop() {
       this->store_.data_length = 0;
     }
 
-    ESP_LOGV(TAG, "Received raw frame [%02x.%s]", type, format_hex_pretty(data).c_str());
+    if (this->raw_frame_logging_enabled_) {
+      ESP_LOGI(TAG, "Received raw frame [%02x.%s]", type, format_hex_pretty(data).c_str());
+    } else {
+      ESP_LOGV(TAG, "Received raw frame [%02x.%s]", type, format_hex_pretty(data).c_str());
+    }
 
     switch (type) {
       case CONTROLLER_STATUS: {
