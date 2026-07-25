@@ -16,8 +16,11 @@ esp32:
     advanced:
       minimum_chip_revision: '3.1'
 
-# Enable logging
+# Enable logging at VERY_VERBOSE so every ESP_LOGV/ESP_LOGVV call site actually
+# compiles (log macros below the configured level compile out entirely), keeping
+# this fixture's compile check able to catch format-string issues in verbose logs.
 logger:
+  level: VERY_VERBOSE
 
 # Enable Home Assistant API
 api:
