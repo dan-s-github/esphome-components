@@ -568,23 +568,22 @@ void CrowAlarmPanel::loop() {
               uint8_t cmd_byte = (data.size() > 1) ? data[1] : 0;
               if (!this->arm_disarm_digit_ack_byte_set_) {
                 // Learn this sequence's "digit accepted, more expected" display_code from the
-                // first digit's response. Trace: logs-7/logs-33 (2026-07-08) show address 0x05
-                // consistently getting 0x07 here — never 0x01 — across four separate arm and
-                // disarm attempts with a code independently confirmed correct via the physical
-                // IP keypad (0x07), while address 0x07 consistently got 0x01. The controller
-                // does not validate code correctness per digit (only at ENTER), so this is a
-                // per-keypad-type display quirk, not a rejection.
+                // first digit's response, for diagnostics only. Trace: logs-7/logs-33 (2026-07-08)
+                // show address 0x05 consistently getting 0x07 here — never 0x01 — across four
+                // separate arm and disarm attempts with a code independently confirmed correct via
+                // the physical IP keypad (0x07), while address 0x07 consistently got 0x01. The
+                // controller does not validate code correctness per digit (only at ENTER), so this
+                // is a per-keypad-type display quirk, not a rejection. A mid-sequence change isn't
+                // treated as an abort-worthy anomaly either (see docs/arm_disarm_state_machine.md):
+                // its meaning was never established, and logs-18 showed the abort itself causing a
+                // stuck alarm_control_panel entity for a sequence that may well have succeeded.
+                // Success/failure comes solely from the ARMED_STATE broadcast or the shared 1s
+                // watchdog, same as CODE_ENTER_PENDING.
                 this->arm_disarm_digit_ack_byte_ = cmd_byte;
                 this->arm_disarm_digit_ack_byte_set_ = true;
               } else if (cmd_byte != this->arm_disarm_digit_ack_byte_) {
-                // A change mid-sequence from the established baseline is still treated as an
-                // anomaly (e.g. logs-6's mid-sequence rejection case).
-                ESP_LOGW(TAG, "Arm/disarm: CMD byte changed from 0x%02X to 0x%02X in CODE_DIGIT_PENDING, aborting",
+                ESP_LOGD(TAG, "Arm/disarm: CMD byte changed from 0x%02X to 0x%02X in CODE_DIGIT_PENDING, continuing",
                          this->arm_disarm_digit_ack_byte_, cmd_byte);
-                this->arm_disarm_state_ = ArmDisarmState::IDLE;
-                this->arm_disarm_code_digits_.clear();
-                this->arm_disarm_code_idx_ = 0;
-                break;
               }
               if (this->arm_disarm_code_idx_ < this->arm_disarm_code_digits_.size()) {
                 uint8_t digit = this->arm_disarm_code_digits_[this->arm_disarm_code_idx_++];
