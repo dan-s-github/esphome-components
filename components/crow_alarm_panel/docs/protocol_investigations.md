@@ -256,3 +256,38 @@ Whether the extra bit originates from the panel's own bus driver (e.g. a hiccup 
 ### Practical takeaway
 
 Do not attempt to auto-correct by halving the bytes: a doubled value can coincidentally land in a valid range (e.g. true `month=6` → corrupted `12`), which would silently publish a wrong-but-plausible date. Discarding the frame with a warning (current behavior) is the safer choice. The `ESP_LOGW` branches in `CURRENT_TIME` handling now include the raw frame hex so future captures don't require `ESP_LOGV` to diagnose this.
+
+## `Unknown [ff.]`/`[fe.]` RX decode corruption still recurring after the 2026-07-12 ISR fix
+
+`arm_disarm_state_machine.md`'s "Root-cause candidate: hardware-ACK release corrupts our own RX decode under rapid retransmission (2026-07-12)" entry identified this signature (a burst of `Unknown [ff.]`/`[fe.]` frames, decoded correctly by a passive monitor at the same moment but garbled on the active interface) and applied a fix to `CrowAlarmPanelStore::interrupt()`, validated against `logs-12/37` as showing zero occurrences in that one session.
+
+### Findings (observed facts)
+
+Checking every trace captured with `ESP_LOGV` enabled, across all sessions (before and after the 2026-07-12 fix), for this signature:
+
+| Trace | `Unknown [ff.]`/`[fe.]` count | Relative to the fix |
+| --- | --- | --- |
+| `esphome-aap-alarm-interface-logs-3.txt` | 4 | before |
+| `esphome-aap-alarm-interface-logs-11.txt` | 28 | before (the fix's source trace) |
+| `esphome-aap-keypad-monitor-logs-33.txt` | 2 | before |
+| `esphome-aap-keypad-monitor-logs-36.txt` | 4 | before |
+| `esphome-aap-keypad-monitor-logs-38.txt` | 9 | before |
+| `esphome-aap-alarm-interface-logs-13.txt` | 10 | **after** |
+| `esphome-aap-alarm-interface-logs-18.txt` | 1 | **after** |
+| `esphome-aap-alarm-interface-logs-21.txt` | 10 | **after** |
+
+`logs-13`, `logs-18`, and `logs-21` all postdate the 2026-07-12 fix but were never checked for this signature until now — the fix's validation (logs-12/37) was a single session showing zero occurrences, which was correct as far as it went but was not re-checked against later captures.
+
+In `logs-21` specifically (`14:59:18.722`–`14:59:19.153`): nine consecutive `Unknown [ff.]` frames appear immediately after a successful disarm's own follow-up `KEYPAD_COMMAND` ack exchange finishes (`14:59:18.547`–`.650`), then the bus goes quiet, and ~3.5s later an unrelated `arm_away()` (no code) call is made and times out (see `arm_disarm_state_machine.md`, logs-21 entry) — but that timeout's own send/timeout window is clean, with no frames at all in between, so the corruption burst and that particular failure are not directly linked; they're two separate issues that happened to occur in the same session.
+
+### Inference (medium confidence)
+
+The 2026-07-12 ISR change reduced but did not eliminate this class of corruption. Its consistent association with a burst of activity right after our own TX/ACK exchange (rather than random/independent bus noise) still points at the same general area — some interaction between our own hardware-ACK handling and rapid subsequent bus traffic — but the fix applied clearly isn't the complete fix.
+
+### Assumption (unverified)
+
+Whether the remaining corruption is a different manifestation of the same ISR-level mechanism (e.g. a case the 2026-07-12 fix's fall-through doesn't cover) or an unrelated cause is not established without a fresh bit-level (CLK/DAT) capture specifically targeting one of these bursts, the same way the original mechanism was identified.
+
+### Practical takeaway
+
+This does not currently appear to cause the `CODE_ENTER_PENDING` arm/disarm failures (those show clean silence, not corruption — see `arm_disarm_state_machine.md`). It's logged here as a distinct, still-open issue so it isn't mistaken for "fixed" in future investigations. No code change is proposed until a fresh raw capture isolates the exact edge/timing condition, per the same caution the original 2026-07-12 entry applied.
