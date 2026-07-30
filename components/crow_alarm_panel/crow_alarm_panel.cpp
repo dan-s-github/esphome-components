@@ -140,6 +140,16 @@ void IRAM_ATTR HOT CrowAlarmPanelStore::interrupt(CrowAlarmPanelStore *arg) {
   // Check for boundary
   arg->boundary_buffer_ = (uint8_t) ((arg->boundary_buffer_ << 1) | data_bit);
 
+  if (arg->bit_trace_enabled_) {
+    arg->bit_trace_buffer_[arg->bit_trace_len_++] = data_bit ? '1' : '0';
+    if (arg->bit_trace_len_ >= BIT_TRACE_BUFFER_BITS) {
+      memcpy(arg->bit_trace_buffer2_, arg->bit_trace_buffer_, BIT_TRACE_BUFFER_BITS);
+      arg->bit_trace_buffer2_[BIT_TRACE_BUFFER_BITS] = '\0';
+      arg->bit_trace_len_ = 0;
+      arg->bit_trace_ready_ = true;
+    }
+  }
+
   if (arg->inside_) {
     uint8_t idx = arg->num_bits_ / 8;
     arg->buffer[idx] = (arg->buffer[idx] >> 1) | ((data_bit ? 1 : 0) << 7);
@@ -249,6 +259,16 @@ void CrowAlarmPanel::loop() {
   if (this->store_.ack_pending_ && (micros() - this->store_.ack_set_time_us_ > 2000)) {
     this->data_pin_->pin_mode(gpio::FLAG_INPUT);
     this->store_.ack_pending_ = false;
+  }
+
+  if (this->store_.bit_trace_ready_) {
+    char local_bits[CrowAlarmPanelStore::BIT_TRACE_BUFFER_BITS + 1];
+    {
+      InterruptLock lock;
+      memcpy(local_bits, this->store_.bit_trace_buffer2_, sizeof(local_bits));
+      this->store_.bit_trace_ready_ = false;
+    }
+    ESP_LOGI(TAG, "Raw bit trace: %s", local_bits);
   }
 
   if (this->store_.data_length) {

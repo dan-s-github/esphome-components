@@ -116,3 +116,8 @@ switch:
   - platform: crow_alarm_panel
     type: log_raw_frames
     name: "Raw Frame Logging"
+  # Toggles ISR-side raw bit trace: batched DAT bitstream (post glitch-filter), logged
+  # at INFO once a 128-bit buffer fills. Diagnostic aid for framing/glitch issues.
+  - platform: crow_alarm_panel
+    type: log_raw_bits
+    name: "Raw Bit Trace"

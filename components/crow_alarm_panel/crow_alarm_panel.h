@@ -165,6 +165,18 @@ class CrowAlarmPanelStore {
   // The controller then keeps the keypad stuck in "output-select mode", rejecting all
   // subsequent KEY_OUTPUT attempts with KEYPAD_COMMAND [07].
   static const uint32_t OUTPUT_SELECT_ENTER_DELAY_MS = 60;
+
+  // Raw bit trace (diagnostic): batches every clock-sampled DAT bit that reaches the
+  // frame boundary-search logic (i.e. after glitch filtering, same bits that feed
+  // boundary_buffer_) into a fixed-size string and hands it to loop() once full.
+  // Independent of frame decoding, so mis-alignment/framing issues can be diagnosed
+  // by hand from the literal bitstream instead of the already-decoded bytes.
+  static const uint16_t BIT_TRACE_BUFFER_BITS = 128;
+  bool bit_trace_enabled_{false};
+  char bit_trace_buffer_[BIT_TRACE_BUFFER_BITS + 1]{};
+  char bit_trace_buffer2_[BIT_TRACE_BUFFER_BITS + 1]{};
+  uint16_t bit_trace_len_{0};
+  volatile bool bit_trace_ready_{false};
 };
 
 struct CrowAlarmPanelZone {
@@ -251,6 +263,9 @@ class CrowAlarmPanel : public Component {
   // Forces the raw-frame log line (normally VERBOSE-only) to also log at INFO, so it can
   // be toggled at runtime without recompiling with a higher logger level.
   void set_raw_frame_logging_enabled(bool enabled) { this->raw_frame_logging_enabled_ = enabled; }
+
+  // Enables the ISR-side raw bit trace (see CrowAlarmPanelStore::bit_trace_enabled_).
+  void set_raw_bit_trace_enabled(bool enabled) { this->store_.bit_trace_enabled_ = enabled; }
 
  protected:
   CrowAlarmPanelKeypad find_keypad_(uint8_t address);

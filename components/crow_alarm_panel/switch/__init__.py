@@ -14,6 +14,7 @@ DEPENDENCIES = ["crow_alarm_panel"]
 
 CONF_BYPASS = "bypass"
 CONF_LOG_RAW_FRAMES = "log_raw_frames"
+CONF_LOG_RAW_BITS = "log_raw_bits"
 
 CrowAlarmPanelSwitch = crow_alarm_panel_ns.class_(
     "CrowAlarmPanelSwitch", switch.Switch, cg.Component
@@ -23,6 +24,9 @@ CrowAlarmPanelOutputSwitch = crow_alarm_panel_ns.class_(
 )
 CrowAlarmPanelRawLogSwitch = crow_alarm_panel_ns.class_(
     "CrowAlarmPanelRawLogSwitch", CrowAlarmPanelSwitch
+)
+CrowAlarmPanelRawBitTraceSwitch = crow_alarm_panel_ns.class_(
+    "CrowAlarmPanelRawBitTraceSwitch", CrowAlarmPanelSwitch
 )
 
 
@@ -53,6 +57,12 @@ CONFIG_SCHEMA = cv.typed_schema(
                 cv.Optional(CONF_ICON, default="mdi:text-box-search-outline"): cv.icon,
             }
         ),
+        CONF_LOG_RAW_BITS: CROW_SWITCH_SCHEMA.extend(
+            {
+                cv.GenerateID(): cv.declare_id(CrowAlarmPanelRawBitTraceSwitch),
+                cv.Optional(CONF_ICON, default="mdi:pulse"): cv.icon,
+            }
+        ),
     }
 )
 
@@ -70,6 +80,8 @@ async def to_code(config):
         cg.add(var.set_zone_number(config[CONF_ZONE]))
         cg.add(paren.register_zone_bypass_switch(var, config[CONF_ZONE]))
     elif type == CONF_LOG_RAW_FRAMES:
+        cg.add(var.set_crow_alarm_panel_parent(paren))
+    elif type == CONF_LOG_RAW_BITS:
         cg.add(var.set_crow_alarm_panel_parent(paren))
 
     await switch.register_switch(var, config)
