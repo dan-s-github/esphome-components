@@ -172,7 +172,9 @@ class CrowAlarmPanelStore {
   // Independent of frame decoding, so mis-alignment/framing issues can be diagnosed
   // by hand from the literal bitstream instead of the already-decoded bytes.
   static const uint16_t BIT_TRACE_BUFFER_BITS = 128;
-  bool bit_trace_enabled_{false};
+  // Read in the ISR, written from the main loop via set_raw_bit_trace_enabled() — volatile like
+  // ack_pending_/is_transmitting_ above, for the same cross-core visibility reason.
+  volatile bool bit_trace_enabled_{false};
   char bit_trace_buffer_[BIT_TRACE_BUFFER_BITS + 1]{};
   char bit_trace_buffer2_[BIT_TRACE_BUFFER_BITS + 1]{};
   uint16_t bit_trace_len_{0};
@@ -264,8 +266,19 @@ class CrowAlarmPanel : public Component {
   // be toggled at runtime without recompiling with a higher logger level.
   void set_raw_frame_logging_enabled(bool enabled) { this->raw_frame_logging_enabled_ = enabled; }
 
-  // Enables the ISR-side raw bit trace (see CrowAlarmPanelStore::bit_trace_enabled_).
-  void set_raw_bit_trace_enabled(bool enabled) { this->store_.bit_trace_enabled_ = enabled; }
+  // Enables the ISR-side raw bit trace (see CrowAlarmPanelStore::bit_trace_enabled_). Disables
+  // first, then resets the in-progress buffer position and any pending-but-unconsumed batch
+  // before (re-)enabling, so a toggle never mixes bits captured before/after it into one trace
+  // chunk, and never emits a stale ready buffer left over from before the toggle.
+  void set_raw_bit_trace_enabled(bool enabled) {
+    this->store_.bit_trace_enabled_ = false;
+    {
+      InterruptLock lock;
+      this->store_.bit_trace_len_ = 0;
+      this->store_.bit_trace_ready_ = false;
+    }
+    this->store_.bit_trace_enabled_ = enabled;
+  }
 
  protected:
   CrowAlarmPanelKeypad find_keypad_(uint8_t address);

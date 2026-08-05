@@ -150,7 +150,12 @@ void IRAM_ATTR HOT CrowAlarmPanelStore::interrupt(CrowAlarmPanelStore *arg) {
   // Check for boundary
   arg->boundary_buffer_ = (uint8_t) ((arg->boundary_buffer_ << 1) | data_bit);
 
-  if (arg->bit_trace_enabled_) {
+  // Gated on !bit_trace_ready_ so bit_trace_buffer2_ stays untouched while loop() (running on
+  // the other core) is still copying it out — loop()'s InterruptLock only protects against
+  // same-core reentrancy, not this ISR on the other core, so the flag itself is what prevents
+  // the overwrite. Bits are simply dropped while the consumer is behind; accumulation resumes
+  // as soon as it clears the flag (normally sub-millisecond later).
+  if (arg->bit_trace_enabled_ && !arg->bit_trace_ready_) {
     arg->bit_trace_buffer_[arg->bit_trace_len_++] = data_bit ? '1' : '0';
     if (arg->bit_trace_len_ >= BIT_TRACE_BUFFER_BITS) {
       memcpy(arg->bit_trace_buffer2_, arg->bit_trace_buffer_, BIT_TRACE_BUFFER_BITS);
@@ -898,6 +903,11 @@ void CrowAlarmPanel::loop() {
         ESP_LOGW(TAG, "Arm/disarm: timeout in state %u, retrying (%u/%u)",
                  static_cast<uint8_t>(this->arm_disarm_state_), this->arm_disarm_retry_count_,
                  ARM_DISARM_MAX_RETRIES);
+        // Refresh the watchdog timer BEFORE any keypress() below — keypress()->send_packet()
+        // can delay()/yield() and re-enter this loop(), and with the old timestamp still in
+        // place the watchdog would see itself as still timed out, firing again and sending an
+        // extra keypress (same race the output-select retry above avoids the same way).
+        this->arm_disarm_state_enter_ms_ = millis();
         switch (this->arm_disarm_state_) {
           case ArmDisarmState::ARM_AWAY_PENDING:
             this->keypress(KEY_ARM);
@@ -917,7 +927,6 @@ void CrowAlarmPanel::loop() {
           default:
             break;
         }
-        this->arm_disarm_state_enter_ms_ = millis();
       } else {
         ESP_LOGW(TAG, "Arm/disarm: timeout in state %u, aborting after %u retries",
                  static_cast<uint8_t>(this->arm_disarm_state_), this->arm_disarm_retry_count_);
