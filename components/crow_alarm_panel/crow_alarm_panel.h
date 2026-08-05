@@ -305,6 +305,13 @@ class CrowAlarmPanel : public Component {
   std::vector<uint8_t> arm_disarm_code_digits_;  // code digits consumed one per KEYPAD_COMMAND
   uint8_t arm_disarm_code_idx_{0};
   uint8_t arm_disarm_terminal_key_{KEY_ENTER};  // KEY_ENTER (disarm), KEY_ARM or KEY_STAY (arm-with-code)
+  // A watchdog timeout here reliably means the panel's state did not change (see
+  // docs/arm_disarm_state_machine.md — multiple sessions with an independent monitor capture
+  // confirm no ARMED_STATE broadcast occurred around the timeout), so unlike output-select/
+  // zone-bypass a blind retry can't undo a change that already landed. 5 covers the worst
+  // consecutive-failure streak observed so far (logs-24, logs-42: 5 failures before success).
+  static const uint8_t ARM_DISARM_MAX_RETRIES = 5;
+  uint8_t arm_disarm_retry_count_{0};
   // "Digit accepted" display_code (KEYPAD_COMMAND byte[1]) learned from the first digit's
   // response each sequence. Physical keypad types disagree on this value (0x01 is common,
   // but address 0x05 has been observed sending 0x07 for the same "more digits expected"

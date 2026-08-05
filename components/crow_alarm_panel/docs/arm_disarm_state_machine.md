@@ -359,6 +359,68 @@ Compiles and passes `esphome config`/`esphome compile` against `crow_alarm_panel
 
 **Not yet established:** why the controller sometimes fails to act on a correctly-received ENTER. No raw CLK/DAT bit capture or controller-side diagnostic exists to distinguish an internal controller timing/busy condition from something else. Needs further investigation if this failure rate proves disruptive in practice; no code change is proposed here since `CODE_ENTER_PENDING` already handles this correctly (resolves via `ARMED_STATE`/watchdog, no byte[1] trust) — this entry is about confirming *why* it fails, not changing *how* it's handled.
 
+## Two more corroborating sessions, gap-timing candidate raised then undermined (2026-08-05)
+
+**Source:** `protocol_trace_2026-08-05_disarm_after_arm.md` (full detail) — `esphome-aap-keypad-monitor-logs-41/42/43.txt`, `esphome-aap-alarm-interface-logs-22.txt`.
+
+Two more sessions show the identical `CODE_ENTER_PENDING` silence signature from the 2026-07-25 entry above (clean terminal-key ack, then genuine bus silence until the 1s watchdog aborts), bringing the running total to at least 7 independent sessions. One session (paired monitor+interface capture, logs-43/22) raised a candidate explanation — the single failure out of 8 cycles had the shortest armed→disarm gap (7.4s) of the session, while all 7 successes had gaps ≥9.6s — but a second session (logs-42, monitor-only) contradicts it: 5 of 6 failures there occurred at gaps of 21–44s, far longer than the 7.4s failure elsewhere. Net conclusion: gap length alone doesn't explain the failure rate; something session-level (overall bus conditions, an unidentified controller state) more likely dominates. Still not established. No code change proposed.
+
+## Gap-timing lead conclusively dead; monitor-side RX corruption complicates the 2026-07-12 ACK theory (2026-08-05, logs-44/23)
+
+**Source:** `protocol_trace_2026-08-05_disarm_after_arm.md` (full detail) — `esphome-aap-keypad-monitor-logs-44.txt`, `esphome-aap-alarm-interface-logs-23.txt`.
+
+A third session in the same investigation kills the gap-timing lead outright: cycle 3's disarm failed twice (`CODE_ENTER_PENDING` silence, same signature as always) at 6.4s and 9.5s armed→disarm gaps, then succeeded on a third attempt at 13.8s — but cycle 5 in the *same session* succeeded with a 5.5s gap, shorter than either of cycle 3's failures. Gap length is not the mechanism, in either direction.
+
+Separately, cross-checking cycle 3's second failed attempt against the passive monitor's independently bit-decoded traffic (the monitor still has no working DEBUG output — see the stale-firmware note above, still true as of this session) turned up a burst of `Unknown 0xFF`/`0xFE` RX-corruption frames on the **monitor** at `11:23:47.330–47.741`, in a window the interface decoded with zero corruption. This is the reverse pairing from the 2026-07-12 entry above (there, the ACK-driving interface saw the garbage and the passive monitor was clean) — and since the monitor never drives the hardware ACK, this instance can't be explained by that entry's "our own ACK-release desyncs our own RX" mechanism. Whether this is the same underlying phenomenon or a distinct one producing the same garbled byte values is open; needs `ESP_LOGV` on both devices simultaneously to compare at the raw-frame level. Not yet established. No code change proposed.
+
+## Five consecutive disarm failures; failure mode 3 (bus collision) independently reproduced, and a new variant found (2026-08-05, logs-45/24)
+
+**Source:** `protocol_trace_2026-08-05_disarm_after_arm.md` (full detail) — `esphome-aap-keypad-monitor-logs-45.txt`, `esphome-aap-alarm-interface-logs-24.txt`.
+
+A fourth session in the same investigation, and the worst failure streak seen yet: 5 of 6 disarm attempts fail in a row before the 6th succeeds. This session also kills the "armed via a physical keypad" lead from the entry above — this failure cycle was armed via the ESPHome interface's own ARM key, not a physical keypad, contradicting the pattern every prior failure shared.
+
+Cross-checking each failed attempt against the passive monitor's independent bit-decode (again no working DEBUG output there) turns up a mix of causes rather than one repeated mechanism:
+
+- **Attempt 1** independently reproduces this document's "Terminal key lost in bus collision" failure mode (mode 3, above) almost exactly — the monitor decodes a garbled `[14.a1.05.11]` frame at the terminal-key send, byte-for-byte the same pattern originally described from the interface's own logs alone. This is the first time it's been confirmed via a passive monitor's raw bits in a fresh session.
+- **Attempt 4** shows a new variant of the same collision class landing on a mid-sequence digit instead of ENTER: the monitor decodes an abnormally long, malformed `OUTPUT_STATE`-typed frame (`data=000406`) spanning several seconds right where digit "6"'s `KEYPRESS` should have been, with `04`/`06` fragments consistent with two keypresses merging. So this collision mechanism isn't ENTER-specific.
+- **Attempts 2 and 5** are the ordinary `CODE_ENTER_PENDING` silence signature from the 2026-07-25 entry (clean `0x07` ack, then genuine silence).
+- **Attempt 3** is the ordinary "timeout in digit state" failure mode (mode 1, above) — no ack at all for the first digit.
+
+**Inference (low confidence, one session):** a "bad" session appears to raise the odds of several already-catalogued failure mechanisms together (two collisions, two silences, one digit-timeout, all in the same ~30s span) rather than introducing one new mechanism. Combined with logs-42 (5/6 failed) and the mostly-clean logs-22/23 (1/8, 2/6 failed), sessions seem to vary between "good" and "bad" for reasons still not isolated. Not yet established. No code change proposed.
+
+## Bus-collision mode reproduced a third time (now on the first digit); corruption pairing flips back (2026-08-05, logs-46/25)
+
+**Source:** `protocol_trace_2026-08-05_disarm_after_arm.md` (full detail) — `esphome-aap-keypad-monitor-logs-46.txt`, `esphome-aap-alarm-interface-logs-25.txt`.
+
+A fifth session, "medium" severity (3 of 9 disarm attempts failed). One failure reproduces failure mode 3 (bus collision) again, this time on the very first digit of the sequence — the monitor's independent decode shows a bare `Unknown 0xFF` frame in place of the first `KEYPRESS`, rather than a clean ack ever arriving. Combined with the previous session's ENTER and mid-digit collisions, this mechanism now appears able to hit any outgoing keypress in a sequence, not a specific one. The other two failures in this session match already-established signatures (digit-silence, then terminal-key `0x07` silence) with no new mechanism, following (but likely not caused by, since polling had been stable for 4m45s beforehand) a "no ping for 60s" registration-storm.
+
+Separately, this session also produced a malformed 7-byte `ARMED_STATE` (`[11.83.01.46.81.00.80.11]`) decoded by the **interface**, with the monitor's simultaneous independent decode showing nothing of the sort — clean ordinary traffic. This is the *original* 2026-07-12 pairing (ACK-driving interface corrupted, passive monitor clean), the reverse of last session's logs-44/23 pairing (monitor corrupted, interface clean). Both directions have now been observed, in different sessions — at least consistent with general bus noise affecting whichever receiver happens to be unlucky, rather than a mechanism deterministically tied to whichever device drives the hardware ACK, though not conclusive either way.
+
+Failure rate across sessions so far (1/8, 2/6, 3/9, 5/6, 5/6) looks more like a continuum than a "good session"/"bad session" binary — argues for something with continuously-varying severity (e.g. general bus contention level) rather than a single on/off trigger. Not yet established. No code change proposed.
+
+## High failure rate with zero collisions; long-gap cycles reproduce the same two-failures-then-success shape twice (2026-08-05, logs-47/26)
+
+**Source:** `protocol_trace_2026-08-05_disarm_after_arm.md` (full detail) — `esphome-aap-keypad-monitor-logs-47.txt`, `esphome-aap-alarm-interface-logs-26.txt`.
+
+A sixth session, 5 of 9 disarm attempts failed (~56%) — extending the failure-rate continuum (now 1/8, 2/6, 3/9, 5/9, 5/6, 5/6) with no two sessions landing at the same rate. Unlike the previous session, cross-checking every "no ack" failure against the monitor here shows **zero** collision artifacts — every failure is genuine bus silence, meaning a high failure rate doesn't require the collision mechanism to be active. One failure's ack arrived but took 825ms (vs. the usual ~100–200ms) before the watchdog still ran out — the first time a slow-but-present ack has been noted rather than one that's prompt or entirely absent.
+
+This session's ~5-minute-gap cycle reproduces logs-46/25's exact "digit-silence fail, terminal-key-silence fail, success" shape a second time — but with completely healthy `KEYPAD_PING` polling throughout the gap, no registration/ping-loss event at all. This weakens the tentative "registration storm precedes failure" link raised last session, while making the "two failures then success on a long-gap cycle" shape itself a small but now-twice-reproduced pattern worth targeting deliberately in a future capture.
+
+Not yet established. No code change proposed.
+
+## Automatic retry added for CODE_DIGIT_PENDING/CODE_ENTER_PENDING and ARM_AWAY_PENDING/ARM_STAY_PENDING (2026-08-05)
+
+**Rationale:** six independent sessions (logs-10/35, logs-12/37, logs-42, logs-24/25/26) now show, with monitor cross-checks in several of them, that a watchdog timeout in these states reliably means the panel's state did not change — no `ARMED_STATE` broadcast is ever missed by the passive monitor either. That's a materially different situation from the output-select and zone-bypass watchdogs above, where a retry could double-fire an output or undo a bypass toggle that actually landed. Here a blind retry can't undo something that already happened, because nothing did. The worst observed streak needing manual retries before success was 5 consecutive failures (logs-24, logs-42).
+
+**Fix applied:** the arm/disarm watchdog (`crow_alarm_panel.cpp`, "Arm/disarm watchdog") now retries up to `ARM_DISARM_MAX_RETRIES` (5, `crow_alarm_panel.h`) times before falling back to the existing abort behavior (clear state, restore `last_confirmed_acp_state_`). A new `arm_disarm_retry_count_` counter, reset to 0 at the start of every fresh `arm_away()`/`arm_stay()`/`disarm()` call (via `start_code_sequence_()` and the no-code branches), tracks this. On retry:
+
+- `ARM_AWAY_PENDING`/`ARM_STAY_PENDING` just resend `KEY_ARM`/`KEY_STAY`.
+- `CODE_DIGIT_PENDING`/`CODE_ENTER_PENDING` restart the whole code+terminal-key sequence from the first digit (`arm_disarm_code_idx_ = 1`, state back to `CODE_DIGIT_PENDING`, digit-ack baseline re-learned) — exactly what every manual retry across every session in this document already did, and which has a 100% eventual success rate in the traces gathered so far.
+
+Because `arm_away()`/`arm_stay()`/`disarm()` all reject a new call while `arm_disarm_state_ != IDLE`, a user's own repeated manual retries (as seen throughout this document) now become no-ops while an automatic retry is already in flight — the entity resolves on its own instead of needing the user to notice the failure and try again by hand.
+
+Compiles and passes `esphome compile` against `crow_alarm_panel_test.yaml`. **Not yet validated on real hardware** — needs a fresh capture (ideally reproducing a multi-failure streak like logs-24/42) to confirm the automatic retries actually land and that no new interaction appears between rapid consecutive retries and the controller (e.g. the same kind of ACK-timing sensitivity documented for output-select's `OUTPUT_SELECT_ENTER_DELAY_MS`).
+
 ## Notes
 
 - ARM/STAY/DISARM sequences are simpler than OUTPUT because there's no ACK handshake

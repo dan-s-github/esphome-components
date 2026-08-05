@@ -852,23 +852,53 @@ void CrowAlarmPanel::loop() {
     }
   }
 
-  // Arm/disarm watchdog: abort if any non-IDLE state exceeds 1s without progress.
+  // Arm/disarm watchdog: abort if any non-IDLE state exceeds 1s without progress. See
+  // ARM_DISARM_MAX_RETRIES in crow_alarm_panel.h for why retrying here (unlike output-select/
+  // zone-bypass above) is safe: a timeout reliably means the panel's state did not change.
   if (this->arm_disarm_state_ != ArmDisarmState::IDLE) {
     const uint32_t now_ms = millis();
     if (now_ms - this->arm_disarm_state_enter_ms_ > 1000) {
-      ESP_LOGW(TAG, "Arm/disarm: timeout in state %u, aborting",
-               static_cast<uint8_t>(this->arm_disarm_state_));
-      this->arm_disarm_state_ = ArmDisarmState::IDLE;
-      this->arm_disarm_code_digits_.clear();
-      this->arm_disarm_code_idx_ = 0;
-      // CrowAlarmControlPanel::control() optimistically publishes ACP_STATE_ARMING/DISARMING
-      // before this sequence resolves. On abort no ARMED_STATE broadcast is coming to correct
-      // that, so without this the entity would be stuck in the transitional state forever,
-      // rejecting both future arm and disarm calls (ESPHome's alarm_control_panel validate_()
-      // requires DISARMED to arm and an armed/pending state to disarm). Restore it to the last
-      // state the controller itself actually confirmed.
-      if (this->alarm_control_panel_ != nullptr) {
-        this->alarm_control_panel_->publish_state(this->last_confirmed_acp_state_);
+      if (this->arm_disarm_retry_count_ < ARM_DISARM_MAX_RETRIES) {
+        this->arm_disarm_retry_count_++;
+        ESP_LOGW(TAG, "Arm/disarm: timeout in state %u, retrying (%u/%u)",
+                 static_cast<uint8_t>(this->arm_disarm_state_), this->arm_disarm_retry_count_,
+                 ARM_DISARM_MAX_RETRIES);
+        switch (this->arm_disarm_state_) {
+          case ArmDisarmState::ARM_AWAY_PENDING:
+            this->keypress(KEY_ARM);
+            break;
+          case ArmDisarmState::ARM_STAY_PENDING:
+            this->keypress(KEY_STAY);
+            break;
+          case ArmDisarmState::CODE_DIGIT_PENDING:
+          case ArmDisarmState::CODE_ENTER_PENDING:
+            // Restart the whole code+terminal-key sequence from scratch, exactly like a fresh
+            // manual retry (proven reliable across every session in arm_disarm_state_machine.md).
+            this->arm_disarm_code_idx_ = 1;
+            this->arm_disarm_state_ = ArmDisarmState::CODE_DIGIT_PENDING;
+            this->arm_disarm_digit_ack_byte_set_ = false;
+            this->keypress(this->arm_disarm_code_digits_[0]);
+            break;
+          default:
+            break;
+        }
+        this->arm_disarm_state_enter_ms_ = millis();
+      } else {
+        ESP_LOGW(TAG, "Arm/disarm: timeout in state %u, aborting after %u retries",
+                 static_cast<uint8_t>(this->arm_disarm_state_), this->arm_disarm_retry_count_);
+        this->arm_disarm_state_ = ArmDisarmState::IDLE;
+        this->arm_disarm_code_digits_.clear();
+        this->arm_disarm_code_idx_ = 0;
+        this->arm_disarm_retry_count_ = 0;
+        // CrowAlarmControlPanel::control() optimistically publishes ACP_STATE_ARMING/DISARMING
+        // before this sequence resolves. On abort no ARMED_STATE broadcast is coming to correct
+        // that, so without this the entity would be stuck in the transitional state forever,
+        // rejecting both future arm and disarm calls (ESPHome's alarm_control_panel validate_()
+        // requires DISARMED to arm and an armed/pending state to disarm). Restore it to the last
+        // state the controller itself actually confirmed.
+        if (this->alarm_control_panel_ != nullptr) {
+          this->alarm_control_panel_->publish_state(this->last_confirmed_acp_state_);
+        }
       }
     }
   }
@@ -912,6 +942,7 @@ void CrowAlarmPanel::start_code_sequence_(const std::string &code, uint8_t termi
   this->arm_disarm_code_idx_ = 1;
   this->arm_disarm_state_ = ArmDisarmState::CODE_DIGIT_PENDING;
   this->arm_disarm_state_enter_ms_ = millis();
+  this->arm_disarm_retry_count_ = 0;
   this->arm_disarm_digit_ack_byte_set_ = false;
   this->keypress(this->arm_disarm_code_digits_[0]);
 }
@@ -932,6 +963,7 @@ void CrowAlarmPanel::arm_away(const std::string &code) {
     ESP_LOGI(TAG, "Arm away");
     this->arm_disarm_state_ = ArmDisarmState::ARM_AWAY_PENDING;
     this->arm_disarm_state_enter_ms_ = millis();
+    this->arm_disarm_retry_count_ = 0;
     this->keypress(KEY_ARM);
   }
 }
@@ -952,6 +984,7 @@ void CrowAlarmPanel::arm_stay(const std::string &code) {
     ESP_LOGI(TAG, "Arm stay");
     this->arm_disarm_state_ = ArmDisarmState::ARM_STAY_PENDING;
     this->arm_disarm_state_enter_ms_ = millis();
+    this->arm_disarm_retry_count_ = 0;
     this->keypress(KEY_STAY);
   }
 }
