@@ -271,6 +271,34 @@ This same log also shows a **second, more severe variant**: in two multi-minute 
 
 Compiles and passes `esphome compile` against `crow_alarm_panel_test.yaml`. **Not yet validated on real hardware** — needs a fresh capture showing the `ESP_LOGI` recovery line fire against a real corrupted frame.
 
+### Update (2026-08-05): validated on real hardware; glitch phase tied to broadcast count, not wall-clock seconds
+
+**Source:** `traces/esphome-aap-alarm-interface-logs-28.txt` and `-29.txt`, both captured with the recovery fix flashed (compiled `2026-08-05 20:00:02`).
+
+**Findings (observed facts) — recovery confirmed working:** logs-28 shows the fix firing 12 times in a ~12-minute session, once per minute, every occurrence at `seconds=0x0F` (15) exactly as previously characterized, and every occurrence's recovered date (`2026-08-05`) matching real time. Verified the arithmetic on one instance (`54.04.04.B2.0F.0A.10.34`): `day_of_week=4` (Wed), `minutes=0x04B2=1202→20:02`, `seconds=0x0F=15` (clean), `day=0x0A`/`month=0x10`/`year=0x34` halve cleanly to `5`/`8`/`26`. This resolves the "not yet validated on real hardware" note above.
+
+**Findings (observed facts) — glitch phase shifts after an out-of-cycle broadcast, and one occurrence corrupts `seconds` in a way that isn't clean doubling:** logs-29, captured later in the same session, shows both glitch occurrences at `seconds=0x17` (23) instead of the usual 15 — e.g. `54.04.04.CF.17.0A.10.34`. Tracing the surrounding traffic: at `20:30:47.228` the AAP Keypad (address `0x00`) sends a `KEYPAD_REGISTRATION` announce, and the controller's documented post-registration re-broadcast sequence follows (`Disarmed`, `Zone state`, `Controller status`) — including an **extra, out-of-cycle `CURRENT_TIME` broadcast** at `20:30:47.612` (decoded `seconds=52`), only ~7.3s after the previous one instead of the usual ~15s. Every `CURRENT_TIME` broadcast after that point keeps dead-on 15.0s spacing (confirmed via the ESP's own receipt timestamps), just shifted 8 seconds later than before the extra broadcast — i.e. one extra broadcast got inserted mid-cycle, and every broadcast after it (including the glitchy one) shifted phase by the same amount.
+
+`day`/`month`/`year` in the logs-29 glitch still decode correctly via the existing recovery (`0x0A`/`0x10`/`0x34` → `5`/`8`/`26`, matching real date) — the fix is unaffected. But the observed `seconds` value itself (`0x17`=23, odd) cannot be a clean single-bit-doubling of anything, since doubling any integer is always even — this rules out the same bit-insertion mechanism that's cleanly doubling `day`/`month`/`year` in the identical frame. Whatever corrupted `seconds` here is mechanically different from (or in addition to) the established one.
+
+**Inference (medium confidence, one session):** the recurring glitch is very likely keyed to an internal broadcast *counter* on the panel (e.g. "corrupt every Nth `CURRENT_TIME` frame sent"), not to wall-clock `:15` directly — the extra registration-triggered broadcast inserting itself into the cycle would explain the clean 8-second phase shift in when the counter's "problem slot" next lands, while every broadcast's own 15s spacing stayed perfectly regular throughout. This also means "seconds=15" was never the real trigger condition, just what it happened to coincide with in every session observed before this one.
+
+**Assumption (unverified):** what specifically corrupts `seconds` to a non-doubled, odd value in this instance — a different insertion point within that byte (partial/mid-byte corruption, as opposed to the clean at-byte-boundary insertion characterizing the day/month/year doubling), two independent corruption events in the same frame, or something else — is not established from this single occurrence. Not yet worth a code change: `seconds` was already excluded from the recovery fix by design, and this doesn't affect the day/month/year recovery's correctness or safety guarantees (the weekday cross-check remains sound regardless of what happens to `seconds`).
+
+**Practical takeaway:** if this glitch's fixed wall-clock position (previously always `:15`) needs to be relied on again (e.g. for future correlation with other bus events), don't assume it — it moved after a single registration event in this session, and may not be fixed at all going forward.
+
+### Update (2026-08-05): panel's own clock runs ~4.4s fast relative to real time
+
+**Source:** `traces/esphome-aap-alarm-interface-logs-30.txt`.
+
+**Findings (observed facts):** comparing every clean (non-corrupted) `CURRENT_TIME` decode in this session against the log line's own timestamp shows a consistent offset — the panel's reported time is always **4.3–4.5 seconds ahead** of the log timestamp, holding steady across ~30 samples spanning the full ~12-minute session (e.g. `20:36:55.563` receipt → panel reports `20:37:00`, a +4.44s offset; `20:44:25.489` → `20:44:30`, +4.51s; `20:48:55.518` → `20:49:00`, +4.48s). The offset doesn't grow or shrink over the session — it's a fixed bias, not clock drift accumulating in real time.
+
+The device's actual production config (`aap-esl2-keypad-interface/aap_esl_keypad_interface.yaml`) has **no `time:` component** — the ESP itself has no synced clock. The bracketed log timestamp therefore isn't sourced from the device at all; it's stamped by whichever client received the API stream (`esphome logs` / Home Assistant) at the moment each line arrived, which should track real wall-clock time to well under a second on any normally NTP-synced machine.
+
+**Inference (medium-high confidence):** since the receiving side's timestamp should be accurate to well under a second, a stable multi-second lead is too large to be network/API transport latency, and too consistent to be jitter. This points to the **alarm panel's own onboard RTC genuinely running ~4.4 seconds fast** relative to real time — not a decoding bug, not something introduced by the recovery fix, and not something correctable from the ESP side, since we're only a passive listener reporting what the panel itself broadcasts.
+
+**Practical takeaway:** if any future analysis needs to correlate a `CURRENT_TIME` broadcast's reported value against real-world wall-clock time precisely (rather than just "close enough to identify which session/date"), expect the panel's own value to read ~4–5 seconds ahead.
+
 ## `Unknown [ff.]`/`[fe.]` RX decode corruption still recurring after the 2026-07-12 ISR fix
 
 `arm_disarm_state_machine.md`'s "Root-cause candidate: hardware-ACK release corrupts our own RX decode under rapid retransmission (2026-07-12)" entry identified this signature (a burst of `Unknown [ff.]`/`[fe.]` frames, decoded correctly by a passive monitor at the same moment but garbled on the active interface) and applied a fix to `CrowAlarmPanelStore::interrupt()`, validated against `logs-12/37` as showing zero occurrences in that one session.
