@@ -249,13 +249,27 @@ Doubling a byte whose true value never sets bit 7 (true for `day` 1–31, `month
 
 The closing `0x7E` boundary is still found at the expected byte count (`(7)` in both good and bad frames), which is consistent with the framer's boundary detector because it uses a raw sliding-bit window rather than byte-aligned matching (see `protocol_wire_format.md`).
 
-### Assumption (unverified)
+### Assumption (unverified) — superseded, see 2026-08-05 update below
 
 Whether the extra bit originates from the panel's own bus driver (e.g. a hiccup while it composes/shifts out this specific broadcast) or from our own ISR sampling (e.g. something else briefly delaying bit capture at a consistent point in the cycle) is not established. The fact that it recurs at the exact same *relative* position every session, across different panel installs and different ESP32 units, favors a controller-side cause, but this is not confirmed.
 
 ### Practical takeaway
 
 Do not attempt to auto-correct by halving the bytes: a doubled value can coincidentally land in a valid range (e.g. true `month=6` → corrupted `12`), which would silently publish a wrong-but-plausible date. Discarding the frame with a warning (current behavior) is the safer choice. The `ESP_LOGW` branches in `CURRENT_TIME` handling now include the raw frame hex so future captures don't require `ESP_LOGV` to diagnose this.
+
+### Update (2026-08-05): panel-side origin confirmed; safe recovery implemented
+
+**Source:** `traces/home-assistant_2026-08-05T03-50-34.425Z.log` (Home Assistant's own log, which timestamps every ESPHome device log line with HA's real wall-clock time — a ground truth independent of the panel's own RTC).
+
+**Findings (observed facts):** cross-checking the recovered date (halving `day`/`month`/`year`) against HA's own log timestamp for multiple `Current time has invalid month value 16` warnings shows an exact match, to the minute, every time — e.g. `14:56:10.594` decodes (after halving) to `2026-08-05 14:56`, matching HA's own timestamp precisely; same for `15:00:10.507` → `15:00` and `15:26:10.153` → `15:26`. `minutes_hi`/`minutes_lo` (offsets 1–2, transmitted *before* the glitch's insertion point at the seconds/day boundary) also matched real wall-clock time exactly in every sample, incrementing by exactly one minute between consecutive corrupted broadcasts.
+
+This same log also shows a **second, more severe variant**: in two multi-minute bursts (`14:22:55`–`14:23:40` and `14:51:55`–`14:55:40`), *every* `CURRENT_TIME` broadcast in the window is corrupted (not just one per minute), and `seconds` is doubled too, not just `day`/`month`/`year` — confirmed by tracking four consecutive 15s-spaced broadcasts whose observed `seconds` bytes (`0x00, 0x1E, 0x3C, 0x5A` = 0, 30, 60, 90) are each exactly double the true progression (0, 15, 30, 45). This suggests the insertion point sometimes shifts one byte earlier (into the `seconds` byte itself), and that the "severe" variant clusters in bursts rather than being spread evenly — more consistent with a triggered condition (e.g. bus contention, matching the "session badness" continuum from `arm_disarm_state_machine.md`) than constant background noise.
+
+**Inference (high confidence):** since `minutes_hi`/`minutes_lo` — transmitted *before* the corruption's insertion point in the same frame — always match real time exactly while `day`/`month`/`year` after it don't, this is very unlikely to be an ISR/receiver-side sampling artifact (which would be expected to occasionally perturb earlier bytes too, or differ between independent receivers). This resolves the assumption above: **the glitch originates on the panel's own transmit side**, not our sampling.
+
+**Fix applied:** `CrowAlarmPanel::` `CURRENT_TIME` handling (`crow_alarm_panel.cpp`) now attempts recovery instead of only discarding, addressing the "coincidental valid range" risk the original practical takeaway (above) correctly flagged: when `day`/`month` fail their range check, it halves `day`/`month`/`year` together (only if all three are even — a true single-bit doubling can't produce an odd result) and independently cross-checks the recovered date's day-of-week (via a new `day_of_week_from_date()` Sakamoto's-algorithm helper) against the frame's own untouched `day_of_week` field. A coincidental match on both the halved ranges *and* the weekday is astronomically unlikely, so this is treated as a confident recovery (logged at `ESP_LOGI`) rather than a guess. The "severe" seconds-doubling variant is not addressed — `seconds` isn't critical enough to warrant the same treatment, and the existing per-field range check still discards those frames when `seconds` lands out of range.
+
+Compiles and passes `esphome compile` against `crow_alarm_panel_test.yaml`. **Not yet validated on real hardware** — needs a fresh capture showing the `ESP_LOGI` recovery line fire against a real corrupted frame.
 
 ## `Unknown [ff.]`/`[fe.]` RX decode corruption still recurring after the 2026-07-12 ISR fix
 
