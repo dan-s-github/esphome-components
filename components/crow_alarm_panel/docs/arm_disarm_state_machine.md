@@ -421,6 +421,21 @@ Because `arm_away()`/`arm_stay()`/`disarm()` all reject a new call while `arm_di
 
 Compiles and passes `esphome compile` against `crow_alarm_panel_test.yaml`. **Not yet validated on real hardware** — needs a fresh capture (ideally reproducing a multi-failure streak like logs-24/42) to confirm the automatic retries actually land and that no new interaction appears between rapid consecutive retries and the controller (e.g. the same kind of ACK-timing sensitivity documented for output-select's `OUTPUT_SELECT_ENTER_DELAY_MS`).
 
+**Validated on real hardware (2026-08-05, logs-27):** `esphome-aap-alarm-interface-logs-27.txt`, captured with the fix flashed (compiled `14:47:22`). Two disarm cycles: the first succeeds on the first attempt (no retry needed), the second reproduces the familiar "digit-silence/terminal-key-silence, then success" shape already seen manually in logs-44/23, logs-46/25, and logs-47/26 — but fully automatically this time:
+
+```
+14:51:46.740  Disarm (single user-initiated call)
+14:51:47.349  CMD 0x01 after terminal key, awaiting ARMED_STATE confirmation
+14:51:48.288  Arm/disarm: timeout in state 4, retrying (1/5)
+14:51:48.669  Arm/disarm: CMD byte changed from 0x01 to 0x07 in CODE_DIGIT_PENDING, continuing
+14:51:48.999  CMD 0x07 after terminal key, awaiting ARMED_STATE confirmation
+14:51:49.820  Arm/disarm: timeout in state 4, retrying (2/5)
+14:51:50.513  [Controller] Disarmed
+14:51:50.529  Code sequence: complete (confirmed via ARMED_STATE broadcast)
+```
+
+A single `disarm()` call resolved in 3.8s total across two automatic retries, with no user action in between — the retries land cleanly, the CMD-byte-change tolerance from the 2026-07-25 fix keeps working unmodified mid-retry, and there's no sign of any new interaction between the rapid consecutive retries and the controller. Confirms the fix works in practice, not just in code review.
+
 ## Notes
 
 - ARM/STAY/DISARM sequences are simpler than OUTPUT because there's no ACK handshake
