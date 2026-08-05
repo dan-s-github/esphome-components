@@ -165,6 +165,20 @@ class CrowAlarmPanelStore {
   // The controller then keeps the keypad stuck in "output-select mode", rejecting all
   // subsequent KEY_OUTPUT attempts with KEYPAD_COMMAND [07].
   static const uint32_t OUTPUT_SELECT_ENTER_DELAY_MS = 60;
+
+  // Raw bit trace (diagnostic): batches every clock-sampled DAT bit that reaches the
+  // frame boundary-search logic (i.e. after glitch filtering, same bits that feed
+  // boundary_buffer_) into a fixed-size string and hands it to loop() once full.
+  // Independent of frame decoding, so mis-alignment/framing issues can be diagnosed
+  // by hand from the literal bitstream instead of the already-decoded bytes.
+  static const uint16_t BIT_TRACE_BUFFER_BITS = 128;
+  // Read in the ISR, written from the main loop via set_raw_bit_trace_enabled() — volatile like
+  // ack_pending_/is_transmitting_ above, for the same cross-core visibility reason.
+  volatile bool bit_trace_enabled_{false};
+  char bit_trace_buffer_[BIT_TRACE_BUFFER_BITS + 1]{};
+  char bit_trace_buffer2_[BIT_TRACE_BUFFER_BITS + 1]{};
+  uint16_t bit_trace_len_{0};
+  volatile bool bit_trace_ready_{false};
 };
 
 struct CrowAlarmPanelZone {
@@ -252,6 +266,20 @@ class CrowAlarmPanel : public Component {
   // be toggled at runtime without recompiling with a higher logger level.
   void set_raw_frame_logging_enabled(bool enabled) { this->raw_frame_logging_enabled_ = enabled; }
 
+  // Enables the ISR-side raw bit trace (see CrowAlarmPanelStore::bit_trace_enabled_). Disables
+  // first, then resets the in-progress buffer position and any pending-but-unconsumed batch
+  // before (re-)enabling, so a toggle never mixes bits captured before/after it into one trace
+  // chunk, and never emits a stale ready buffer left over from before the toggle.
+  void set_raw_bit_trace_enabled(bool enabled) {
+    this->store_.bit_trace_enabled_ = false;
+    {
+      InterruptLock lock;
+      this->store_.bit_trace_len_ = 0;
+      this->store_.bit_trace_ready_ = false;
+    }
+    this->store_.bit_trace_enabled_ = enabled;
+  }
+
  protected:
   CrowAlarmPanelKeypad find_keypad_(uint8_t address);
   bool is_bus_idle_();
@@ -290,6 +318,13 @@ class CrowAlarmPanel : public Component {
   std::vector<uint8_t> arm_disarm_code_digits_;  // code digits consumed one per KEYPAD_COMMAND
   uint8_t arm_disarm_code_idx_{0};
   uint8_t arm_disarm_terminal_key_{KEY_ENTER};  // KEY_ENTER (disarm), KEY_ARM or KEY_STAY (arm-with-code)
+  // A watchdog timeout here reliably means the panel's state did not change (see
+  // docs/arm_disarm_state_machine.md — multiple sessions with an independent monitor capture
+  // confirm no ARMED_STATE broadcast occurred around the timeout), so unlike output-select/
+  // zone-bypass a blind retry can't undo a change that already landed. 5 covers the worst
+  // consecutive-failure streak observed so far (logs-24, logs-42: 5 failures before success).
+  static const uint8_t ARM_DISARM_MAX_RETRIES = 5;
+  uint8_t arm_disarm_retry_count_{0};
   // "Digit accepted" display_code (KEYPAD_COMMAND byte[1]) learned from the first digit's
   // response each sequence. Physical keypad types disagree on this value (0x01 is common,
   // but address 0x05 has been observed sending 0x07 for the same "more digits expected"

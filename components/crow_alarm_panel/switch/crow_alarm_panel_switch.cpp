@@ -37,5 +37,18 @@ void CrowAlarmPanelRawLogSwitch::dump_config() {
   LOG_SWITCH("", "Crow Alarm Panel Raw Log Switch", this);
 }
 
+void CrowAlarmPanelRawBitTraceSwitch::write_state(bool state) {
+  if (this->parent_ == nullptr) {
+    ESP_LOGE(TAG, "Parent not set, ignoring raw bit trace switch command");
+    return;
+  }
+  this->parent_->set_raw_bit_trace_enabled(state);
+  this->publish_state(state);
+}
+
+void CrowAlarmPanelRawBitTraceSwitch::dump_config() {
+  LOG_SWITCH("", "Crow Alarm Panel Raw Bit Trace Switch", this);
+}
+
 }  // namespace crow_alarm_panel
 }  // namespace esphome

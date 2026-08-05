@@ -39,5 +39,15 @@ class CrowAlarmPanelRawLogSwitch : public CrowAlarmPanelSwitch {
   void write_state(bool state) override;
 };
 
+// Pure software toggle: no bus traffic, enables the parent's ISR-side raw bit trace
+// (batched DAT bitstream sampled on each accepted clock edge). State isn't restored on
+// boot since it's a debug aid, not panel state.
+class CrowAlarmPanelRawBitTraceSwitch : public CrowAlarmPanelSwitch {
+ public:
+  void dump_config() override;
+ protected:
+  void write_state(bool state) override;
+};
+
 }  // namespace crow_alarm_panel
 }  // namespace esphome

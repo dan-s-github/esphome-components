@@ -47,6 +47,16 @@ std::string keypad_label(const CrowAlarmPanelKeypad &keypad, uint8_t address) {
   return str_sprintf("Keypad 0x%02X", address);
 }
 
+// Sakamoto's algorithm. Returns the protocol's day_of_week encoding directly (1=Sunday..7=Saturday,
+// matching DAYS[] and CURRENT_TIME's data[0]) rather than the usual 0=Sunday.
+uint8_t day_of_week_from_date(uint16_t year, uint8_t month, uint8_t day) {
+  static const uint8_t OFFSETS[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
+  if (month < 3) {
+    year--;
+  }
+  return static_cast<uint8_t>((year + year / 4 - year / 100 + year / 400 + OFFSETS[month - 1] + day) % 7) + 1;
+}
+
 const char *controller_status_profile(uint8_t flags) {
   if (flags == 0x80) {
     return "zone_activity";
@@ -139,6 +149,21 @@ void IRAM_ATTR HOT CrowAlarmPanelStore::interrupt(CrowAlarmPanelStore *arg) {
 
   // Check for boundary
   arg->boundary_buffer_ = (uint8_t) ((arg->boundary_buffer_ << 1) | data_bit);
+
+  // Gated on !bit_trace_ready_ so bit_trace_buffer2_ stays untouched while loop() (running on
+  // the other core) is still copying it out — loop()'s InterruptLock only protects against
+  // same-core reentrancy, not this ISR on the other core, so the flag itself is what prevents
+  // the overwrite. Bits are simply dropped while the consumer is behind; accumulation resumes
+  // as soon as it clears the flag (normally sub-millisecond later).
+  if (arg->bit_trace_enabled_ && !arg->bit_trace_ready_) {
+    arg->bit_trace_buffer_[arg->bit_trace_len_++] = data_bit ? '1' : '0';
+    if (arg->bit_trace_len_ >= BIT_TRACE_BUFFER_BITS) {
+      memcpy(arg->bit_trace_buffer2_, arg->bit_trace_buffer_, BIT_TRACE_BUFFER_BITS);
+      arg->bit_trace_buffer2_[BIT_TRACE_BUFFER_BITS] = '\0';
+      arg->bit_trace_len_ = 0;
+      arg->bit_trace_ready_ = true;
+    }
+  }
 
   if (arg->inside_) {
     uint8_t idx = arg->num_bits_ / 8;
@@ -249,6 +274,16 @@ void CrowAlarmPanel::loop() {
   if (this->store_.ack_pending_ && (micros() - this->store_.ack_set_time_us_ > 2000)) {
     this->data_pin_->pin_mode(gpio::FLAG_INPUT);
     this->store_.ack_pending_ = false;
+  }
+
+  if (this->store_.bit_trace_ready_) {
+    char local_bits[CrowAlarmPanelStore::BIT_TRACE_BUFFER_BITS + 1];
+    {
+      InterruptLock lock;
+      memcpy(local_bits, this->store_.bit_trace_buffer2_, sizeof(local_bits));
+      this->store_.bit_trace_ready_ = false;
+    }
+    ESP_LOGI(TAG, "Raw bit trace: %s", local_bits);
   }
 
   if (this->store_.data_length) {
@@ -493,19 +528,44 @@ void CrowAlarmPanel::loop() {
                    CONTROLLER_LABEL, data[3], type, format_hex_pretty(data).c_str());
           break;
         }
-        if (data[4] == 0 || data[4] > 31) {
-          ESP_LOGW(TAG, "[%-*s] Current time has invalid day-of-month value %u [%02x.%s]", this->keypad_label_width_,
-                   CONTROLLER_LABEL, data[4], type, format_hex_pretty(data).c_str());
-          break;
-        }
-        if (data[5] == 0 || data[5] > 12) {
-          ESP_LOGW(TAG, "[%-*s] Current time has invalid month value %u [%02x.%s]", this->keypad_label_width_,
-                   CONTROLLER_LABEL, data[5], type, format_hex_pretty(data).c_str());
-          break;
+        uint8_t day = data[4];
+        uint8_t month = data[5];
+        uint8_t year = data[6];
+        if (day == 0 || day > 31 || month == 0 || month > 12) {
+          // The documented CURRENT_TIME bit-corruption glitch (protocol_investigations.md) shifts
+          // day/month/year one bit left together (a single spurious 0 bit inserted right after the
+          // seconds byte) — i.e. each is exactly double its true value. Halving all three and
+          // cross-checking the recovered date's weekday against the untouched day_of_week field
+          // (data[0], from earlier in the frame, before the glitch's insertion point) makes a false
+          // recovery astronomically unlikely, addressing the coincidental-valid-range risk noted in
+          // that doc. Validated against real HA log timestamps in the 2026-08-05 traces: the
+          // recovered date matched the true date/time exactly in every sample checked.
+          bool recovered = false;
+          if ((data[4] % 2) == 0 && (data[5] % 2) == 0 && (data[6] % 2) == 0) {
+            uint8_t rec_day = data[4] / 2;
+            uint8_t rec_month = data[5] / 2;
+            uint8_t rec_year = data[6] / 2;
+            if (rec_day >= 1 && rec_day <= 31 && rec_month >= 1 && rec_month <= 12 &&
+                day_of_week_from_date(2000 + rec_year, rec_month, rec_day) == data[0]) {
+              ESP_LOGI(TAG,
+                       "[%-*s] Current time: recovered doubled-bit glitch, using 20%02u-%02u-%02u [%02x.%s]",
+                       this->keypad_label_width_, CONTROLLER_LABEL, rec_year, rec_month, rec_day, type,
+                       format_hex_pretty(data).c_str());
+              day = rec_day;
+              month = rec_month;
+              year = rec_year;
+              recovered = true;
+            }
+          }
+          if (!recovered) {
+            ESP_LOGW(TAG, "[%-*s] Current time has invalid day/month value %u/%u [%02x.%s]",
+                     this->keypad_label_width_, CONTROLLER_LABEL, data[4], data[5], type,
+                     format_hex_pretty(data).c_str());
+            break;
+          }
         }
         ESP_LOGD(TAG, "[%-*s] Controller time update: %s 20%02d-%02d-%02d %02d:%02d:%02d",
-                 this->keypad_label_width_, CONTROLLER_LABEL, day_of_week, data[6], data[5], data[4], hour, minute,
-                 data[3]);
+                 this->keypad_label_width_, CONTROLLER_LABEL, day_of_week, year, month, day, hour, minute, data[3]);
         break;
       }
       case RESPONSE_TIME:
@@ -832,23 +892,57 @@ void CrowAlarmPanel::loop() {
     }
   }
 
-  // Arm/disarm watchdog: abort if any non-IDLE state exceeds 1s without progress.
+  // Arm/disarm watchdog: abort if any non-IDLE state exceeds 1s without progress. See
+  // ARM_DISARM_MAX_RETRIES in crow_alarm_panel.h for why retrying here (unlike output-select/
+  // zone-bypass above) is safe: a timeout reliably means the panel's state did not change.
   if (this->arm_disarm_state_ != ArmDisarmState::IDLE) {
     const uint32_t now_ms = millis();
     if (now_ms - this->arm_disarm_state_enter_ms_ > 1000) {
-      ESP_LOGW(TAG, "Arm/disarm: timeout in state %u, aborting",
-               static_cast<uint8_t>(this->arm_disarm_state_));
-      this->arm_disarm_state_ = ArmDisarmState::IDLE;
-      this->arm_disarm_code_digits_.clear();
-      this->arm_disarm_code_idx_ = 0;
-      // CrowAlarmControlPanel::control() optimistically publishes ACP_STATE_ARMING/DISARMING
-      // before this sequence resolves. On abort no ARMED_STATE broadcast is coming to correct
-      // that, so without this the entity would be stuck in the transitional state forever,
-      // rejecting both future arm and disarm calls (ESPHome's alarm_control_panel validate_()
-      // requires DISARMED to arm and an armed/pending state to disarm). Restore it to the last
-      // state the controller itself actually confirmed.
-      if (this->alarm_control_panel_ != nullptr) {
-        this->alarm_control_panel_->publish_state(this->last_confirmed_acp_state_);
+      if (this->arm_disarm_retry_count_ < ARM_DISARM_MAX_RETRIES) {
+        this->arm_disarm_retry_count_++;
+        ESP_LOGW(TAG, "Arm/disarm: timeout in state %u, retrying (%u/%u)",
+                 static_cast<uint8_t>(this->arm_disarm_state_), this->arm_disarm_retry_count_,
+                 ARM_DISARM_MAX_RETRIES);
+        // Refresh the watchdog timer BEFORE any keypress() below — keypress()->send_packet()
+        // can delay()/yield() and re-enter this loop(), and with the old timestamp still in
+        // place the watchdog would see itself as still timed out, firing again and sending an
+        // extra keypress (same race the output-select retry above avoids the same way).
+        this->arm_disarm_state_enter_ms_ = millis();
+        switch (this->arm_disarm_state_) {
+          case ArmDisarmState::ARM_AWAY_PENDING:
+            this->keypress(KEY_ARM);
+            break;
+          case ArmDisarmState::ARM_STAY_PENDING:
+            this->keypress(KEY_STAY);
+            break;
+          case ArmDisarmState::CODE_DIGIT_PENDING:
+          case ArmDisarmState::CODE_ENTER_PENDING:
+            // Restart the whole code+terminal-key sequence from scratch, exactly like a fresh
+            // manual retry (proven reliable across every session in arm_disarm_state_machine.md).
+            this->arm_disarm_code_idx_ = 1;
+            this->arm_disarm_state_ = ArmDisarmState::CODE_DIGIT_PENDING;
+            this->arm_disarm_digit_ack_byte_set_ = false;
+            this->keypress(this->arm_disarm_code_digits_[0]);
+            break;
+          default:
+            break;
+        }
+      } else {
+        ESP_LOGW(TAG, "Arm/disarm: timeout in state %u, aborting after %u retries",
+                 static_cast<uint8_t>(this->arm_disarm_state_), this->arm_disarm_retry_count_);
+        this->arm_disarm_state_ = ArmDisarmState::IDLE;
+        this->arm_disarm_code_digits_.clear();
+        this->arm_disarm_code_idx_ = 0;
+        this->arm_disarm_retry_count_ = 0;
+        // CrowAlarmControlPanel::control() optimistically publishes ACP_STATE_ARMING/DISARMING
+        // before this sequence resolves. On abort no ARMED_STATE broadcast is coming to correct
+        // that, so without this the entity would be stuck in the transitional state forever,
+        // rejecting both future arm and disarm calls (ESPHome's alarm_control_panel validate_()
+        // requires DISARMED to arm and an armed/pending state to disarm). Restore it to the last
+        // state the controller itself actually confirmed.
+        if (this->alarm_control_panel_ != nullptr) {
+          this->alarm_control_panel_->publish_state(this->last_confirmed_acp_state_);
+        }
       }
     }
   }
@@ -892,6 +986,7 @@ void CrowAlarmPanel::start_code_sequence_(const std::string &code, uint8_t termi
   this->arm_disarm_code_idx_ = 1;
   this->arm_disarm_state_ = ArmDisarmState::CODE_DIGIT_PENDING;
   this->arm_disarm_state_enter_ms_ = millis();
+  this->arm_disarm_retry_count_ = 0;
   this->arm_disarm_digit_ack_byte_set_ = false;
   this->keypress(this->arm_disarm_code_digits_[0]);
 }
@@ -912,6 +1007,7 @@ void CrowAlarmPanel::arm_away(const std::string &code) {
     ESP_LOGI(TAG, "Arm away");
     this->arm_disarm_state_ = ArmDisarmState::ARM_AWAY_PENDING;
     this->arm_disarm_state_enter_ms_ = millis();
+    this->arm_disarm_retry_count_ = 0;
     this->keypress(KEY_ARM);
   }
 }
@@ -932,6 +1028,7 @@ void CrowAlarmPanel::arm_stay(const std::string &code) {
     ESP_LOGI(TAG, "Arm stay");
     this->arm_disarm_state_ = ArmDisarmState::ARM_STAY_PENDING;
     this->arm_disarm_state_enter_ms_ = millis();
+    this->arm_disarm_retry_count_ = 0;
     this->keypress(KEY_STAY);
   }
 }
