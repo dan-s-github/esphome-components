@@ -523,11 +523,6 @@ void CrowAlarmPanel::loop() {
                    format_hex_pretty(data).c_str());
           break;
         }
-        if (data[3] >= 60) {
-          ESP_LOGW(TAG, "[%-*s] Current time has invalid seconds value %u [%02x.%s]", this->keypad_label_width_,
-                   CONTROLLER_LABEL, data[3], type, format_hex_pretty(data).c_str());
-          break;
-        }
         uint8_t day = data[4];
         uint8_t month = data[5];
         uint8_t year = data[6];
@@ -563,6 +558,15 @@ void CrowAlarmPanel::loop() {
                      format_hex_pretty(data).c_str());
             break;
           }
+        }
+        // Checked after the day/month recovery attempt above (not before) so a bad seconds value
+        // doesn't discard an otherwise-recoverable day/month/year — see protocol_investigations.md,
+        // the 2026-08-10 CURRENT_TIME update, for two sessions where this order previously discarded
+        // cleanly-recoverable date data alongside an unrelated bad seconds byte.
+        if (data[3] >= 60) {
+          ESP_LOGW(TAG, "[%-*s] Current time has invalid seconds value %u [%02x.%s]", this->keypad_label_width_,
+                   CONTROLLER_LABEL, data[3], type, format_hex_pretty(data).c_str());
+          break;
         }
         ESP_LOGD(TAG, "[%-*s] Controller time update: %s 20%02d-%02d-%02d %02d:%02d:%02d",
                  this->keypad_label_width_, CONTROLLER_LABEL, day_of_week, year, month, day, hour, minute, data[3]);

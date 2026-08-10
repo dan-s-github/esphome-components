@@ -309,6 +309,8 @@ The device's actual production config (`aap-esl2-keypad-interface/aap_esl_keypad
 
 **Practical takeaway:** the `logs-30` handover note asking whether to fix the check ordering (so day/month recovery can fire independently of the unrelated `seconds` validation) remains open and unanswered — this session doesn't change the recommendation, just adds a third data point. No code change made.
 
+**Fix applied (2026-08-10):** `CURRENT_TIME` handling (`crow_alarm_panel.cpp`) now checks `seconds` *after* attempting the day/month/year recovery rather than before, so a frame with a corrupted `seconds` byte alongside a cleanly-recoverable `day`/`month`/`year` still fires the `ESP_LOGI` recovery path instead of being discarded before recovery is even attempted. The final `Controller time update` log line is still gated on `seconds` being valid (0–59) — this only fixes the completeness gap in *attempting* recovery, it does not start trusting an invalid `seconds` value. Compiles and passes `esphome compile` against `crow_alarm_panel_test.yaml`. Not yet validated on real hardware against a fresh case matching the `logs-30`/`logs-32` shape (bad `seconds`, recoverable date).
+
 ## `Unknown [ff.]`/`[fe.]` RX decode corruption still recurring after the 2026-07-12 ISR fix
 
 `arm_disarm_state_machine.md`'s "Root-cause candidate: hardware-ACK release corrupts our own RX decode under rapid retransmission (2026-07-12)" entry identified this signature (a burst of `Unknown [ff.]`/`[fe.]` frames, decoded correctly by a passive monitor at the same moment but garbled on the active interface) and applied a fix to `CrowAlarmPanelStore::interrupt()`, validated against `logs-12/37` as showing zero occurrences in that one session.
