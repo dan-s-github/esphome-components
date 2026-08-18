@@ -311,6 +311,46 @@ The device's actual production config (`aap-esl2-keypad-interface/aap_esl_keypad
 
 **Fix applied (2026-08-10):** `CURRENT_TIME` handling (`crow_alarm_panel.cpp`) now checks `seconds` *after* attempting the day/month/year recovery rather than before, so a frame with a corrupted `seconds` byte alongside a cleanly-recoverable `day`/`month`/`year` still fires the `ESP_LOGI` recovery path instead of being discarded before recovery is even attempted. The final `Controller time update` log line is still gated on `seconds` being valid (0–59) — this only fixes the completeness gap in *attempting* recovery, it does not start trusting an invalid `seconds` value. Compiles and passes `esphome compile` against `crow_alarm_panel_test.yaml`. Not yet validated on real hardware against a fresh case matching the `logs-30`/`logs-32` shape (bad `seconds`, recoverable date).
 
+### Update (2026-08-19): 62-hour log shows glitch bursts recurring at the same wall-clock time on consecutive days — strengthens the "internal counter/schedule, not bus noise" hypothesis
+
+**Source:** `traces/home-assistant_2026-08-18T20-27-05.080Z.log`, a Home Assistant log spanning `2026-08-17 04:11:25` to `2026-08-19 08:26:55` (~62 hours) captured post-2026-08-10-fix, at HA's default log level (only `ESP_LOGI`/`ESP_LOGW` `CURRENT_TIME` lines are visible — no `ESP_LOGD` clean-decode lines to compute a glitch ratio against).
+
+**Findings (observed facts):**
+
+- Across the full log, `CURRENT_TIME` glitch-related lines total 2279 `recovered doubled-bit glitch` (day/month/year), 559 `invalid seconds value`, and 90 `invalid day/month value` (unrecoverable). The recoverable/unrecoverable split is consistent with prior sessions; nothing new there.
+- The corrupted values are drawn from a small fixed set, not spread across the byte range: `invalid seconds value` is one of `{60, 61, 89, 90, 91}` in 557 of 559 occurrences (2 outliers: one `73`, one `100`). `invalid day/month value` is one of `{68/32, 72/32, 76/32}` in all 90 occurrences — `month` is *always* exactly `32`.
+- Bucketing all glitch-line timestamps by hour-of-day shows near-identical counts 24 hours apart across the two full days in the log, e.g.: `05:00`→18/18, `08:00`→88/88, `09:00`→18/18, `12:00`→111/114, `13:00`→18/18, `16:00`→102/102, `21:00`→82/82, `22:00`→18/18, `23:00`→49/49 (Aug 17 vs Aug 18 respectively; full table not reproduced here).
+- Individual glitch *bursts* line up to within ~1 second, 24 hours apart. E.g. the `05:xx` burst on both days: Aug 17 — `05:17:55`, `05:18:10`, `05:18:25`, `05:18:40`, `05:18:55`, `05:19:10`, `05:19:25`, `05:19:40`; Aug 18 — `05:17:54`, `05:18:09`, `05:18:25`, `05:18:39`, `05:18:55`, `05:19:10`, `05:19:25`, `05:19:40`. Same shape recurs at `05:50:54`–`05:51:39` both days too.
+
+**Inference (medium-high confidence):** random bus contention or EMI would not be expected to phase-lock a burst's onset to within ~1 second of real wall-clock time across a 24-hour gap, nor reproduce near-identical per-hour glitch counts two days running. This is a much stronger data point for the "internal broadcast counter" hypothesis raised in the 2026-08-05 update above (`glitch phase tied to broadcast count, not wall-clock seconds`) than the single-session evidence that hypothesis was originally based on — and points toward the glitch being tied to something that itself runs on a roughly-24h schedule (a periodic counter whose cycle length divides evenly enough into ~86400s to phase-lock, or a daily reset/rollover event on the panel), rather than to transient wiring/contention noise. Whether the trigger is purely internal to the panel (e.g. a scheduled self-test or status-report cycle) or an external environmental correlate (e.g. another device on the same daily schedule perturbing the bus) is not distinguishable from this log alone.
+
+**Assumption (unverified):** the exact mechanism tying the glitch to time-of-day — panel-internal schedule vs. external daily-cycling interference source — is not established. Confirming either would need either panel documentation/firmware insight (not available) or correlating burst onsets against other known daily-scheduled activity in the installation (HVAC, irrigation, etc.), which hasn't been attempted.
+
+**Practical takeaway:** no code change proposed — the existing day/month/year recovery already handles the recoverable case regardless of *why* it recurs, and `seconds` is still correctly discarded when invalid. This is logged here because it directly answers the open question from the 2026-08-05 update about whether the "severe" (near-every-broadcast) glitch variant is triggered/contention-driven or schedule-driven: the day-over-day phase-lock evidence here favors schedule/counter-driven ("by design", in the sense of being a deterministic property of the panel's own broadcast logic) over bus contention.
+
+### Update (2026-08-19, cont.): dominant trigger is still `seconds = 0x0F` (15) — the day-over-day match is better explained by that per-minute phase plus a stable clock offset than by a literal daily schedule
+
+**Findings (observed facts):** decoding `data[3]` (the `seconds` byte) for every `recovered doubled-bit glitch` line in the same log whose `seconds` value itself was *not* also corrupted (1721 of the 2279 recovered events; the other 558 pair with an `invalid seconds value` line off the same frame, per the previous entry) gives this distribution:
+
+| `seconds` byte | Count | Share |
+| --- | --- | --- |
+| `0x0F` (15) | 736 | 43% |
+| `0x17` (23) | 341 | 20% |
+| `0x1B` (27) | 176 | 10% |
+| `0x1E` (30) | 143 | 8% |
+| `0x00` (0) | 144 | 8% |
+| `0x01` (1) | 90 | 5% |
+| `0x1D` (29) | 88 | 5% |
+| `0x0E` (14) / `0x2F` (47) | 1 / 2 | <1% |
+
+`0x0F` (15) is the single largest bucket by a wide margin — nearly 2.2x the next most common value — matching (not superseding) the original `protocol_trace_2026-04-12_time_setting.md`/2026-08-05 characterization of the mild variant firing "always at the `seconds = 0x0F` (15s) broadcast." The other values above are not random scatter either: `arm_disarm_state_machine.md`-style phase shifts (documented in the 2026-08-05 "glitch phase tied to broadcast count" update, where a registration event shifted the glitch's `seconds` phase from 15 to 23 for the rest of that session) plausibly account for the `23`/`27`/`30` clusters as the same per-cycle trigger recurring at a shifted phase after similar mid-session events, though this hasn't been individually traced per burst here.
+
+**Inference (revises the previous entry's framing):** this changes what the day-over-day burst-timing match most likely indicates. The trigger is best described as tied to the panel's own broadcast-cycle *phase* (predominantly, but not exclusively, "the broadcast where its internal clock reads `:15` seconds"), not to wall-clock time directly. Combined with the already-documented, stable ~4.4s-fast panel clock offset (2026-08-05 update — a fixed bias, not accumulating drift), a phase trigger recurring every cycle would land at very nearly the same real-world clock time from one day to the next *on its own*, with no need to additionally posit a literal calendar/24h-scheduled event on the panel. In other words: the previous entry's "roughly-24h schedule" framing was more speculative than necessary — a per-minute (or per-broadcast-count) phase trigger plus a non-drifting clock is sufficient to produce the observed ~1-second day-over-day alignment.
+
+This does *not* explain why the "severe" behavior (multiple corrupted broadcasts clustering into a several-minute burst, rather than the mild variant's steady one-per-minute) itself only occurs in specific windows through the day rather than continuously — that part of the original question is still open and isn't addressed by the `seconds` phase data alone.
+
+**Practical takeaway:** narrows, rather than replaces, the previous entry's conclusion — still "by design" in the sense of being deterministic and tied to the panel's own clock/broadcast logic rather than random bus noise, but the day-over-day recurrence specifically is adequately explained by (per-cycle phase trigger) + (stable clock offset), so it shouldn't be read as independent evidence of a separate daily-scheduled trigger condition. No code change proposed.
+
 ## `Unknown [ff.]`/`[fe.]` RX decode corruption still recurring after the 2026-07-12 ISR fix
 
 `arm_disarm_state_machine.md`'s "Root-cause candidate: hardware-ACK release corrupts our own RX decode under rapid retransmission (2026-07-12)" entry identified this signature (a burst of `Unknown [ff.]`/`[fe.]` frames, decoded correctly by a passive monitor at the same moment but garbled on the active interface) and applied a fix to `CrowAlarmPanelStore::interrupt()`, validated against `logs-12/37` as showing zero occurrences in that one session.
