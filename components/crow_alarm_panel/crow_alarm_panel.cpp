@@ -535,6 +535,12 @@ void CrowAlarmPanel::loop() {
           // recovery astronomically unlikely, addressing the coincidental-valid-range risk noted in
           // that doc. Validated against real HA log timestamps in the 2026-08-05 traces: the
           // recovered date matched the true date/time exactly in every sample checked.
+          //
+          // This glitch is frequent (up to hundreds of occurrences/hour — see the 2026-08-19
+          // protocol_investigations.md update) and, per that update, an expected/benign property of
+          // the panel's own broadcast logic rather than a bus fault — and CURRENT_TIME isn't published
+          // to any entity, so none of this is user-actionable. Logged at DEBUG, same level as the
+          // successful decode below, to avoid spamming WARN/INFO on every occurrence.
           bool recovered = false;
           if ((data[4] % 2) == 0 && (data[5] % 2) == 0 && (data[6] % 2) == 0) {
             uint8_t rec_day = data[4] / 2;
@@ -542,7 +548,7 @@ void CrowAlarmPanel::loop() {
             uint8_t rec_year = data[6] / 2;
             if (rec_day >= 1 && rec_day <= 31 && rec_month >= 1 && rec_month <= 12 &&
                 day_of_week_from_date(2000 + rec_year, rec_month, rec_day) == data[0]) {
-              ESP_LOGI(TAG,
+              ESP_LOGD(TAG,
                        "[%-*s] Current time: recovered doubled-bit glitch, using 20%02u-%02u-%02u [%02x.%s]",
                        this->keypad_label_width_, CONTROLLER_LABEL, rec_year, rec_month, rec_day, type,
                        format_hex_pretty(data).c_str());
@@ -553,7 +559,7 @@ void CrowAlarmPanel::loop() {
             }
           }
           if (!recovered) {
-            ESP_LOGW(TAG, "[%-*s] Current time has invalid day/month value %u/%u [%02x.%s]",
+            ESP_LOGD(TAG, "[%-*s] Current time has invalid day/month value %u/%u [%02x.%s]",
                      this->keypad_label_width_, CONTROLLER_LABEL, data[4], data[5], type,
                      format_hex_pretty(data).c_str());
             break;
@@ -564,7 +570,8 @@ void CrowAlarmPanel::loop() {
         // the 2026-08-10 CURRENT_TIME update, for two sessions where this order previously discarded
         // cleanly-recoverable date data alongside an unrelated bad seconds byte.
         if (data[3] >= 60) {
-          ESP_LOGW(TAG, "[%-*s] Current time has invalid seconds value %u [%02x.%s]", this->keypad_label_width_,
+          // Same known glitch family as above (frequent, benign, unpublished) — DEBUG, not WARN.
+          ESP_LOGD(TAG, "[%-*s] Current time has invalid seconds value %u [%02x.%s]", this->keypad_label_width_,
                    CONTROLLER_LABEL, data[3], type, format_hex_pretty(data).c_str());
           break;
         }
