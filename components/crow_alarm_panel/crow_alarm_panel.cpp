@@ -969,12 +969,14 @@ void CrowAlarmPanel::loop() {
       ESP_LOGW(TAG, "No ping for 60 s, re-sending registration announce");
       this->registration_sent_ = false;
     }
-    if (!this->registration_sent_ && now_ms >= this->registration_after_ms_ && this->is_bus_idle_()) {
+    if (!this->registration_sent_ && now_ms >= this->registration_after_ms_ && this->is_bus_idle_() &&
+        (now_ms - this->last_registration_announce_ms_) >= REGISTRATION_ANNOUNCE_MIN_INTERVAL_MS) {
       CrowAlarmPanelKeypad keypad = this->find_keypad_(this->keypad_address_);
       ESP_LOGW(TAG, "[%-*s] Sending registration announce", this->keypad_label_width_,
                keypad_label(keypad, this->keypad_address_).c_str());
       this->send_packet(KEYPAD_REGISTRATION, {0x00});
       this->registration_sent_ = true;
+      this->last_registration_announce_ms_ = now_ms;
     }
   }
 }

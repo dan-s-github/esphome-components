@@ -294,6 +294,12 @@ class CrowAlarmPanel : public Component {
 
   // Watchdog: track last time the controller polled us; re-register if silent for 60 s.
   uint32_t last_ping_ms_{0};
+  // Minimum spacing between registration-announce resends triggered by the no-ping watchdog
+  // above. Without this, registration_sent_ flips false->true every loop() iteration while
+  // last_ping_ms_ stays stale (no KEYPAD_PING arriving to advance it), re-sending on every pass
+  // instead of backing off — observed firing 6x within ~1s in a real capture (2026-08-19).
+  static const uint32_t REGISTRATION_ANNOUNCE_MIN_INTERVAL_MS = 1000;
+  uint32_t last_registration_announce_ms_{0};
 
   // Output-select state machine.
   OutputSelectState output_select_state_{OutputSelectState::IDLE};
