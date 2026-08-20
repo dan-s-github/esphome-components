@@ -436,6 +436,8 @@ Compiles and passes `esphome compile` against `crow_alarm_panel_test.yaml`. **No
 
 A single `disarm()` call resolved in 3.8s total across two automatic retries, with no user action in between — the retries land cleanly, the CMD-byte-change tolerance from the 2026-07-25 fix keeps working unmodified mid-retry, and there's no sign of any new interaction between the rapid consecutive retries and the controller. Confirms the fix works in practice, not just in code review.
 
+**Further confirmed (2026-08-19, logs-33):** `esphome-aap-alarm-interface-logs-33.txt`, four arm/disarm cycles in a ~14-minute session (`14:06`–`14:20`). All four arms completed cleanly on the first attempt. Two of the four disarms (`14:08:36.196`, `14:20:00.756`) hit the ordinary `CODE_ENTER_PENDING` silence signature — terminal key acked (`CMD 0x07`), then genuine bus silence, 1s watchdog fires `Arm/disarm: timeout in state 4, retrying (1/5)`, full code+terminal sequence resent, succeeds immediately on the retry with no user action. Same shape as the logs-27 validation above, one retry each instead of two, still 100% eventual success. No new failure mechanism, no code change proposed.
+
 ## Notes
 
 - ARM/STAY/DISARM sequences are simpler than OUTPUT because there's no ACK handshake

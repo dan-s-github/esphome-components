@@ -153,6 +153,8 @@ Output-select and arm/disarm sequences are now captured (`esphome-aap-keypad-mon
 - During arming countdown, keypad receives `Command [14.06.AA.00.00.01.80]` before final armed-away state
 - Protocol appears identical to IP keypad for output-select and code-entry command gating
 - Address 0x06 confirmed
+- **Digit batching, not per-keystroke bus timing** (`esphome-aap-alarm-interface-logs-32.txt`): during code entry, digits arrive as two near-simultaneous pairs (e.g. digits 1+2 within ~1ms of each other, then a ~150–200ms gap, then digits 3+4 within ~1ms, then another gap before ENTER) rather than the smoothly user-paced single-digit spacing IP/AAP keypads show. This is the RS232 interface's own "enter code" prompt UI batching digits behind a confirm step before relaying them to the bus — not a bus collision or double-transmit — and shouldn't be misread as a protocol anomaly if seen again.
+- **Confirms multi-user-code support:** the code used by Control4 to disarm differs from the code the IP Keypad and ESPHome integration use (both redacted) — the panel accepts more than one independently-valid user code.
 
 #### ARM_AWAY + DISARM with code (from logs-25)
 ```text

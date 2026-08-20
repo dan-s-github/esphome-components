@@ -523,11 +523,6 @@ void CrowAlarmPanel::loop() {
                    format_hex_pretty(data).c_str());
           break;
         }
-        if (data[3] >= 60) {
-          ESP_LOGW(TAG, "[%-*s] Current time has invalid seconds value %u [%02x.%s]", this->keypad_label_width_,
-                   CONTROLLER_LABEL, data[3], type, format_hex_pretty(data).c_str());
-          break;
-        }
         uint8_t day = data[4];
         uint8_t month = data[5];
         uint8_t year = data[6];
@@ -540,6 +535,12 @@ void CrowAlarmPanel::loop() {
           // recovery astronomically unlikely, addressing the coincidental-valid-range risk noted in
           // that doc. Validated against real HA log timestamps in the 2026-08-05 traces: the
           // recovered date matched the true date/time exactly in every sample checked.
+          //
+          // This glitch is frequent (up to hundreds of occurrences/hour — see the 2026-08-19
+          // protocol_investigations.md update) and, per that update, an expected/benign property of
+          // the panel's own broadcast logic rather than a bus fault — and CURRENT_TIME isn't published
+          // to any entity, so none of this is user-actionable. Logged at DEBUG, same level as the
+          // successful decode below, to avoid spamming WARN/INFO on every occurrence.
           bool recovered = false;
           if ((data[4] % 2) == 0 && (data[5] % 2) == 0 && (data[6] % 2) == 0) {
             uint8_t rec_day = data[4] / 2;
@@ -547,7 +548,7 @@ void CrowAlarmPanel::loop() {
             uint8_t rec_year = data[6] / 2;
             if (rec_day >= 1 && rec_day <= 31 && rec_month >= 1 && rec_month <= 12 &&
                 day_of_week_from_date(2000 + rec_year, rec_month, rec_day) == data[0]) {
-              ESP_LOGI(TAG,
+              ESP_LOGD(TAG,
                        "[%-*s] Current time: recovered doubled-bit glitch, using 20%02u-%02u-%02u [%02x.%s]",
                        this->keypad_label_width_, CONTROLLER_LABEL, rec_year, rec_month, rec_day, type,
                        format_hex_pretty(data).c_str());
@@ -558,11 +559,21 @@ void CrowAlarmPanel::loop() {
             }
           }
           if (!recovered) {
-            ESP_LOGW(TAG, "[%-*s] Current time has invalid day/month value %u/%u [%02x.%s]",
+            ESP_LOGD(TAG, "[%-*s] Current time has invalid day/month value %u/%u [%02x.%s]",
                      this->keypad_label_width_, CONTROLLER_LABEL, data[4], data[5], type,
                      format_hex_pretty(data).c_str());
             break;
           }
+        }
+        // Checked after the day/month recovery attempt above (not before) so a bad seconds value
+        // doesn't discard an otherwise-recoverable day/month/year — see protocol_investigations.md,
+        // the 2026-08-10 CURRENT_TIME update, for two sessions where this order previously discarded
+        // cleanly-recoverable date data alongside an unrelated bad seconds byte.
+        if (data[3] >= 60) {
+          // Same known glitch family as above (frequent, benign, unpublished) — DEBUG, not WARN.
+          ESP_LOGD(TAG, "[%-*s] Current time has invalid seconds value %u [%02x.%s]", this->keypad_label_width_,
+                   CONTROLLER_LABEL, data[3], type, format_hex_pretty(data).c_str());
+          break;
         }
         ESP_LOGD(TAG, "[%-*s] Controller time update: %s 20%02d-%02d-%02d %02d:%02d:%02d",
                  this->keypad_label_width_, CONTROLLER_LABEL, day_of_week, year, month, day, hour, minute, data[3]);
@@ -958,12 +969,14 @@ void CrowAlarmPanel::loop() {
       ESP_LOGW(TAG, "No ping for 60 s, re-sending registration announce");
       this->registration_sent_ = false;
     }
-    if (!this->registration_sent_ && now_ms >= this->registration_after_ms_ && this->is_bus_idle_()) {
+    if (!this->registration_sent_ && now_ms >= this->registration_after_ms_ && this->is_bus_idle_() &&
+        (now_ms - this->last_registration_announce_ms_) >= REGISTRATION_ANNOUNCE_MIN_INTERVAL_MS) {
       CrowAlarmPanelKeypad keypad = this->find_keypad_(this->keypad_address_);
       ESP_LOGW(TAG, "[%-*s] Sending registration announce", this->keypad_label_width_,
                keypad_label(keypad, this->keypad_address_).c_str());
       this->send_packet(KEYPAD_REGISTRATION, {0x00});
       this->registration_sent_ = true;
+      this->last_registration_announce_ms_ = now_ms;
     }
   }
 }
