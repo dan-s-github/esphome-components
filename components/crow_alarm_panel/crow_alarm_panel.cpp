@@ -1072,6 +1072,13 @@ void CrowAlarmPanel::arm_away(const std::string &code) {
     ESP_LOGW(TAG, "arm_away: ARM/DISARM already in progress, ignoring");
     return;
   }
+  // All three keypress state machines advance on the same KEYPAD_COMMAND frames; running
+  // two at once would double-consume confirmations.
+  if (this->output_select_state_ != OutputSelectState::IDLE ||
+      this->zone_bypass_state_ != ZoneBypassState::IDLE) {
+    ESP_LOGW(TAG, "arm_away: another keypress sequence in progress, ignoring");
+    return;
+  }
   if (!code.empty()) {
     ESP_LOGI(TAG, "Arm away (with code)");
     this->start_code_sequence_(code, KEY_ARM);
@@ -1092,6 +1099,13 @@ void CrowAlarmPanel::arm_stay(const std::string &code) {
   }
   if (this->arm_disarm_state_ != ArmDisarmState::IDLE) {
     ESP_LOGW(TAG, "arm_stay: ARM/DISARM already in progress, ignoring");
+    return;
+  }
+  // All three keypress state machines advance on the same KEYPAD_COMMAND frames; running
+  // two at once would double-consume confirmations.
+  if (this->output_select_state_ != OutputSelectState::IDLE ||
+      this->zone_bypass_state_ != ZoneBypassState::IDLE) {
+    ESP_LOGW(TAG, "arm_stay: another keypress sequence in progress, ignoring");
     return;
   }
   if (!code.empty()) {
@@ -1118,6 +1132,13 @@ void CrowAlarmPanel::disarm(const std::string &code) {
   }
   if (this->arm_disarm_state_ != ArmDisarmState::IDLE) {
     ESP_LOGW(TAG, "disarm: ARM/DISARM already in progress, ignoring");
+    return;
+  }
+  // All three keypress state machines advance on the same KEYPAD_COMMAND frames; running
+  // two at once would double-consume confirmations.
+  if (this->output_select_state_ != OutputSelectState::IDLE ||
+      this->zone_bypass_state_ != ZoneBypassState::IDLE) {
+    ESP_LOGW(TAG, "disarm: another keypress sequence in progress, ignoring");
     return;
   }
   ESP_LOGI(TAG, "Disarm");
@@ -1162,6 +1183,15 @@ void CrowAlarmPanel::set_output(uint8_t output, bool state) {
   }
   if (this->output_select_state_ != OutputSelectState::IDLE) {
     ESP_LOGW(TAG, "set_output(%u, %s): output-select sequence already in progress", output, state ? "on" : "off");
+    return;
+  }
+  // All three keypress state machines advance on the same KEYPAD_COMMAND frames; running
+  // two at once would double-consume confirmations. arm_disarm_state_ stays non-IDLE for the
+  // whole multi-second retry-backoff envelope, so this window is long enough to matter.
+  if (this->arm_disarm_state_ != ArmDisarmState::IDLE ||
+      this->zone_bypass_state_ != ZoneBypassState::IDLE) {
+    ESP_LOGW(TAG, "set_output(%u, %s): another keypress sequence in progress, ignoring", output,
+             state ? "on" : "off");
     return;
   }
   // Build digit queue consumed one per KEYPAD_COMMAND received after the ACK.

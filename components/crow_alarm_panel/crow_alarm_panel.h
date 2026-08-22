@@ -329,10 +329,13 @@ class CrowAlarmPanel : public Component {
   std::vector<uint8_t> arm_disarm_code_digits_;  // code digits consumed one per KEYPAD_COMMAND
   uint8_t arm_disarm_code_idx_{0};
   uint8_t arm_disarm_terminal_key_{KEY_ENTER};  // KEY_ENTER (disarm), KEY_ARM or KEY_STAY (arm-with-code)
-  // A watchdog timeout here reliably means the panel's state did not change (see
-  // docs/arm_disarm_state_machine.md — multiple sessions with an independent monitor capture
-  // confirm no ARMED_STATE broadcast occurred around the timeout), so unlike output-select/
-  // zone-bypass a blind retry can't undo a change that already landed. 6 with the growing
+  // A watchdog timeout here has almost always meant the panel's state did not change (multiple
+  // sessions with an independent monitor capture show no ARMED_STATE broadcast around the
+  // timeout), but retry safety does NOT rest on that: an 825 ms ack has been observed right at
+  // the 1 s boundary, so a confirmation can land after the watchdog fires. What makes retries
+  // safe — unlike output-select/zone-bypass — is intent-matched ARMED_STATE resolution (resolves
+  // from any non-IDLE state, including a backoff wait) plus arm_disarm_generation_ cancelling
+  // any in-flight key once resolved (see docs/arm_disarm_state_machine.md). 6 with the growing
   // backoff below spans the worst episode observed so far (HA log 2026-08-19 17:09: two
   // consecutive calls exhausted 5 back-to-back retries each, and a manual call ~29 s after the
   // first attempt succeeded — back-to-back retries burned the whole budget in ~7 s, well inside
