@@ -659,8 +659,12 @@ void CrowAlarmPanel::loop() {
           // Drive arm/disarm state machine forward. Skipped while a retry backoff is pending:
           // the timed-out attempt is dead and will restart from the first digit, so a stray
           // periodic KEYPAD_COMMAND arriving mid-wait must not advance the stale sequence
-          // (it would type leftover digits into the panel outside any attempt).
-          if (!this->arm_disarm_retry_pending_) {
+          // (it would type leftover digits into the panel outside any attempt). Also skipped
+          // while a key is committed but not yet transmitted (arm_disarm_key_in_flight_): a
+          // command arriving during that bus-idle wait cannot acknowledge the pending key, so
+          // acting on it would falsely complete ARM/STAY (suppressing the never-sent key) or
+          // send the next digit out of order.
+          if (!this->arm_disarm_retry_pending_ && !this->arm_disarm_key_in_flight_) {
             switch (this->arm_disarm_state_) {
               case ArmDisarmState::ARM_AWAY_PENDING:
               case ArmDisarmState::ARM_STAY_PENDING:
@@ -945,7 +949,11 @@ void CrowAlarmPanel::loop() {
   // immediately: back-to-back retries burned the whole budget in ~7 s during a controller
   // degradation episode that outlasted them (HA log 2026-08-19 17:09 — see
   // arm_disarm_state_machine.md), while a manual call ~8 s after the abort succeeded first try.
-  if (this->arm_disarm_state_ != ArmDisarmState::IDLE) {
+  // Gated while a key is committed but not yet transmitted (arm_disarm_key_in_flight_): timing
+  // out an attempt whose key hasn't gone out yet is premature, and a retry started from inside
+  // that key's bus-idle wait would create a second waiter transmitting a duplicate key.
+  // arm_disarm_keypress_() restarts the no-progress window when the key actually transmits.
+  if (this->arm_disarm_state_ != ArmDisarmState::IDLE && !this->arm_disarm_key_in_flight_) {
     const uint32_t now_ms = millis();
     if (this->arm_disarm_retry_pending_) {
       if (now_ms - this->arm_disarm_state_enter_ms_ >= this->arm_disarm_retry_backoff_ms_) {
@@ -1126,15 +1134,25 @@ void CrowAlarmPanel::arm_disarm_keypress_(uint8_t key) {
   // key must no longer go out: setting arm_disarm_state_ back to IDLE can't recall a keypress
   // already committed to send_packet(), and after a disarm resolution a retry's already-typed
   // digits + ENTER is exactly the "arm with code" gesture (could re-arm the panel).
+  // arm_disarm_key_in_flight_ gates the KEYPAD_COMMAND-driven transitions and the watchdog
+  // for the duration of the wait — see the member comment in crow_alarm_panel.h.
   const uint32_t gen = this->arm_disarm_generation_;
+  this->arm_disarm_key_in_flight_ = true;
   if (!this->wait_for_bus_idle_()) {
+    this->arm_disarm_key_in_flight_ = false;
     return;
   }
   if (gen != this->arm_disarm_generation_) {
     ESP_LOGD(TAG, "Arm/disarm: sequence resolved during bus-idle wait, suppressing key 0x%02X", key);
+    this->arm_disarm_key_in_flight_ = false;
     return;
   }
   this->transmit_packet_(KEYPRESS, {key});
+  // Restart the no-progress window from the actual transmit — the bus-idle wait above may
+  // have consumed most (or more) of the 1 s budget before the key even went out, and the
+  // watchdog was gated during it.
+  this->arm_disarm_state_enter_ms_ = millis();
+  this->arm_disarm_key_in_flight_ = false;
 }
 
 void CrowAlarmPanel::set_output(uint8_t output, bool state) {

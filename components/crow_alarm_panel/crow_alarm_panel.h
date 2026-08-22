@@ -364,6 +364,15 @@ class CrowAlarmPanel : public Component {
   // already-committed key still goes out — after a disarm resolution, a retry's already-typed
   // digits + ENTER is exactly the "arm with code" gesture and could re-arm the panel.
   uint32_t arm_disarm_generation_{0};
+  // True while arm_disarm_keypress_() is between commit and transmit (i.e. inside the bus-idle
+  // wait, which re-enters loop()). Gates the KEYPAD_COMMAND-driven state machine transitions
+  // and the watchdog during that window: a command arriving before the key transmits cannot be
+  // its acknowledgement (acting on it would falsely complete ARM/STAY, or advance the digit
+  // sequence and send digits out of order), and a watchdog retry starting mid-wait would
+  // create a second waiter that transmits a duplicate key once the bus goes idle. ARMED_STATE
+  // resolution is NOT gated — it is the controller's own state, independent of our TX, and
+  // cancelling the in-flight key is exactly what arm_disarm_generation_ is for.
+  bool arm_disarm_key_in_flight_{false};
 
   bool raw_frame_logging_enabled_{false};
 

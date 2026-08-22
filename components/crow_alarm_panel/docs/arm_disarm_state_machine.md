@@ -81,7 +81,7 @@ ARM_AWAY_PENDING / ARM_STAY_PENDING (KEY_ARM or KEY_STAY sent, waiting for Comma
 ├─ on Command(0x14) addressed to us
 │  └─> IDLE (sequence done; ARMED_STATE 0x11 follows independently)
 ├─ on timeout (>1s)
-│  └─> IDLE (abort)
+│  └─> retry with growing backoff, up to ARM_DISARM_MAX_RETRIES; then IDLE (abort)
 
 CODE_DIGIT_PENDING (a code digit sent, waiting for Command)
 ├─ on first Command(0x14) addressed to us in this sequence
@@ -95,7 +95,7 @@ CODE_DIGIT_PENDING (a code digit sent, waiting for Command)
 │  └─> CODE_DIGIT_PENDING (logged, not treated as an anomaly — see logs-18 below; next digit
 │      sent immediately as if byte[1] == baseline)
 ├─ on timeout (>1s)
-│  └─> IDLE (abort)
+│  └─> retry with growing backoff, up to ARM_DISARM_MAX_RETRIES; then IDLE (abort)
 
 CODE_ENTER_PENDING (terminal key sent, waiting for final Command)
 ├─ on Command(0x14) addressed to us
@@ -505,6 +505,18 @@ token (`arm_disarm_generation_`) before the wait and re-checks it immediately be
 blocking transmit; every resolution to IDLE (broadcast confirmation, ARM/STAY ack, watchdog
 abort) bumps the token, so a key committed by a sequence that has since resolved is suppressed
 instead of typed into the panel.
+
+The commit-to-transmit window needs the reverse guard too (`arm_disarm_key_in_flight_`): while
+a key sits in the bus-idle wait, KEYPAD_COMMAND-driven transitions and the watchdog are gated.
+A command arriving before the key transmits cannot be its acknowledgement — acting on it would
+falsely complete `ARM_AWAY_PENDING`/`ARM_STAY_PENDING` (and, combined with the token, suppress
+the never-sent arm key) or advance the digit sequence and emit digits out of order — and a
+watchdog retry started from inside that wait would create a second waiter that transmits a
+duplicate key once the bus goes idle. ARMED_STATE resolution is deliberately *not* gated: it is
+the controller's own state, independent of our TX, and cancelling the in-flight key is exactly
+what the token exists for. On transmit, the no-progress window (`arm_disarm_state_enter_ms_`)
+restarts from the actual send, since the wait may have consumed the whole 1 s budget while the
+watchdog was gated.
 
 Compiles and passes `esphome config`/`esphome compile` against `crow_alarm_panel_test.yaml`.
 **Not yet validated on real hardware** — needs a fresh capture reproducing a multi-failure
