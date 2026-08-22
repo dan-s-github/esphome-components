@@ -697,8 +697,12 @@ void CrowAlarmPanel::loop() {
                   uint8_t digit = this->arm_disarm_code_digits_[this->arm_disarm_code_idx_++];
                   ESP_LOGD(TAG, "Code sequence: sending digit %u (index %u)", digit,
                            this->arm_disarm_code_idx_ - 1);
+                  // No timestamp update here: arm_disarm_keypress_() already refreshes
+                  // arm_disarm_state_enter_ms_ when the key actually transmits, and assigning
+                  // after the call would be stale if the operation resolved (and a newer one
+                  // started re-entrantly) during the yield — overwriting the newer operation's
+                  // watchdog/backoff timestamp.
                   this->arm_disarm_keypress_(digit);
-                  this->arm_disarm_state_enter_ms_ = millis();
                 } else {
                   ESP_LOGD(TAG, "Code sequence: sending terminal key 0x%02X",
                            this->arm_disarm_terminal_key_);
