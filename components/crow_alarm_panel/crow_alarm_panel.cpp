@@ -458,16 +458,39 @@ void CrowAlarmPanel::loop() {
                    format_hex_pretty(data).c_str());
         }
         // ARMED_STATE is the controller's own authoritative state broadcast, independent of the
-        // arm/disarm state machine below — this is the only signal CODE_ENTER_PENDING treats as
-        // proof of success (see the enum comment in crow_alarm_panel.h for why the KEYPAD_COMMAND
-        // byte[1] value below isn't trusted for this). Any recognized ARMED_STATE broadcast while
-        // a terminal key is outstanding settles it, regardless of which of the three it is —
-        // "Arming" confirms an arm-with-code request as much as "Armed Away"/"Disarmed" would.
-        if (this->arm_disarm_state_ == ArmDisarmState::CODE_ENTER_PENDING &&
-            ((data[0] == 0x00 && data[1] == 0x01) || (data[0] == 0x01 && data[1] == 0x00) ||
-             (data[0] == 0x00 && data[1] == 0x00))) {
-          ESP_LOGD(TAG, "Code sequence: complete (confirmed via ARMED_STATE broadcast)");
-          this->arm_disarm_state_ = ArmDisarmState::IDLE;
+        // arm/disarm state machine — this is the only signal treated as proof of success (see the
+        // enum comment in crow_alarm_panel.h for why KEYPAD_COMMAND byte[1] isn't trusted for
+        // this). Resolution is intent-matched and covers every non-IDLE state, including a retry
+        // backoff wait, for two reasons (see arm_disarm_state_machine.md, 2026-08-22 entry):
+        // - A slow controller can broadcast the outcome of a previous attempt after the watchdog
+        //   already restarted the sequence (an 825 ms ack has been observed, right at the 1 s
+        //   boundary). Without resolving from CODE_DIGIT_PENDING, the retry would keep typing
+        //   the remaining digits + ENTER into an already-disarmed panel — and code+ENTER while
+        //   disarmed is exactly the "arm with code" gesture, so the retry could re-arm it.
+        // - The registration handshake re-broadcasts the CURRENT state (logs-46: repeated "Armed
+        //   Away" lines while armed). Accepting any recognized broadcast as success would let an
+        //   "Armed Away" re-announce falsely complete a disarm, so only the broadcast matching
+        //   the request's intent resolves it; non-matching ones are ignored.
+        if (this->arm_disarm_state_ != ArmDisarmState::IDLE) {
+          const bool is_arming = (data[0] == 0x00 && data[1] == 0x01);
+          const bool is_armed_away = (data[0] == 0x01 && data[1] == 0x00);
+          const bool is_disarmed = (data[0] == 0x00 && data[1] == 0x00);
+          if (is_arming || is_armed_away || is_disarmed) {
+            const bool is_disarm_request = (this->arm_disarm_state_ == ArmDisarmState::CODE_DIGIT_PENDING ||
+                                            this->arm_disarm_state_ == ArmDisarmState::CODE_ENTER_PENDING) &&
+                                           this->arm_disarm_terminal_key_ == KEY_ENTER;
+            const bool matches_intent = is_disarm_request ? is_disarmed : (is_arming || is_armed_away);
+            if (matches_intent) {
+              ESP_LOGD(TAG, "Code sequence: complete (confirmed via ARMED_STATE broadcast)");
+              this->arm_disarm_state_ = ArmDisarmState::IDLE;
+              this->arm_disarm_code_digits_.clear();
+              this->arm_disarm_code_idx_ = 0;
+              this->arm_disarm_retry_count_ = 0;
+              this->arm_disarm_retry_pending_ = false;
+            } else {
+              ESP_LOGD(TAG, "Arm/disarm: ignoring ARMED_STATE broadcast not matching request intent");
+            }
+          }
         }
         break;
       }
@@ -632,62 +655,67 @@ void CrowAlarmPanel::loop() {
             default:
               break;
           }
-          // Drive arm/disarm state machine forward.
-          switch (this->arm_disarm_state_) {
-            case ArmDisarmState::ARM_AWAY_PENDING:
-            case ArmDisarmState::ARM_STAY_PENDING:
-              ESP_LOGD(TAG, "Arm/stay: CMD received, sequence complete");
-              this->arm_disarm_state_ = ArmDisarmState::IDLE;
-              break;
-            case ArmDisarmState::CODE_DIGIT_PENDING: {
-              uint8_t cmd_byte = (data.size() > 1) ? data[1] : 0;
-              if (!this->arm_disarm_digit_ack_byte_set_) {
-                // Learn this sequence's "digit accepted, more expected" display_code from the
-                // first digit's response, for diagnostics only. Trace: logs-7/logs-33 (2026-07-08)
-                // show address 0x05 consistently getting 0x07 here — never 0x01 — across four
-                // separate arm and disarm attempts with a code independently confirmed correct via
-                // the physical IP keypad (0x07), while address 0x07 consistently got 0x01. The
-                // controller does not validate code correctness per digit (only at ENTER), so this
-                // is a per-keypad-type display quirk, not a rejection. A mid-sequence change isn't
-                // treated as an abort-worthy anomaly either (see docs/arm_disarm_state_machine.md):
-                // its meaning was never established, and logs-18 showed the abort itself causing a
-                // stuck alarm_control_panel entity for a sequence that may well have succeeded.
-                // Success/failure comes solely from the ARMED_STATE broadcast or the shared 1s
-                // watchdog, same as CODE_ENTER_PENDING.
-                this->arm_disarm_digit_ack_byte_ = cmd_byte;
-                this->arm_disarm_digit_ack_byte_set_ = true;
-              } else if (cmd_byte != this->arm_disarm_digit_ack_byte_) {
-                ESP_LOGD(TAG, "Arm/disarm: CMD byte changed from 0x%02X to 0x%02X in CODE_DIGIT_PENDING, continuing",
-                         this->arm_disarm_digit_ack_byte_, cmd_byte);
+          // Drive arm/disarm state machine forward. Skipped while a retry backoff is pending:
+          // the timed-out attempt is dead and will restart from the first digit, so a stray
+          // periodic KEYPAD_COMMAND arriving mid-wait must not advance the stale sequence
+          // (it would type leftover digits into the panel outside any attempt).
+          if (!this->arm_disarm_retry_pending_) {
+            switch (this->arm_disarm_state_) {
+              case ArmDisarmState::ARM_AWAY_PENDING:
+              case ArmDisarmState::ARM_STAY_PENDING:
+                ESP_LOGD(TAG, "Arm/stay: CMD received, sequence complete");
+                this->arm_disarm_state_ = ArmDisarmState::IDLE;
+                break;
+              case ArmDisarmState::CODE_DIGIT_PENDING: {
+                uint8_t cmd_byte = (data.size() > 1) ? data[1] : 0;
+                if (!this->arm_disarm_digit_ack_byte_set_) {
+                  // Learn this sequence's "digit accepted, more expected" display_code from the
+                  // first digit's response, for diagnostics only. Trace: logs-7/logs-33 (2026-07-08)
+                  // show address 0x05 consistently getting 0x07 here — never 0x01 — across four
+                  // separate arm and disarm attempts with a code independently confirmed correct via
+                  // the physical IP keypad (0x07), while address 0x07 consistently got 0x01. The
+                  // controller does not validate code correctness per digit (only at ENTER), so this
+                  // is a per-keypad-type display quirk, not a rejection. A mid-sequence change isn't
+                  // treated as an abort-worthy anomaly either (see docs/arm_disarm_state_machine.md):
+                  // its meaning was never established, and logs-18 showed the abort itself causing a
+                  // stuck alarm_control_panel entity for a sequence that may well have succeeded.
+                  // Success/failure comes solely from the ARMED_STATE broadcast or the shared 1s
+                  // watchdog, same as CODE_ENTER_PENDING.
+                  this->arm_disarm_digit_ack_byte_ = cmd_byte;
+                  this->arm_disarm_digit_ack_byte_set_ = true;
+                } else if (cmd_byte != this->arm_disarm_digit_ack_byte_) {
+                  ESP_LOGD(TAG, "Arm/disarm: CMD byte changed from 0x%02X to 0x%02X in CODE_DIGIT_PENDING, continuing",
+                           this->arm_disarm_digit_ack_byte_, cmd_byte);
+                }
+                if (this->arm_disarm_code_idx_ < this->arm_disarm_code_digits_.size()) {
+                  uint8_t digit = this->arm_disarm_code_digits_[this->arm_disarm_code_idx_++];
+                  ESP_LOGD(TAG, "Code sequence: sending digit %u (index %u)", digit,
+                           this->arm_disarm_code_idx_ - 1);
+                  this->keypress(digit);
+                  this->arm_disarm_state_enter_ms_ = millis();
+                } else {
+                  ESP_LOGD(TAG, "Code sequence: sending terminal key 0x%02X",
+                           this->arm_disarm_terminal_key_);
+                  this->keypress(this->arm_disarm_terminal_key_);
+                  this->arm_disarm_state_ = ArmDisarmState::CODE_ENTER_PENDING;
+                  this->arm_disarm_state_enter_ms_ = millis();
+                }
+                break;
               }
-              if (this->arm_disarm_code_idx_ < this->arm_disarm_code_digits_.size()) {
-                uint8_t digit = this->arm_disarm_code_digits_[this->arm_disarm_code_idx_++];
-                ESP_LOGD(TAG, "Code sequence: sending digit %u (index %u)", digit,
-                         this->arm_disarm_code_idx_ - 1);
-                this->keypress(digit);
-                this->arm_disarm_state_enter_ms_ = millis();
-              } else {
-                ESP_LOGD(TAG, "Code sequence: sending terminal key 0x%02X",
-                         this->arm_disarm_terminal_key_);
-                this->keypress(this->arm_disarm_terminal_key_);
-                this->arm_disarm_state_ = ArmDisarmState::CODE_ENTER_PENDING;
-                this->arm_disarm_state_enter_ms_ = millis();
+              case ArmDisarmState::CODE_ENTER_PENDING: {
+                // byte[1] here is deliberately not used to judge success/failure — see the enum
+                // comment in crow_alarm_panel.h for why (logs-10/35, logs-12/37, 2026-07-12). This
+                // KEYPAD_COMMAND only proves the controller is still responding; only the
+                // independent ARMED_STATE broadcast (below) or the shared 1s watchdog resolves
+                // this state.
+                uint8_t cmd_byte = (data.size() > 1) ? data[1] : 0;
+                ESP_LOGD(TAG, "Code sequence: CMD 0x%02X after terminal key, awaiting ARMED_STATE confirmation",
+                         cmd_byte);
+                break;
               }
-              break;
+              default:
+                break;
             }
-            case ArmDisarmState::CODE_ENTER_PENDING: {
-              // byte[1] here is deliberately not used to judge success/failure — see the enum
-              // comment in crow_alarm_panel.h for why (logs-10/35, logs-12/37, 2026-07-12). This
-              // KEYPAD_COMMAND only proves the controller is still responding; only the
-              // independent ARMED_STATE broadcast (below) or the shared 1s watchdog resolves
-              // this state.
-              uint8_t cmd_byte = (data.size() > 1) ? data[1] : 0;
-              ESP_LOGD(TAG, "Code sequence: CMD 0x%02X after terminal key, awaiting ARMED_STATE confirmation",
-                       cmd_byte);
-              break;
-            }
-            default:
-              break;
           }
           // Drive zone-bypass state machine forward.
           // See docs/zone_bypass_state_machine.md for observed timing.
@@ -906,18 +934,21 @@ void CrowAlarmPanel::loop() {
   // Arm/disarm watchdog: abort if any non-IDLE state exceeds 1s without progress. See
   // ARM_DISARM_MAX_RETRIES in crow_alarm_panel.h for why retrying here (unlike output-select/
   // zone-bypass above) is safe: a timeout reliably means the panel's state did not change.
+  // Retries are paced by a growing backoff (ARM_DISARM_RETRY_BACKOFF_MS) instead of restarting
+  // immediately: back-to-back retries burned the whole budget in ~7 s during a controller
+  // degradation episode that outlasted them (HA log 2026-08-19 17:09 — see
+  // arm_disarm_state_machine.md), while a manual call ~8 s after the abort succeeded first try.
   if (this->arm_disarm_state_ != ArmDisarmState::IDLE) {
     const uint32_t now_ms = millis();
-    if (now_ms - this->arm_disarm_state_enter_ms_ > 1000) {
-      if (this->arm_disarm_retry_count_ < ARM_DISARM_MAX_RETRIES) {
-        this->arm_disarm_retry_count_++;
-        ESP_LOGW(TAG, "Arm/disarm: timeout in state %u, retrying (%u/%u)",
-                 static_cast<uint8_t>(this->arm_disarm_state_), this->arm_disarm_retry_count_,
+    if (this->arm_disarm_retry_pending_) {
+      if (now_ms - this->arm_disarm_state_enter_ms_ >= this->arm_disarm_retry_backoff_ms_) {
+        ESP_LOGD(TAG, "Arm/disarm: starting retry %u/%u", this->arm_disarm_retry_count_,
                  ARM_DISARM_MAX_RETRIES);
-        // Refresh the watchdog timer BEFORE any keypress() below — keypress()->send_packet()
-        // can delay()/yield() and re-enter this loop(), and with the old timestamp still in
-        // place the watchdog would see itself as still timed out, firing again and sending an
-        // extra keypress (same race the output-select retry above avoids the same way).
+        // Clear the pending flag and refresh the watchdog timer BEFORE any keypress() below —
+        // keypress()->send_packet() can delay()/yield() and re-enter this loop(), and with the
+        // old values still in place this branch would fire again and send an extra keypress
+        // (same race the output-select retry above avoids the same way).
+        this->arm_disarm_retry_pending_ = false;
         this->arm_disarm_state_enter_ms_ = millis();
         switch (this->arm_disarm_state_) {
           case ArmDisarmState::ARM_AWAY_PENDING:
@@ -938,6 +969,16 @@ void CrowAlarmPanel::loop() {
           default:
             break;
         }
+      }
+    } else if (now_ms - this->arm_disarm_state_enter_ms_ > 1000) {
+      if (this->arm_disarm_retry_count_ < ARM_DISARM_MAX_RETRIES) {
+        this->arm_disarm_retry_count_++;
+        this->arm_disarm_retry_backoff_ms_ = ARM_DISARM_RETRY_BACKOFF_MS[this->arm_disarm_retry_count_ - 1];
+        ESP_LOGW(TAG, "Arm/disarm: timeout in state %u, retrying (%u/%u) in %u ms",
+                 static_cast<uint8_t>(this->arm_disarm_state_), this->arm_disarm_retry_count_,
+                 ARM_DISARM_MAX_RETRIES, this->arm_disarm_retry_backoff_ms_);
+        this->arm_disarm_retry_pending_ = true;
+        this->arm_disarm_state_enter_ms_ = now_ms;
       } else {
         ESP_LOGW(TAG, "Arm/disarm: timeout in state %u, aborting after %u retries",
                  static_cast<uint8_t>(this->arm_disarm_state_), this->arm_disarm_retry_count_);
@@ -945,6 +986,7 @@ void CrowAlarmPanel::loop() {
         this->arm_disarm_code_digits_.clear();
         this->arm_disarm_code_idx_ = 0;
         this->arm_disarm_retry_count_ = 0;
+        this->arm_disarm_retry_pending_ = false;
         // CrowAlarmControlPanel::control() optimistically publishes ACP_STATE_ARMING/DISARMING
         // before this sequence resolves. On abort no ARMED_STATE broadcast is coming to correct
         // that, so without this the entity would be stuck in the transitional state forever,
@@ -1000,6 +1042,7 @@ void CrowAlarmPanel::start_code_sequence_(const std::string &code, uint8_t termi
   this->arm_disarm_state_ = ArmDisarmState::CODE_DIGIT_PENDING;
   this->arm_disarm_state_enter_ms_ = millis();
   this->arm_disarm_retry_count_ = 0;
+  this->arm_disarm_retry_pending_ = false;
   this->arm_disarm_digit_ack_byte_set_ = false;
   this->keypress(this->arm_disarm_code_digits_[0]);
 }
@@ -1021,6 +1064,7 @@ void CrowAlarmPanel::arm_away(const std::string &code) {
     this->arm_disarm_state_ = ArmDisarmState::ARM_AWAY_PENDING;
     this->arm_disarm_state_enter_ms_ = millis();
     this->arm_disarm_retry_count_ = 0;
+    this->arm_disarm_retry_pending_ = false;
     this->keypress(KEY_ARM);
   }
 }
@@ -1042,6 +1086,7 @@ void CrowAlarmPanel::arm_stay(const std::string &code) {
     this->arm_disarm_state_ = ArmDisarmState::ARM_STAY_PENDING;
     this->arm_disarm_state_enter_ms_ = millis();
     this->arm_disarm_retry_count_ = 0;
+    this->arm_disarm_retry_pending_ = false;
     this->keypress(KEY_STAY);
   }
 }

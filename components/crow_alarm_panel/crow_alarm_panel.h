@@ -327,10 +327,25 @@ class CrowAlarmPanel : public Component {
   // A watchdog timeout here reliably means the panel's state did not change (see
   // docs/arm_disarm_state_machine.md — multiple sessions with an independent monitor capture
   // confirm no ARMED_STATE broadcast occurred around the timeout), so unlike output-select/
-  // zone-bypass a blind retry can't undo a change that already landed. 5 covers the worst
-  // consecutive-failure streak observed so far (logs-24, logs-42: 5 failures before success).
-  static const uint8_t ARM_DISARM_MAX_RETRIES = 5;
+  // zone-bypass a blind retry can't undo a change that already landed. 6 with the growing
+  // backoff below spans the worst episode observed so far (HA log 2026-08-19 17:09: two
+  // consecutive calls exhausted 5 back-to-back retries each, and a manual call ~29 s after the
+  // first attempt succeeded — back-to-back retries burned the whole budget in ~7 s, well inside
+  // that episode).
+  static const uint8_t ARM_DISARM_MAX_RETRIES = 6;
   uint8_t arm_disarm_retry_count_{0};
+  // Pause before each retry, indexed by (retry number - 1). Controller degradation episodes
+  // last tens of seconds (see arm_disarm_state_machine.md, 2026-08-19 entry); every eventual
+  // success in the trace record came after multi-second gaps, so the retry envelope must span
+  // ~40 s rather than hammering attempts every ~1.5 s (which also adds bus contention, the
+  // prime suspect for the collision failure mode).
+  static constexpr uint32_t ARM_DISARM_RETRY_BACKOFF_MS[ARM_DISARM_MAX_RETRIES] = {1000, 2000, 3000,
+                                                                                   5000, 8000, 13000};
+  // While true, the previous attempt has timed out and the next retry is waiting out its
+  // backoff: arm_disarm_state_enter_ms_ marks the wait start and arm_disarm_retry_backoff_ms_
+  // the required pause. KEYPAD_COMMANDs must not advance the (dead) sequence during the wait.
+  bool arm_disarm_retry_pending_{false};
+  uint32_t arm_disarm_retry_backoff_ms_{0};
   // "Digit accepted" display_code (KEYPAD_COMMAND byte[1]) learned from the first digit's
   // response each sequence. Physical keypad types disagree on this value (0x01 is common,
   // but address 0x05 has been observed sending 0x07 for the same "more digits expected"
