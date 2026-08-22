@@ -29,10 +29,12 @@ void CrowAlarmControlPanel::control(const alarm_control_panel::AlarmControlPanel
       }
       // Publish the optimistic transitional state only if the request was accepted (a
       // rejected request starts no sequence and no watchdog, so nothing would ever move the
-      // entity out of ARMING again) AND the sequence is still unresolved — the call can yield
-      // waiting for the bus, during which a matching ARMED_STATE broadcast may already have
-      // published the confirmed terminal state; overwriting that would strand the entity.
-      if (this->parent_->arm_away(code) && this->parent_->is_arm_disarm_in_progress()) {
+      // entity out of ARMING again) AND this call's operation is still the active one. The
+      // call can yield waiting for the bus, during which the operation may resolve (matching
+      // ARMED_STATE publishes the confirmed state) and a different operation may even start
+      // re-entrantly; an unchanged generation rules out both (see arm_disarm_generation()).
+      const uint32_t gen = this->parent_->arm_disarm_generation();
+      if (this->parent_->arm_away(code) && this->parent_->arm_disarm_generation() == gen) {
         this->publish_state(alarm_control_panel::ACP_STATE_ARMING);
       }
       break;
@@ -43,7 +45,8 @@ void CrowAlarmControlPanel::control(const alarm_control_panel::AlarmControlPanel
         this->status_momentary_warning("Code required to arm", 2000);
         return;
       }
-      if (this->parent_->arm_stay(code) && this->parent_->is_arm_disarm_in_progress()) {
+      const uint32_t gen = this->parent_->arm_disarm_generation();
+      if (this->parent_->arm_stay(code) && this->parent_->arm_disarm_generation() == gen) {
         this->publish_state(alarm_control_panel::ACP_STATE_ARMING);
       }
       break;
@@ -54,7 +57,8 @@ void CrowAlarmControlPanel::control(const alarm_control_panel::AlarmControlPanel
         this->status_momentary_warning("Code required to disarm", 2000);
         return;
       }
-      if (this->parent_->disarm(code) && this->parent_->is_arm_disarm_in_progress()) {
+      const uint32_t gen = this->parent_->arm_disarm_generation();
+      if (this->parent_->disarm(code) && this->parent_->arm_disarm_generation() == gen) {
         this->publish_state(alarm_control_panel::ACP_STATE_DISARMING);
       }
       break;

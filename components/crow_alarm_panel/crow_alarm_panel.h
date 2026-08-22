@@ -262,12 +262,16 @@ class CrowAlarmPanel : public Component {
   bool arm_stay(const std::string &code = "");
   bool disarm(const std::string &code);
   bool is_armed() const;
-  // True while an arm/disarm sequence is unresolved. An accepted request can resolve inside
-  // the call itself (the bus-idle wait yields into loop(), where a matching ARMED_STATE
-  // broadcast publishes the confirmed state and resolves to IDLE), so callers must also check
-  // this before publishing an optimistic transitional state — publishing after a synchronous
-  // resolution would overwrite the confirmed state with no watchdog left to fix it.
-  bool is_arm_disarm_in_progress() const { return this->arm_disarm_state_ != ArmDisarmState::IDLE; }
+  // Identity token for arm/disarm operations, for callers that publish an optimistic
+  // transitional state: capture it BEFORE an arm/disarm call and publish only if it is
+  // unchanged after an accepted call. Every resolution to IDLE bumps the underlying counter,
+  // and a new operation can only start once the previous one has resolved, so an unchanged
+  // token proves the operation this call started is still the active one. Both hazards the
+  // calls' re-entrant bus-idle yield allows are covered: a synchronous resolution (matching
+  // ARMED_STATE publishes the confirmed state — bumped, don't overwrite it), and a newer
+  // operation started re-entrantly after that resolution (bumped by the resolution first —
+  // don't stomp the newer operation's state either).
+  uint32_t arm_disarm_generation() const { return this->arm_disarm_generation_; }
 
   Trigger<uint8_t, std::vector<uint8_t>> *get_on_message_trigger() const { return this->on_message_trigger_; }
 
