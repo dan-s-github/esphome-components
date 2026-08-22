@@ -27,10 +27,12 @@ void CrowAlarmControlPanel::control(const alarm_control_panel::AlarmControlPanel
         this->status_momentary_warning("Code required to arm", 2000);
         return;
       }
-      // Publish the optimistic transitional state only if the request was accepted — a
+      // Publish the optimistic transitional state only if the request was accepted (a
       // rejected request starts no sequence and no watchdog, so nothing would ever move the
-      // entity out of ARMING again.
-      if (this->parent_->arm_away(code)) {
+      // entity out of ARMING again) AND the sequence is still unresolved — the call can yield
+      // waiting for the bus, during which a matching ARMED_STATE broadcast may already have
+      // published the confirmed terminal state; overwriting that would strand the entity.
+      if (this->parent_->arm_away(code) && this->parent_->is_arm_disarm_in_progress()) {
         this->publish_state(alarm_control_panel::ACP_STATE_ARMING);
       }
       break;
@@ -41,7 +43,7 @@ void CrowAlarmControlPanel::control(const alarm_control_panel::AlarmControlPanel
         this->status_momentary_warning("Code required to arm", 2000);
         return;
       }
-      if (this->parent_->arm_stay(code)) {
+      if (this->parent_->arm_stay(code) && this->parent_->is_arm_disarm_in_progress()) {
         this->publish_state(alarm_control_panel::ACP_STATE_ARMING);
       }
       break;
@@ -52,7 +54,7 @@ void CrowAlarmControlPanel::control(const alarm_control_panel::AlarmControlPanel
         this->status_momentary_warning("Code required to disarm", 2000);
         return;
       }
-      if (this->parent_->disarm(code)) {
+      if (this->parent_->disarm(code) && this->parent_->is_arm_disarm_in_progress()) {
         this->publish_state(alarm_control_panel::ACP_STATE_DISARMING);
       }
       break;

@@ -262,6 +262,12 @@ class CrowAlarmPanel : public Component {
   bool arm_stay(const std::string &code = "");
   bool disarm(const std::string &code);
   bool is_armed() const;
+  // True while an arm/disarm sequence is unresolved. An accepted request can resolve inside
+  // the call itself (the bus-idle wait yields into loop(), where a matching ARMED_STATE
+  // broadcast publishes the confirmed state and resolves to IDLE), so callers must also check
+  // this before publishing an optimistic transitional state — publishing after a synchronous
+  // resolution would overwrite the confirmed state with no watchdog left to fix it.
+  bool is_arm_disarm_in_progress() const { return this->arm_disarm_state_ != ArmDisarmState::IDLE; }
 
   Trigger<uint8_t, std::vector<uint8_t>> *get_on_message_trigger() const { return this->on_message_trigger_; }
 
