@@ -976,7 +976,7 @@ void CrowAlarmPanel::loop() {
         this->arm_disarm_retry_backoff_ms_ = ARM_DISARM_RETRY_BACKOFF_MS[this->arm_disarm_retry_count_ - 1];
         ESP_LOGW(TAG, "Arm/disarm: timeout in state %u, retrying (%u/%u) in %u ms",
                  static_cast<uint8_t>(this->arm_disarm_state_), this->arm_disarm_retry_count_,
-                 ARM_DISARM_MAX_RETRIES, this->arm_disarm_retry_backoff_ms_);
+                 ARM_DISARM_MAX_RETRIES, (unsigned) this->arm_disarm_retry_backoff_ms_);
         this->arm_disarm_retry_pending_ = true;
         this->arm_disarm_state_enter_ms_ = now_ms;
       } else {
