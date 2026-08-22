@@ -696,9 +696,14 @@ void CrowAlarmPanel::loop() {
                 } else {
                   ESP_LOGD(TAG, "Code sequence: sending terminal key 0x%02X",
                            this->arm_disarm_terminal_key_);
-                  this->keypress(this->arm_disarm_terminal_key_);
+                  // Set state BEFORE the keypress — send_packet() delays/yields internally and can
+                  // re-enter loop(). If the matching ARMED_STATE broadcast resolves the sequence
+                  // during that yield (state -> IDLE, code cleared), assigning after the call would
+                  // resurrect CODE_ENTER_PENDING and the watchdog retry would index the emptied
+                  // code vector.
                   this->arm_disarm_state_ = ArmDisarmState::CODE_ENTER_PENDING;
                   this->arm_disarm_state_enter_ms_ = millis();
+                  this->keypress(this->arm_disarm_terminal_key_);
                 }
                 break;
               }
