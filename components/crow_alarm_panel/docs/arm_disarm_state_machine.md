@@ -497,6 +497,15 @@ from every non-IDLE state including the retry backoff wait, fully resetting the 
 ignored by the state machine (entity state is still published from them unconditionally, as
 always).
 
+A review follow-up (PR #12) closed one more layer of the same hazard: resolving the state
+machine to IDLE cannot recall a keypress already inside `send_packet()`'s bus-idle wait — that
+wait delays/yields (re-entering `loop()`) and then transmits unconditionally once the bus goes
+idle. Arm/disarm keys are now sent via `arm_disarm_keypress_()`, which captures a generation
+token (`arm_disarm_generation_`) before the wait and re-checks it immediately before the
+blocking transmit; every resolution to IDLE (broadcast confirmation, ARM/STAY ack, watchdog
+abort) bumps the token, so a key committed by a sequence that has since resolved is suppressed
+instead of typed into the panel.
+
 Compiles and passes `esphome config`/`esphome compile` against `crow_alarm_panel_test.yaml`.
 **Not yet validated on real hardware** — needs a fresh capture reproducing a multi-failure
 streak (ideally another degradation episode like 2026-08-19 17:09) to confirm the backoff

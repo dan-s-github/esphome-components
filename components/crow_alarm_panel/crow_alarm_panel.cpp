@@ -483,6 +483,7 @@ void CrowAlarmPanel::loop() {
             if (matches_intent) {
               ESP_LOGD(TAG, "Code sequence: complete (confirmed via ARMED_STATE broadcast)");
               this->arm_disarm_state_ = ArmDisarmState::IDLE;
+              this->arm_disarm_generation_++;
               this->arm_disarm_code_digits_.clear();
               this->arm_disarm_code_idx_ = 0;
               this->arm_disarm_retry_count_ = 0;
@@ -665,6 +666,7 @@ void CrowAlarmPanel::loop() {
               case ArmDisarmState::ARM_STAY_PENDING:
                 ESP_LOGD(TAG, "Arm/stay: CMD received, sequence complete");
                 this->arm_disarm_state_ = ArmDisarmState::IDLE;
+                this->arm_disarm_generation_++;
                 break;
               case ArmDisarmState::CODE_DIGIT_PENDING: {
                 uint8_t cmd_byte = (data.size() > 1) ? data[1] : 0;
@@ -691,7 +693,7 @@ void CrowAlarmPanel::loop() {
                   uint8_t digit = this->arm_disarm_code_digits_[this->arm_disarm_code_idx_++];
                   ESP_LOGD(TAG, "Code sequence: sending digit %u (index %u)", digit,
                            this->arm_disarm_code_idx_ - 1);
-                  this->keypress(digit);
+                  this->arm_disarm_keypress_(digit);
                   this->arm_disarm_state_enter_ms_ = millis();
                 } else {
                   ESP_LOGD(TAG, "Code sequence: sending terminal key 0x%02X",
@@ -703,7 +705,7 @@ void CrowAlarmPanel::loop() {
                   // code vector.
                   this->arm_disarm_state_ = ArmDisarmState::CODE_ENTER_PENDING;
                   this->arm_disarm_state_enter_ms_ = millis();
-                  this->keypress(this->arm_disarm_terminal_key_);
+                  this->arm_disarm_keypress_(this->arm_disarm_terminal_key_);
                 }
                 break;
               }
@@ -957,10 +959,10 @@ void CrowAlarmPanel::loop() {
         this->arm_disarm_state_enter_ms_ = millis();
         switch (this->arm_disarm_state_) {
           case ArmDisarmState::ARM_AWAY_PENDING:
-            this->keypress(KEY_ARM);
+            this->arm_disarm_keypress_(KEY_ARM);
             break;
           case ArmDisarmState::ARM_STAY_PENDING:
-            this->keypress(KEY_STAY);
+            this->arm_disarm_keypress_(KEY_STAY);
             break;
           case ArmDisarmState::CODE_DIGIT_PENDING:
           case ArmDisarmState::CODE_ENTER_PENDING:
@@ -969,7 +971,7 @@ void CrowAlarmPanel::loop() {
             this->arm_disarm_code_idx_ = 1;
             this->arm_disarm_state_ = ArmDisarmState::CODE_DIGIT_PENDING;
             this->arm_disarm_digit_ack_byte_set_ = false;
-            this->keypress(this->arm_disarm_code_digits_[0]);
+            this->arm_disarm_keypress_(this->arm_disarm_code_digits_[0]);
             break;
           default:
             break;
@@ -988,6 +990,7 @@ void CrowAlarmPanel::loop() {
         ESP_LOGW(TAG, "Arm/disarm: timeout in state %u, aborting after %u retries",
                  static_cast<uint8_t>(this->arm_disarm_state_), this->arm_disarm_retry_count_);
         this->arm_disarm_state_ = ArmDisarmState::IDLE;
+        this->arm_disarm_generation_++;
         this->arm_disarm_code_digits_.clear();
         this->arm_disarm_code_idx_ = 0;
         this->arm_disarm_retry_count_ = 0;
@@ -1049,7 +1052,7 @@ void CrowAlarmPanel::start_code_sequence_(const std::string &code, uint8_t termi
   this->arm_disarm_retry_count_ = 0;
   this->arm_disarm_retry_pending_ = false;
   this->arm_disarm_digit_ack_byte_set_ = false;
-  this->keypress(this->arm_disarm_code_digits_[0]);
+  this->arm_disarm_keypress_(this->arm_disarm_code_digits_[0]);
 }
 
 void CrowAlarmPanel::arm_away(const std::string &code) {
@@ -1070,7 +1073,7 @@ void CrowAlarmPanel::arm_away(const std::string &code) {
     this->arm_disarm_state_enter_ms_ = millis();
     this->arm_disarm_retry_count_ = 0;
     this->arm_disarm_retry_pending_ = false;
-    this->keypress(KEY_ARM);
+    this->arm_disarm_keypress_(KEY_ARM);
   }
 }
 
@@ -1092,7 +1095,7 @@ void CrowAlarmPanel::arm_stay(const std::string &code) {
     this->arm_disarm_state_enter_ms_ = millis();
     this->arm_disarm_retry_count_ = 0;
     this->arm_disarm_retry_pending_ = false;
-    this->keypress(KEY_STAY);
+    this->arm_disarm_keypress_(KEY_STAY);
   }
 }
 
@@ -1115,6 +1118,23 @@ void CrowAlarmPanel::disarm(const std::string &code) {
 
 void CrowAlarmPanel::keypress(uint8_t key) {
   this->send_packet(KEYPRESS, {key});
+}
+
+void CrowAlarmPanel::arm_disarm_keypress_(uint8_t key) {
+  // The bus-idle wait delays/yields and re-enters loop(). If the sequence resolves during that
+  // window (matching ARMED_STATE broadcast, or watchdog abort), the generation bumps and this
+  // key must no longer go out: setting arm_disarm_state_ back to IDLE can't recall a keypress
+  // already committed to send_packet(), and after a disarm resolution a retry's already-typed
+  // digits + ENTER is exactly the "arm with code" gesture (could re-arm the panel).
+  const uint32_t gen = this->arm_disarm_generation_;
+  if (!this->wait_for_bus_idle_()) {
+    return;
+  }
+  if (gen != this->arm_disarm_generation_) {
+    ESP_LOGD(TAG, "Arm/disarm: sequence resolved during bus-idle wait, suppressing key 0x%02X", key);
+    return;
+  }
+  this->transmit_packet_(KEYPRESS, {key});
 }
 
 void CrowAlarmPanel::set_output(uint8_t output, bool state) {
@@ -1212,22 +1232,32 @@ void CrowAlarmPanel::send_packet(uint8_t type, const std::vector<uint8_t> &data)
     ESP_LOGW(TAG, "No keypad address configured — cannot send packet (passive monitor mode)");
     return;
   }
+  if (!this->wait_for_bus_idle_()) {
+    return;
+  }
+  this->transmit_packet_(type, data);
+}
+
+bool CrowAlarmPanel::wait_for_bus_idle_() {
+  uint32_t start_ms = millis();
+  while (!this->is_bus_idle_()) {
+    if (millis() - start_ms > 5000) {
+      ESP_LOGW(TAG, "Timeout waiting for bus idle before sending packet");
+      return false;
+    }
+    delay(2);
+    yield();
+  }
+  return true;
+}
+
+void CrowAlarmPanel::transmit_packet_(uint8_t type, const std::vector<uint8_t> &data) {
   std::vector<uint8_t> packet;
   packet.push_back(BOUNDARY);
   packet.push_back(type);
   packet.push_back(this->keypad_address_);
   packet.insert(packet.end(), data.begin(), data.end());
   packet.push_back(BOUNDARY);
-
-  uint32_t start_ms = millis();
-  while (!this->is_bus_idle_()) {
-    if (millis() - start_ms > 5000) {
-      ESP_LOGW(TAG, "Timeout waiting for bus idle before sending packet");
-      return;
-    }
-    delay(2);
-    yield();
-  }
 
   ESP_LOGD(TAG, "Sending packet: [%s]", format_hex_pretty(packet).c_str());
   this->send_packet_blocking_(packet);

@@ -283,7 +283,12 @@ class CrowAlarmPanel : public Component {
  protected:
   CrowAlarmPanelKeypad find_keypad_(uint8_t address);
   bool is_bus_idle_();
+  bool wait_for_bus_idle_();
+  void transmit_packet_(uint8_t type, const std::vector<uint8_t> &data);
   void start_code_sequence_(const std::string &code, uint8_t terminal_key);
+  // keypress() variant for the arm/disarm state machine only: suppresses the transmit if the
+  // sequence resolved while waiting for bus idle (see arm_disarm_generation_).
+  void arm_disarm_keypress_(uint8_t key);
 
   void send_packet_blocking_(const std::vector<uint8_t> &packet);
   bool wait_for_clock_edge_(bool wait_for_state, uint32_t timeout_us);
@@ -352,6 +357,13 @@ class CrowAlarmPanel : public Component {
   // semantic — see docs/arm_disarm_state_machine.md), so it can't be hardcoded to 0x01.
   uint8_t arm_disarm_digit_ack_byte_{0};
   bool arm_disarm_digit_ack_byte_set_{false};
+  // Cancellation token for in-flight arm/disarm keypresses. arm_disarm_keypress_() captures
+  // this before the bus-idle wait (which delays/yields and re-enters loop()) and re-checks it
+  // immediately before transmitting; every resolution to IDLE increments it. Without this, a
+  // matching ARMED_STATE broadcast landing during that wait resolves the sequence but the
+  // already-committed key still goes out — after a disarm resolution, a retry's already-typed
+  // digits + ENTER is exactly the "arm with code" gesture and could re-arm the panel.
+  uint32_t arm_disarm_generation_{0};
 
   bool raw_frame_logging_enabled_{false};
 
