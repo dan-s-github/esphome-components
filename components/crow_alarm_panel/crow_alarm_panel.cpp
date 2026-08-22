@@ -944,7 +944,8 @@ void CrowAlarmPanel::loop() {
 
   // Arm/disarm watchdog: abort if any non-IDLE state exceeds 1s without progress. See
   // ARM_DISARM_MAX_RETRIES in crow_alarm_panel.h for why retrying here (unlike output-select/
-  // zone-bypass above) is safe: a timeout reliably means the panel's state did not change.
+  // zone-bypass above) is safe: intent-matched ARMED_STATE resolution plus generation-token
+  // cancellation cover a confirmation landing after the watchdog fires.
   // Retries are paced by a growing backoff (ARM_DISARM_RETRY_BACKOFF_MS) instead of restarting
   // immediately: back-to-back retries burned the whole budget in ~7 s during a controller
   // degradation episode that outlasted them (HA log 2026-08-19 17:09 — see
@@ -1039,7 +1040,7 @@ void CrowAlarmPanel::loop() {
   }
 }
 
-void CrowAlarmPanel::start_code_sequence_(const std::string &code, uint8_t terminal_key) {
+bool CrowAlarmPanel::start_code_sequence_(const std::string &code, uint8_t terminal_key) {
   this->arm_disarm_code_digits_.clear();
   for (char c : code) {
     if (c >= '0' && c <= '9') {
@@ -1048,7 +1049,7 @@ void CrowAlarmPanel::start_code_sequence_(const std::string &code, uint8_t termi
   }
   if (this->arm_disarm_code_digits_.empty()) {
     ESP_LOGW(TAG, "start_code_sequence_: empty or non-numeric code, ignoring");
-    return;
+    return false;
   }
   ESP_LOGD(TAG, "Code sequence: %u digits, terminal key 0x%02X",
            this->arm_disarm_code_digits_.size(), terminal_key);
@@ -1061,88 +1062,89 @@ void CrowAlarmPanel::start_code_sequence_(const std::string &code, uint8_t termi
   this->arm_disarm_retry_pending_ = false;
   this->arm_disarm_digit_ack_byte_set_ = false;
   this->arm_disarm_keypress_(this->arm_disarm_code_digits_[0]);
+  return true;
 }
 
-void CrowAlarmPanel::arm_away(const std::string &code) {
+bool CrowAlarmPanel::arm_away(const std::string &code) {
   if (!this->is_active_keypad()) {
     ESP_LOGW(TAG, "arm_away: passive monitor mode, ignoring");
-    return;
+    return false;
   }
   if (this->arm_disarm_state_ != ArmDisarmState::IDLE) {
     ESP_LOGW(TAG, "arm_away: ARM/DISARM already in progress, ignoring");
-    return;
+    return false;
   }
   // All three keypress state machines advance on the same KEYPAD_COMMAND frames; running
   // two at once would double-consume confirmations.
   if (this->output_select_state_ != OutputSelectState::IDLE ||
       this->zone_bypass_state_ != ZoneBypassState::IDLE) {
     ESP_LOGW(TAG, "arm_away: another keypress sequence in progress, ignoring");
-    return;
+    return false;
   }
   if (!code.empty()) {
     ESP_LOGI(TAG, "Arm away (with code)");
-    this->start_code_sequence_(code, KEY_ARM);
-  } else {
-    ESP_LOGI(TAG, "Arm away");
-    this->arm_disarm_state_ = ArmDisarmState::ARM_AWAY_PENDING;
-    this->arm_disarm_state_enter_ms_ = millis();
-    this->arm_disarm_retry_count_ = 0;
-    this->arm_disarm_retry_pending_ = false;
-    this->arm_disarm_keypress_(KEY_ARM);
+    return this->start_code_sequence_(code, KEY_ARM);
   }
+  ESP_LOGI(TAG, "Arm away");
+  this->arm_disarm_state_ = ArmDisarmState::ARM_AWAY_PENDING;
+  this->arm_disarm_state_enter_ms_ = millis();
+  this->arm_disarm_retry_count_ = 0;
+  this->arm_disarm_retry_pending_ = false;
+  this->arm_disarm_keypress_(KEY_ARM);
+  return true;
 }
 
-void CrowAlarmPanel::arm_stay(const std::string &code) {
+bool CrowAlarmPanel::arm_stay(const std::string &code) {
   if (!this->is_active_keypad()) {
     ESP_LOGW(TAG, "arm_stay: passive monitor mode, ignoring");
-    return;
+    return false;
   }
   if (this->arm_disarm_state_ != ArmDisarmState::IDLE) {
     ESP_LOGW(TAG, "arm_stay: ARM/DISARM already in progress, ignoring");
-    return;
+    return false;
   }
   // All three keypress state machines advance on the same KEYPAD_COMMAND frames; running
   // two at once would double-consume confirmations.
   if (this->output_select_state_ != OutputSelectState::IDLE ||
       this->zone_bypass_state_ != ZoneBypassState::IDLE) {
     ESP_LOGW(TAG, "arm_stay: another keypress sequence in progress, ignoring");
-    return;
+    return false;
   }
   if (!code.empty()) {
     ESP_LOGI(TAG, "Arm stay (with code)");
-    this->start_code_sequence_(code, KEY_STAY);
-  } else {
-    ESP_LOGI(TAG, "Arm stay");
-    this->arm_disarm_state_ = ArmDisarmState::ARM_STAY_PENDING;
-    this->arm_disarm_state_enter_ms_ = millis();
-    this->arm_disarm_retry_count_ = 0;
-    this->arm_disarm_retry_pending_ = false;
-    this->arm_disarm_keypress_(KEY_STAY);
+    return this->start_code_sequence_(code, KEY_STAY);
   }
+  ESP_LOGI(TAG, "Arm stay");
+  this->arm_disarm_state_ = ArmDisarmState::ARM_STAY_PENDING;
+  this->arm_disarm_state_enter_ms_ = millis();
+  this->arm_disarm_retry_count_ = 0;
+  this->arm_disarm_retry_pending_ = false;
+  this->arm_disarm_keypress_(KEY_STAY);
+  return true;
 }
 
-void CrowAlarmPanel::disarm(const std::string &code) {
+bool CrowAlarmPanel::disarm(const std::string &code) {
   if (!this->is_active_keypad()) {
     ESP_LOGW(TAG, "disarm: passive monitor mode, ignoring");
-    return;
+    return false;
   }
   if (!this->is_armed()) {
     ESP_LOGW(TAG, "disarm: not armed, ignoring");
-    return;
+    return false;
   }
   if (this->arm_disarm_state_ != ArmDisarmState::IDLE) {
     ESP_LOGW(TAG, "disarm: ARM/DISARM already in progress, ignoring");
-    return;
+    return false;
   }
   // All three keypress state machines advance on the same KEYPAD_COMMAND frames; running
   // two at once would double-consume confirmations.
   if (this->output_select_state_ != OutputSelectState::IDLE ||
       this->zone_bypass_state_ != ZoneBypassState::IDLE) {
     ESP_LOGW(TAG, "disarm: another keypress sequence in progress, ignoring");
-    return;
+    return false;
   }
   ESP_LOGI(TAG, "Disarm");
-  this->start_code_sequence_(code, KEY_ENTER);
+  return this->start_code_sequence_(code, KEY_ENTER);
 }
 
 void CrowAlarmPanel::keypress(uint8_t key) {
@@ -1176,14 +1178,14 @@ void CrowAlarmPanel::arm_disarm_keypress_(uint8_t key) {
   this->arm_disarm_key_in_flight_ = false;
 }
 
-void CrowAlarmPanel::set_output(uint8_t output, bool state) {
+bool CrowAlarmPanel::set_output(uint8_t output, bool state) {
   if (!this->is_active_keypad()) {
     ESP_LOGW(TAG, "set_output(%u, %s): passive monitor mode, ignoring", output, state ? "on" : "off");
-    return;
+    return false;
   }
   if (this->output_select_state_ != OutputSelectState::IDLE) {
     ESP_LOGW(TAG, "set_output(%u, %s): output-select sequence already in progress", output, state ? "on" : "off");
-    return;
+    return false;
   }
   // All three keypress state machines advance on the same KEYPAD_COMMAND frames; running
   // two at once would double-consume confirmations. arm_disarm_state_ stays non-IDLE for the
@@ -1192,7 +1194,7 @@ void CrowAlarmPanel::set_output(uint8_t output, bool state) {
       this->zone_bypass_state_ != ZoneBypassState::IDLE) {
     ESP_LOGW(TAG, "set_output(%u, %s): another keypress sequence in progress, ignoring", output,
              state ? "on" : "off");
-    return;
+    return false;
   }
   // Build digit queue consumed one per KEYPAD_COMMAND received after the ACK.
   this->output_select_keys_.clear();
@@ -1210,6 +1212,7 @@ void CrowAlarmPanel::set_output(uint8_t output, bool state) {
   this->output_select_state_ = OutputSelectState::OUTPUT_PENDING;
   this->output_select_state_enter_ms_ = millis();
   this->keypress(KEY_OUTPUT);
+  return true;
 }
 
 void CrowAlarmPanel::set_zone_bypass(uint8_t zone, bool state) {

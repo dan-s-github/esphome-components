@@ -198,7 +198,11 @@ class CrowAlarmPanel : public Component {
   void dump_config() override;
   void loop() override;
 
-  void set_output(uint8_t output, bool state);
+  // Returns true if the request was accepted (sequence started); false if it was rejected
+  // (passive mode, or another keypress sequence in progress). Callers that publish an
+  // optimistic entity state must do so only on acceptance — a rejected request starts no
+  // sequence and no watchdog, so nothing would ever correct the optimistic publish.
+  bool set_output(uint8_t output, bool state);
   void set_zone_bypass(uint8_t zone, bool state);
 
   void set_clock_pin(InternalGPIOPin *clock) { this->clock_pin_ = clock; }
@@ -251,9 +255,12 @@ class CrowAlarmPanel : public Component {
   }
   void register_alarm_control_panel(alarm_control_panel::AlarmControlPanel *acp) { this->alarm_control_panel_ = acp; }
 
-  void arm_away(const std::string &code = "");
-  void arm_stay(const std::string &code = "");
-  void disarm(const std::string &code);
+  // These return true if the request was accepted (sequence started); false if rejected
+  // (passive mode, invalid code, already/not armed, or another sequence in progress). See the
+  // acceptance note on set_output() — optimistic publishes must be gated on the result.
+  bool arm_away(const std::string &code = "");
+  bool arm_stay(const std::string &code = "");
+  bool disarm(const std::string &code);
   bool is_armed() const;
 
   Trigger<uint8_t, std::vector<uint8_t>> *get_on_message_trigger() const { return this->on_message_trigger_; }
@@ -285,7 +292,7 @@ class CrowAlarmPanel : public Component {
   bool is_bus_idle_();
   bool wait_for_bus_idle_();
   void transmit_packet_(uint8_t type, const std::vector<uint8_t> &data);
-  void start_code_sequence_(const std::string &code, uint8_t terminal_key);
+  bool start_code_sequence_(const std::string &code, uint8_t terminal_key);
   // keypress() variant for the arm/disarm state machine only: suppresses the transmit if the
   // sequence resolved while waiting for bus idle (see arm_disarm_generation_).
   void arm_disarm_keypress_(uint8_t key);

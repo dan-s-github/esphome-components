@@ -27,8 +27,12 @@ void CrowAlarmControlPanel::control(const alarm_control_panel::AlarmControlPanel
         this->status_momentary_warning("Code required to arm", 2000);
         return;
       }
-      this->parent_->arm_away(code);
-      this->publish_state(alarm_control_panel::ACP_STATE_ARMING);
+      // Publish the optimistic transitional state only if the request was accepted — a
+      // rejected request starts no sequence and no watchdog, so nothing would ever move the
+      // entity out of ARMING again.
+      if (this->parent_->arm_away(code)) {
+        this->publish_state(alarm_control_panel::ACP_STATE_ARMING);
+      }
       break;
     }
     case alarm_control_panel::ACP_STATE_ARMED_HOME: {
@@ -37,8 +41,9 @@ void CrowAlarmControlPanel::control(const alarm_control_panel::AlarmControlPanel
         this->status_momentary_warning("Code required to arm", 2000);
         return;
       }
-      this->parent_->arm_stay(code);
-      this->publish_state(alarm_control_panel::ACP_STATE_ARMING);
+      if (this->parent_->arm_stay(code)) {
+        this->publish_state(alarm_control_panel::ACP_STATE_ARMING);
+      }
       break;
     }
     case alarm_control_panel::ACP_STATE_DISARMED: {
@@ -47,8 +52,9 @@ void CrowAlarmControlPanel::control(const alarm_control_panel::AlarmControlPanel
         this->status_momentary_warning("Code required to disarm", 2000);
         return;
       }
-      this->parent_->disarm(code);
-      this->publish_state(alarm_control_panel::ACP_STATE_DISARMING);
+      if (this->parent_->disarm(code)) {
+        this->publish_state(alarm_control_panel::ACP_STATE_DISARMING);
+      }
       break;
     }
     case alarm_control_panel::ACP_STATE_TRIGGERED:
