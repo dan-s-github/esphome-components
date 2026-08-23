@@ -402,3 +402,29 @@ This does not currently appear to cause the `CODE_ENTER_PENDING` arm/disarm fail
 **Assumption (unverified):** whether `0x8A` is itself a corrupted decode of something else (like `ff.`/`fe.`) or a legitimate-but-rare packet type is not established. Whether the corruption mechanism is the same across all three trigger contexts now observed (our own TX, registration storms, another keypad's physical arm) or several distinct mechanisms sharing a symptom is likewise still open.
 
 **Practical takeaway:** no code change proposed. The registration-storm correlation is now real evidence rather than speculation, but still not proven causal (which direction, if either, is cause vs. effect isn't established) — worth deliberately targeting in a future capture (e.g. watching for `ff.`/`fe.` bursts specifically around forced re-registrations). `0x8A` should be logged if seen again but not acted on.
+
+## `Unknown [91.]` — new unlabeled packet type
+
+**Source:** `traces/esphome-aap-alarm-interface-logs-34.txt`, a ~1h47m standard-debug-level session with four keypads live (`AAP`, `ESPHome`, `Control 4`, `IP`), otherwise unremarkable (normal disarmed-state zone activity, the already-documented `CURRENT_TIME` glitch, one controller reset with the usual re-registration signature).
+
+### Findings (observed facts)
+
+Three occurrences of an undocumented type `0x91`, not present in `crow_alarm_panel.h`'s known-type list:
+
+```sh
+[13:02:52.261][D][crow_alarm_panel:885]: Unknown [91.82.01.46.81.00.80.11 (7)]
+[13:09:52.193][D][crow_alarm_panel:885]: Unknown [91.83.01.46.81.00.80.11 (7)]
+[13:55:21.897][D][crow_alarm_panel:885]: Unknown [91.82.01.46.81.00.80.11 (7)]
+```
+
+- Payload is identical across all three except the leading byte (`0x82` vs `0x83`), which doesn't match any of the four keypad addresses active on this bus (`0x00`/`0x05`/`0x06`/`0x07`), so — if it follows the usual `data[0] = address` convention seen in other packet types — it points at a fifth device not otherwise visible via `KEYPAD_PING`.
+- All three land in the same relative slot in the ~15s poll cycle: immediately after the `AAP Keypad` (`0x00`) ping and before the `ESPHome Keypad` (`0x05`) ping, with spacing to its neighbors consistent with the other keypads' own ping cadence — i.e. it behaves like it occupies a normal polling slot rather than appearing as async/interrupt-style traffic.
+- Timing between occurrences isn't a clean fixed period: `13:02:52` → `13:09:52` is almost exactly 7 minutes, but the third (`13:55:21`) is ~45.5 minutes after the second — not a small multiple of the first gap. Three samples is too few to characterize a period.
+
+### Assumption (unverified)
+
+Meaning is not established. Candidates not distinguished by this data: a status/keep-alive poll for a fifth bus device (e.g. a peripheral or wireless receiver module) at address `0x82`/`0x83`, or a corrupted decode of some other type (cf. the `0x8A` entry above, which was also seen only twice with inconsistent context). The consistent poll-cycle-slot positioning across all three occurrences argues mildly against pure decode corruption, but isn't conclusive.
+
+### Practical takeaway
+
+No code change proposed — `0x91` correctly falls through to the `default:` "Unknown" branch already, and nothing here indicates it needs special handling yet. Logged here so it's recognized (not mistaken for noise, and not confused with the `0xff`/`0xfe`/`0x8A` corruption signatures above) if seen again in a future capture; a repeat occurrence with a fixed period or a clearer address correlation would be the next useful data point.
