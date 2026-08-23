@@ -1027,8 +1027,13 @@ void CrowAlarmPanel::loop() {
     const uint32_t now_ms = millis();
     // Watchdog: if we were being polled but haven't heard from the controller in 60 s,
     // re-send registration (handles controller resets where physical keypads re-register).
+    // Also gated on last_registration_announce_ms_: resending doesn't update last_ping_ms_,
+    // so without this a still-stale ping would re-trip the watchdog on the very next loop()
+    // pass and fire a second, usually unnecessary, announce ~1 s later (before the controller
+    // has had a chance to respond to the first one) instead of waiting the full 60 s.
     if (this->registration_sent_ && this->last_ping_ms_ != 0 &&
-        (now_ms - this->last_ping_ms_) >= 60000) {
+        (now_ms - this->last_ping_ms_) >= 60000 &&
+        (now_ms - this->last_registration_announce_ms_) >= 60000) {
       ESP_LOGW(TAG, "No ping for 60 s, re-sending registration announce");
       this->registration_sent_ = false;
     }
