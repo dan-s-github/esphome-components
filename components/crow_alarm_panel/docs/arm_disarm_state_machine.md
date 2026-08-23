@@ -81,7 +81,7 @@ ARM_AWAY_PENDING / ARM_STAY_PENDING (KEY_ARM or KEY_STAY sent, waiting for Comma
 ├─ on Command(0x14) addressed to us
 │  └─> IDLE (sequence done; ARMED_STATE 0x11 follows independently)
 ├─ on timeout (>1s)
-│  └─> IDLE (abort)
+│  └─> retry with growing backoff, up to ARM_DISARM_MAX_RETRIES; then IDLE (abort)
 
 CODE_DIGIT_PENDING (a code digit sent, waiting for Command)
 ├─ on first Command(0x14) addressed to us in this sequence
@@ -95,21 +95,22 @@ CODE_DIGIT_PENDING (a code digit sent, waiting for Command)
 │  └─> CODE_DIGIT_PENDING (logged, not treated as an anomaly — see logs-18 below; next digit
 │      sent immediately as if byte[1] == baseline)
 ├─ on timeout (>1s)
-│  └─> IDLE (abort)
+│  └─> retry with growing backoff, up to ARM_DISARM_MAX_RETRIES; then IDLE (abort)
 
 CODE_ENTER_PENDING (terminal key sent, waiting for final Command)
 ├─ on Command(0x14) addressed to us
 │  └─> CODE_ENTER_PENDING (logged only, proves the controller is still responding; byte[1] is
 │      not used to judge success or failure here — see "CODE_ENTER_PENDING success detection
 │      redesigned" below for why)
-├─ on ARMED_STATE (0x11) recognized as Arming/Armed Away/Disarmed (dispatched independently by
-│  the message handler, not gated on this state)
-│  └─> IDLE (success)
+├─ on ARMED_STATE (0x11) matching the request's intent (Disarmed for a disarm; Arming or
+│  Armed Away for an arm — dispatched independently by the message handler)
+│  └─> IDLE (success; applies from ANY non-IDLE state, including a retry backoff wait — see
+│      "Retry backoff + intent-matched ARMED_STATE resolution" (2026-08-22) below)
 ├─ on timeout (>1s)
-│  └─> IDLE (abort; failure)
+│  └─> retry with growing backoff, up to ARM_DISARM_MAX_RETRIES; then IDLE (abort; failure)
 
 [Note: ARMED_STATE (0x11) messages are dispatched by the message handler independently;
-the state machine does not gate on them.]
+entity state is always published from them regardless of the state machine.]
 ```
 
 ### Two paths per operation
@@ -168,7 +169,9 @@ Code-entry path is available when the controller requires code authentication.
 3. **Code required for disarm:** `disarm()` always takes a code; there is no no-code toggle path
 4. **Shared code-sequence helper:** `start_code_sequence_(code, terminal_key)` handles arm-with-code and disarm identically; terminal key differs (KEY_ARM, KEY_STAY, or KEY_ENTER)
 5. **No ACK barrier:** Unlike OUTPUT, the code sequence does not wait for an ACK (0x1D)
-6. **Timeout recovery:** ~1s per state; if no Command received, abort to IDLE
+6. **Timeout recovery:** ~1s per state; on timeout the sequence is retried up to
+   `ARM_DISARM_MAX_RETRIES` times with a growing backoff between attempts (see the 2026-08-05
+   and 2026-08-22 entries below), then aborts to IDLE
 7. **Command byte validation:** `CODE_DIGIT_PENDING` does not hardcode the "digit accepted" byte[1] value to 0x01. It learns the value from the first response of each sequence for diagnostics, but no longer aborts if a later response doesn't match that baseline — see "Digit-ack byte is keypad-address-specific, not a validity signal" below for why that broke ESPHome-initiated sequences, and "CMD-byte-change abort removed" (2026-07-25, logs-18) below for why the mid-sequence-abort behavior itself was removed. `CODE_ENTER_PENDING` **also does not use byte[1]** to judge success or failure — see "CODE_ENTER_PENDING success detection redesigned" (2026-07-12) below for why that was proven unreliable in both directions. Both states now rely solely on an independent `ARMED_STATE` broadcast for success, or the shared 1s watchdog for failure.
 
 ## Timing Observations
@@ -438,11 +441,103 @@ A single `disarm()` call resolved in 3.8s total across two automatic retries, wi
 
 **Further confirmed (2026-08-19, logs-33):** `esphome-aap-alarm-interface-logs-33.txt`, four arm/disarm cycles in a ~14-minute session (`14:06`–`14:20`). All four arms completed cleanly on the first attempt. Two of the four disarms (`14:08:36.196`, `14:20:00.756`) hit the ordinary `CODE_ENTER_PENDING` silence signature — terminal key acked (`CMD 0x07`), then genuine bus silence, 1s watchdog fires `Arm/disarm: timeout in state 4, retrying (1/5)`, full code+terminal sequence resent, succeeds immediately on the retry with no user action. Same shape as the logs-27 validation above, one retry each instead of two, still 100% eventual success. No new failure mechanism, no code change proposed.
 
+## Retry backoff + intent-matched ARMED_STATE resolution (2026-08-22)
+
+**Observed facts** (`traces/home-assistant_2026-08-19T08-03-09.331Z.log` — this episode falls
+outside every interface/monitor capture, including logs-33 from earlier the same day): at
+`2026-08-19 17:09:17` and `17:09:30`, two consecutive `disarm()` calls each exhausted **all 5
+automatic retries** and aborted (`Arm/disarm: timeout in state 4, aborting after 5 retries`) —
+12 failed attempts in ~21 s, alternating between state 3 (digit silence) and state 4
+(terminal-key silence). A third call at `17:09:46` — ~8 s after the second abort, ~29 s after the
+first attempt — succeeded with no retry. The wider context marks this as a controller-side
+degradation episode, the strongest evidence yet for the "session-level bad state" theory: the
+controller's `KEYPAD_PING` polling stopped entirely around `17:10:55` (the "No ping for 60 s"
+storm fires at `17:11:55`), and both physical keypads spontaneously re-registered
+(`17:11:16` IP Keypad, `17:11:32` AAP Keypad) — the whole bus lost the controller for a while,
+starting ~90 s after the failed disarms. Two near-misses in the same HA logs reinforce the trend:
+`2026-08-18 16:17:54` needed 3–4 retries and `2026-08-17 16:47:23` needed 4–5 retries to succeed.
+
+**Inference (medium confidence):** the 2026-08-05 back-to-back retry loop burns its whole budget
+in ~7 s (attempt + 1 s watchdog ≈ 1.5 s cadence), well inside a degradation episode that
+evidently lasted tens of seconds — while every eventual success in the whole trace record
+(manual retries in logs-22/23/24/25/26, and this episode's `17:09:46` recovery) came after
+multi-second gaps. Hammering also adds bus contention, the prime suspect for the collision
+failure mode (documented above).
+
+**Fix applied (1/2 — retry backoff):** the watchdog no longer restarts the sequence immediately
+on timeout. It schedules the retry after a growing pause (`ARM_DISARM_RETRY_BACKOFF_MS`:
+1/2/3/5/8/13 s for retries 1–6; `ARM_DISARM_MAX_RETRIES` raised 5 → 6), stretching one call's
+retry envelope from ~7 s to ~40 s — spanning the ~29 s recovery observed on 2026-08-19. While
+the backoff is pending, `KEYPAD_COMMAND`s no longer advance the (dead) sequence — without that
+gate, a stray periodic command arriving mid-wait would type leftover digits into the panel
+outside any attempt. When the retry fires, its keys go through `arm_disarm_keypress_()` —
+the same bus-idle wait `send_packet()` uses, plus the generation check and in-flight gating
+described in the review follow-up below — which covers TX timing. The abort fallback (restore `last_confirmed_acp_state_`) is unchanged.
+
+**Fix applied (2/2 — intent-matched ARMED_STATE resolution from any state):** two related holes
+in the previous `CODE_ENTER_PENDING`-only resolution, both made more likely by retries:
+
+- A slow controller can broadcast the outcome of attempt N after the watchdog has already
+  restarted the sequence (logs-47/26 recorded an 825 ms ack, right at the 1 s boundary; logs-12/37
+  recorded a `Disarmed` broadcast 92 ms *after* an abort). A late `Disarmed` arriving while the
+  retry sits in `CODE_DIGIT_PENDING` previously didn't stop the machine — it would keep typing
+  the remaining digits + ENTER into a now-disarmed panel, and code+ENTER while disarmed is
+  exactly the "arm with code" gesture (logs-42 armed that way), i.e. **the disarm retry could
+  re-arm the panel**. Never observed in a trace, but structurally reachable; now closed.
+- The registration handshake re-broadcasts the *current* state (logs-46: repeated `Armed Away`
+  lines while armed during a re-registration storm). `CODE_ENTER_PENDING` previously accepted
+  *any* recognized ARMED_STATE as success, so an `Armed Away` re-announce landing in a disarm's
+  `CODE_ENTER_PENDING` window would have falsely completed the disarm while the panel stayed
+  armed. Also never directly observed, but the 2026-08-19 episode shows registration storms and
+  disarm attempts do co-occur.
+
+Resolution is now intent-matched — a disarm (terminal key `KEY_ENTER`) resolves only on
+`Disarmed`; an arm (no-code or code path) resolves on `Arming` or `Armed Away` — and applies
+from every non-IDLE state including the retry backoff wait, fully resetting the state machine
+(retry counter and pending flag included). Non-matching recognized broadcasts are logged and
+ignored by the state machine (entity state is still published from them unconditionally, as
+always).
+
+A review follow-up (PR #12) closed one more layer of the same hazard: resolving the state
+machine to IDLE cannot recall a keypress already inside `send_packet()`'s bus-idle wait — that
+wait delays/yields (re-entering `loop()`) and then transmits unconditionally once the bus goes
+idle. Arm/disarm keys are now sent via `arm_disarm_keypress_()`, which captures a generation
+token (`arm_disarm_generation_`) before the wait and re-checks it immediately before the
+blocking transmit; every resolution to IDLE (broadcast confirmation, ARM/STAY ack, watchdog
+abort) bumps the token, so a key committed by a sequence that has since resolved is suppressed
+instead of typed into the panel.
+
+The commit-to-transmit window needs the reverse guard too (`arm_disarm_key_in_flight_`): while
+a key sits in the bus-idle wait, KEYPAD_COMMAND-driven transitions and the watchdog are gated.
+A command arriving before the key transmits cannot be its acknowledgement — acting on it would
+falsely complete `ARM_AWAY_PENDING`/`ARM_STAY_PENDING` (and, combined with the token, suppress
+the never-sent arm key) or advance the digit sequence and emit digits out of order — and a
+watchdog retry started from inside that wait would create a second waiter that transmits a
+duplicate key once the bus goes idle. ARMED_STATE resolution is deliberately *not* gated: it is
+the controller's own state, independent of our TX, and cancelling the in-flight key is exactly
+what the token exists for. On transmit, the no-progress window (`arm_disarm_state_enter_ms_`)
+restarts from the actual send, since the wait may have consumed the whole 1 s budget while the
+watchdog was gated.
+
+Compiles and passes `esphome config`/`esphome compile` against `crow_alarm_panel_test.yaml`.
+**Not yet validated on real hardware** — needs a fresh capture reproducing a multi-failure
+streak (ideally another degradation episode like 2026-08-19 17:09) to confirm the backoff
+envelope rides it out within a single call, and that the intent-match never wrongly ignores a
+genuine confirmation (watch specifically for an arm-stay confirmation shape other than
+`Arming`/`Armed Away`, which would now retry instead of resolving — see Open point below).
+
+**Open point:** if the controller broadcasts a distinct "Armed Stay" ARMED_STATE pattern (none
+of the three recognized patterns `00.01`/`01.00`/`00.00`), an arm-stay sequence would no longer
+resolve via broadcast at all and would fall to the watchdog/retry path, re-pressing KEY_STAY.
+The previous code had the same recognition gap (unknown patterns were logged and ignored), so
+this is not a regression, but a stay-mode capture confirming the actual broadcast bytes would
+settle it.
+
 ## Notes
 
 - ARM/STAY/DISARM sequences are simpler than OUTPUT because there's no ACK handshake
 - No-code arm_away()/arm_stay() complete after a single KEYPAD_COMMAND (~100ms total)
 - Code-based sequences share the same `CODE_DIGIT_PENDING` / `CODE_ENTER_PENDING` states regardless of whether the operation is arm or disarm
-- ARMED_STATE messages (0x11) are published independently regardless of `arm_disarm_state_` (entities always reflect them). As of 2026-07-12, `CODE_ENTER_PENDING` is the one exception that actively *waits* on one to resolve — see "CODE_ENTER_PENDING success detection redesigned" above. `ARM_AWAY_PENDING`/`ARM_STAY_PENDING`/`CODE_DIGIT_PENDING` still don't gate on it.
+- ARMED_STATE messages (0x11) are published independently regardless of `arm_disarm_state_` (entities always reflect them). As of 2026-08-22, an ARMED_STATE broadcast matching the request's intent resolves the sequence from **any** non-IDLE state (including a retry backoff wait) — see "Retry backoff + intent-matched ARMED_STATE resolution" above. `CODE_ENTER_PENDING` remains the only state that *requires* one to succeed (`ARM_AWAY_PENDING`/`ARM_STAY_PENDING` still resolve on their KEYPAD_COMMAND ack).
 - All three keypads receive Command broadcasts during arming/disarming; only the originating keypad controls the sequence
 - `disarm()` also guards against calling when already disarmed — it returns early if `is_armed()` is false

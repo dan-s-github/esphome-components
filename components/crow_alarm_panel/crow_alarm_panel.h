@@ -198,7 +198,11 @@ class CrowAlarmPanel : public Component {
   void dump_config() override;
   void loop() override;
 
-  void set_output(uint8_t output, bool state);
+  // Returns true if the request was accepted (sequence started); false if it was rejected
+  // (passive mode, or another keypress sequence in progress). Callers that publish an
+  // optimistic entity state must do so only on acceptance — a rejected request starts no
+  // sequence and no watchdog, so nothing would ever correct the optimistic publish.
+  bool set_output(uint8_t output, bool state);
   void set_zone_bypass(uint8_t zone, bool state);
 
   void set_clock_pin(InternalGPIOPin *clock) { this->clock_pin_ = clock; }
@@ -251,10 +255,23 @@ class CrowAlarmPanel : public Component {
   }
   void register_alarm_control_panel(alarm_control_panel::AlarmControlPanel *acp) { this->alarm_control_panel_ = acp; }
 
-  void arm_away(const std::string &code = "");
-  void arm_stay(const std::string &code = "");
-  void disarm(const std::string &code);
+  // These return true if the request was accepted (sequence started); false if rejected
+  // (passive mode, invalid code, already/not armed, or another sequence in progress). See the
+  // acceptance note on set_output() — optimistic publishes must be gated on the result.
+  bool arm_away(const std::string &code = "");
+  bool arm_stay(const std::string &code = "");
+  bool disarm(const std::string &code);
   bool is_armed() const;
+  // Identity token for arm/disarm operations, for callers that publish an optimistic
+  // transitional state: capture it BEFORE an arm/disarm call and publish only if it is
+  // unchanged after an accepted call. Every resolution to IDLE bumps the underlying counter,
+  // and a new operation can only start once the previous one has resolved, so an unchanged
+  // token proves the operation this call started is still the active one. Both hazards the
+  // calls' re-entrant bus-idle yield allows are covered: a synchronous resolution (matching
+  // ARMED_STATE publishes the confirmed state — bumped, don't overwrite it), and a newer
+  // operation started re-entrantly after that resolution (bumped by the resolution first —
+  // don't stomp the newer operation's state either).
+  uint32_t arm_disarm_generation() const { return this->arm_disarm_generation_; }
 
   Trigger<uint8_t, std::vector<uint8_t>> *get_on_message_trigger() const { return this->on_message_trigger_; }
 
@@ -283,7 +300,12 @@ class CrowAlarmPanel : public Component {
  protected:
   CrowAlarmPanelKeypad find_keypad_(uint8_t address);
   bool is_bus_idle_();
-  void start_code_sequence_(const std::string &code, uint8_t terminal_key);
+  bool wait_for_bus_idle_();
+  void transmit_packet_(uint8_t type, const std::vector<uint8_t> &data);
+  bool start_code_sequence_(const std::string &code, uint8_t terminal_key);
+  // keypress() variant for the arm/disarm state machine only: suppresses the transmit if the
+  // sequence resolved while waiting for bus idle (see arm_disarm_generation_).
+  void arm_disarm_keypress_(uint8_t key);
 
   void send_packet_blocking_(const std::vector<uint8_t> &packet);
   bool wait_for_clock_edge_(bool wait_for_state, uint32_t timeout_us);
@@ -324,19 +346,53 @@ class CrowAlarmPanel : public Component {
   std::vector<uint8_t> arm_disarm_code_digits_;  // code digits consumed one per KEYPAD_COMMAND
   uint8_t arm_disarm_code_idx_{0};
   uint8_t arm_disarm_terminal_key_{KEY_ENTER};  // KEY_ENTER (disarm), KEY_ARM or KEY_STAY (arm-with-code)
-  // A watchdog timeout here reliably means the panel's state did not change (see
-  // docs/arm_disarm_state_machine.md — multiple sessions with an independent monitor capture
-  // confirm no ARMED_STATE broadcast occurred around the timeout), so unlike output-select/
-  // zone-bypass a blind retry can't undo a change that already landed. 5 covers the worst
-  // consecutive-failure streak observed so far (logs-24, logs-42: 5 failures before success).
-  static const uint8_t ARM_DISARM_MAX_RETRIES = 5;
+  // A watchdog timeout here has almost always meant the panel's state did not change (multiple
+  // sessions with an independent monitor capture show no ARMED_STATE broadcast around the
+  // timeout), but retry safety does NOT rest on that: an 825 ms ack has been observed right at
+  // the 1 s boundary, so a confirmation can land after the watchdog fires. What makes retries
+  // safe — unlike output-select/zone-bypass — is intent-matched ARMED_STATE resolution (resolves
+  // from any non-IDLE state, including a backoff wait) plus arm_disarm_generation_ cancelling
+  // any in-flight key once resolved (see docs/arm_disarm_state_machine.md). 6 with the growing
+  // backoff below spans the worst episode observed so far (HA log 2026-08-19 17:09: two
+  // consecutive calls exhausted 5 back-to-back retries each, and a manual call ~29 s after the
+  // first attempt succeeded — back-to-back retries burned the whole budget in ~7 s, well inside
+  // that episode).
+  static const uint8_t ARM_DISARM_MAX_RETRIES = 6;
   uint8_t arm_disarm_retry_count_{0};
+  // Pause before each retry, indexed by (retry number - 1). Controller degradation episodes
+  // last tens of seconds (see arm_disarm_state_machine.md, 2026-08-19 entry); every eventual
+  // success in the trace record came after multi-second gaps, so the retry envelope must span
+  // ~40 s rather than hammering attempts every ~1.5 s (which also adds bus contention, the
+  // prime suspect for the collision failure mode).
+  static constexpr uint32_t ARM_DISARM_RETRY_BACKOFF_MS[ARM_DISARM_MAX_RETRIES] = {1000, 2000, 3000,
+                                                                                   5000, 8000, 13000};
+  // While true, the previous attempt has timed out and the next retry is waiting out its
+  // backoff: arm_disarm_state_enter_ms_ marks the wait start and arm_disarm_retry_backoff_ms_
+  // the required pause. KEYPAD_COMMANDs must not advance the (dead) sequence during the wait.
+  bool arm_disarm_retry_pending_{false};
+  uint32_t arm_disarm_retry_backoff_ms_{0};
   // "Digit accepted" display_code (KEYPAD_COMMAND byte[1]) learned from the first digit's
   // response each sequence. Physical keypad types disagree on this value (0x01 is common,
   // but address 0x05 has been observed sending 0x07 for the same "more digits expected"
   // semantic — see docs/arm_disarm_state_machine.md), so it can't be hardcoded to 0x01.
   uint8_t arm_disarm_digit_ack_byte_{0};
   bool arm_disarm_digit_ack_byte_set_{false};
+  // Cancellation token for in-flight arm/disarm keypresses. arm_disarm_keypress_() captures
+  // this before the bus-idle wait (which delays/yields and re-enters loop()) and re-checks it
+  // immediately before transmitting; every resolution to IDLE increments it. Without this, a
+  // matching ARMED_STATE broadcast landing during that wait resolves the sequence but the
+  // already-committed key still goes out — after a disarm resolution, a retry's already-typed
+  // digits + ENTER is exactly the "arm with code" gesture and could re-arm the panel.
+  uint32_t arm_disarm_generation_{0};
+  // True while arm_disarm_keypress_() is between commit and transmit (i.e. inside the bus-idle
+  // wait, which re-enters loop()). Gates the KEYPAD_COMMAND-driven state machine transitions
+  // and the watchdog during that window: a command arriving before the key transmits cannot be
+  // its acknowledgement (acting on it would falsely complete ARM/STAY, or advance the digit
+  // sequence and send digits out of order), and a watchdog retry starting mid-wait would
+  // create a second waiter that transmits a duplicate key once the bus goes idle. ARMED_STATE
+  // resolution is NOT gated — it is the controller's own state, independent of our TX, and
+  // cancelling the in-flight key is exactly what arm_disarm_generation_ is for.
+  bool arm_disarm_key_in_flight_{false};
 
   bool raw_frame_logging_enabled_{false};
 

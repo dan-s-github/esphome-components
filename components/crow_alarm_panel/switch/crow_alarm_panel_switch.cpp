@@ -15,8 +15,12 @@ void CrowAlarmPanelOutputSwitch::write_state(bool state) {
     ESP_LOGE(TAG, "Parent not set, ignoring output switch command");
     return;
   }
-  this->parent_->set_output(this->output_number_, state);
-  this->publish_state(state);
+  // Publish the requested state only if the sequence actually started — on rejection
+  // (passive mode, another keypress sequence running) no output keys are sent, so an
+  // unconditional publish would misreport the output until the next controller broadcast.
+  if (this->parent_->set_output(this->output_number_, state)) {
+    this->publish_state(state);
+  }
 }
 
 void CrowAlarmPanelOutputSwitch::dump_config() {

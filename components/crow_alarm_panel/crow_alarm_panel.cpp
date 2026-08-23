@@ -458,16 +458,40 @@ void CrowAlarmPanel::loop() {
                    format_hex_pretty(data).c_str());
         }
         // ARMED_STATE is the controller's own authoritative state broadcast, independent of the
-        // arm/disarm state machine below — this is the only signal CODE_ENTER_PENDING treats as
-        // proof of success (see the enum comment in crow_alarm_panel.h for why the KEYPAD_COMMAND
-        // byte[1] value below isn't trusted for this). Any recognized ARMED_STATE broadcast while
-        // a terminal key is outstanding settles it, regardless of which of the three it is —
-        // "Arming" confirms an arm-with-code request as much as "Armed Away"/"Disarmed" would.
-        if (this->arm_disarm_state_ == ArmDisarmState::CODE_ENTER_PENDING &&
-            ((data[0] == 0x00 && data[1] == 0x01) || (data[0] == 0x01 && data[1] == 0x00) ||
-             (data[0] == 0x00 && data[1] == 0x00))) {
-          ESP_LOGD(TAG, "Code sequence: complete (confirmed via ARMED_STATE broadcast)");
-          this->arm_disarm_state_ = ArmDisarmState::IDLE;
+        // arm/disarm state machine — this is the only signal treated as proof of success (see the
+        // enum comment in crow_alarm_panel.h for why KEYPAD_COMMAND byte[1] isn't trusted for
+        // this). Resolution is intent-matched and covers every non-IDLE state, including a retry
+        // backoff wait, for two reasons (see arm_disarm_state_machine.md, 2026-08-22 entry):
+        // - A slow controller can broadcast the outcome of a previous attempt after the watchdog
+        //   already restarted the sequence (an 825 ms ack has been observed, right at the 1 s
+        //   boundary). Without resolving from CODE_DIGIT_PENDING, the retry would keep typing
+        //   the remaining digits + ENTER into an already-disarmed panel — and code+ENTER while
+        //   disarmed is exactly the "arm with code" gesture, so the retry could re-arm it.
+        // - The registration handshake re-broadcasts the CURRENT state (logs-46: repeated "Armed
+        //   Away" lines while armed). Accepting any recognized broadcast as success would let an
+        //   "Armed Away" re-announce falsely complete a disarm, so only the broadcast matching
+        //   the request's intent resolves it; non-matching ones are ignored.
+        if (this->arm_disarm_state_ != ArmDisarmState::IDLE) {
+          const bool is_arming = (data[0] == 0x00 && data[1] == 0x01);
+          const bool is_armed_away = (data[0] == 0x01 && data[1] == 0x00);
+          const bool is_disarmed = (data[0] == 0x00 && data[1] == 0x00);
+          if (is_arming || is_armed_away || is_disarmed) {
+            const bool is_disarm_request = (this->arm_disarm_state_ == ArmDisarmState::CODE_DIGIT_PENDING ||
+                                            this->arm_disarm_state_ == ArmDisarmState::CODE_ENTER_PENDING) &&
+                                           this->arm_disarm_terminal_key_ == KEY_ENTER;
+            const bool matches_intent = is_disarm_request ? is_disarmed : (is_arming || is_armed_away);
+            if (matches_intent) {
+              ESP_LOGD(TAG, "Code sequence: complete (confirmed via ARMED_STATE broadcast)");
+              this->arm_disarm_state_ = ArmDisarmState::IDLE;
+              this->arm_disarm_generation_++;
+              this->arm_disarm_code_digits_.clear();
+              this->arm_disarm_code_idx_ = 0;
+              this->arm_disarm_retry_count_ = 0;
+              this->arm_disarm_retry_pending_ = false;
+            } else {
+              ESP_LOGD(TAG, "Arm/disarm: ignoring ARMED_STATE broadcast not matching request intent");
+            }
+          }
         }
         break;
       }
@@ -632,62 +656,81 @@ void CrowAlarmPanel::loop() {
             default:
               break;
           }
-          // Drive arm/disarm state machine forward.
-          switch (this->arm_disarm_state_) {
-            case ArmDisarmState::ARM_AWAY_PENDING:
-            case ArmDisarmState::ARM_STAY_PENDING:
-              ESP_LOGD(TAG, "Arm/stay: CMD received, sequence complete");
-              this->arm_disarm_state_ = ArmDisarmState::IDLE;
-              break;
-            case ArmDisarmState::CODE_DIGIT_PENDING: {
-              uint8_t cmd_byte = (data.size() > 1) ? data[1] : 0;
-              if (!this->arm_disarm_digit_ack_byte_set_) {
-                // Learn this sequence's "digit accepted, more expected" display_code from the
-                // first digit's response, for diagnostics only. Trace: logs-7/logs-33 (2026-07-08)
-                // show address 0x05 consistently getting 0x07 here — never 0x01 — across four
-                // separate arm and disarm attempts with a code independently confirmed correct via
-                // the physical IP keypad (0x07), while address 0x07 consistently got 0x01. The
-                // controller does not validate code correctness per digit (only at ENTER), so this
-                // is a per-keypad-type display quirk, not a rejection. A mid-sequence change isn't
-                // treated as an abort-worthy anomaly either (see docs/arm_disarm_state_machine.md):
-                // its meaning was never established, and logs-18 showed the abort itself causing a
-                // stuck alarm_control_panel entity for a sequence that may well have succeeded.
-                // Success/failure comes solely from the ARMED_STATE broadcast or the shared 1s
-                // watchdog, same as CODE_ENTER_PENDING.
-                this->arm_disarm_digit_ack_byte_ = cmd_byte;
-                this->arm_disarm_digit_ack_byte_set_ = true;
-              } else if (cmd_byte != this->arm_disarm_digit_ack_byte_) {
-                ESP_LOGD(TAG, "Arm/disarm: CMD byte changed from 0x%02X to 0x%02X in CODE_DIGIT_PENDING, continuing",
-                         this->arm_disarm_digit_ack_byte_, cmd_byte);
+          // Drive arm/disarm state machine forward. Skipped while a retry backoff is pending:
+          // the timed-out attempt is dead and will restart from the first digit, so a stray
+          // periodic KEYPAD_COMMAND arriving mid-wait must not advance the stale sequence
+          // (it would type leftover digits into the panel outside any attempt). Also skipped
+          // while a key is committed but not yet transmitted (arm_disarm_key_in_flight_): a
+          // command arriving during that bus-idle wait cannot acknowledge the pending key, so
+          // acting on it would falsely complete ARM/STAY (suppressing the never-sent key) or
+          // send the next digit out of order.
+          if (!this->arm_disarm_retry_pending_ && !this->arm_disarm_key_in_flight_) {
+            switch (this->arm_disarm_state_) {
+              case ArmDisarmState::ARM_AWAY_PENDING:
+              case ArmDisarmState::ARM_STAY_PENDING:
+                ESP_LOGD(TAG, "Arm/stay: CMD received, sequence complete");
+                this->arm_disarm_state_ = ArmDisarmState::IDLE;
+                this->arm_disarm_generation_++;
+                break;
+              case ArmDisarmState::CODE_DIGIT_PENDING: {
+                uint8_t cmd_byte = (data.size() > 1) ? data[1] : 0;
+                if (!this->arm_disarm_digit_ack_byte_set_) {
+                  // Learn this sequence's "digit accepted, more expected" display_code from the
+                  // first digit's response, for diagnostics only. Trace: logs-7/logs-33 (2026-07-08)
+                  // show address 0x05 consistently getting 0x07 here — never 0x01 — across four
+                  // separate arm and disarm attempts with a code independently confirmed correct via
+                  // the physical IP keypad (0x07), while address 0x07 consistently got 0x01. The
+                  // controller does not validate code correctness per digit (only at ENTER), so this
+                  // is a per-keypad-type display quirk, not a rejection. A mid-sequence change isn't
+                  // treated as an abort-worthy anomaly either (see docs/arm_disarm_state_machine.md):
+                  // its meaning was never established, and logs-18 showed the abort itself causing a
+                  // stuck alarm_control_panel entity for a sequence that may well have succeeded.
+                  // Success/failure comes solely from the ARMED_STATE broadcast or the shared 1s
+                  // watchdog, same as CODE_ENTER_PENDING.
+                  this->arm_disarm_digit_ack_byte_ = cmd_byte;
+                  this->arm_disarm_digit_ack_byte_set_ = true;
+                } else if (cmd_byte != this->arm_disarm_digit_ack_byte_) {
+                  ESP_LOGD(TAG, "Arm/disarm: CMD byte changed from 0x%02X to 0x%02X in CODE_DIGIT_PENDING, continuing",
+                           this->arm_disarm_digit_ack_byte_, cmd_byte);
+                }
+                if (this->arm_disarm_code_idx_ < this->arm_disarm_code_digits_.size()) {
+                  uint8_t digit = this->arm_disarm_code_digits_[this->arm_disarm_code_idx_++];
+                  ESP_LOGD(TAG, "Code sequence: sending digit %u (index %u)", digit,
+                           this->arm_disarm_code_idx_ - 1);
+                  // No timestamp update here: arm_disarm_keypress_() already refreshes
+                  // arm_disarm_state_enter_ms_ when the key actually transmits, and assigning
+                  // after the call would be stale if the operation resolved (and a newer one
+                  // started re-entrantly) during the yield — overwriting the newer operation's
+                  // watchdog/backoff timestamp.
+                  this->arm_disarm_keypress_(digit);
+                } else {
+                  ESP_LOGD(TAG, "Code sequence: sending terminal key 0x%02X",
+                           this->arm_disarm_terminal_key_);
+                  // Set state BEFORE the keypress — send_packet() delays/yields internally and can
+                  // re-enter loop(). If the matching ARMED_STATE broadcast resolves the sequence
+                  // during that yield (state -> IDLE, code cleared), assigning after the call would
+                  // resurrect CODE_ENTER_PENDING and the watchdog retry would index the emptied
+                  // code vector.
+                  this->arm_disarm_state_ = ArmDisarmState::CODE_ENTER_PENDING;
+                  this->arm_disarm_state_enter_ms_ = millis();
+                  this->arm_disarm_keypress_(this->arm_disarm_terminal_key_);
+                }
+                break;
               }
-              if (this->arm_disarm_code_idx_ < this->arm_disarm_code_digits_.size()) {
-                uint8_t digit = this->arm_disarm_code_digits_[this->arm_disarm_code_idx_++];
-                ESP_LOGD(TAG, "Code sequence: sending digit %u (index %u)", digit,
-                         this->arm_disarm_code_idx_ - 1);
-                this->keypress(digit);
-                this->arm_disarm_state_enter_ms_ = millis();
-              } else {
-                ESP_LOGD(TAG, "Code sequence: sending terminal key 0x%02X",
-                         this->arm_disarm_terminal_key_);
-                this->keypress(this->arm_disarm_terminal_key_);
-                this->arm_disarm_state_ = ArmDisarmState::CODE_ENTER_PENDING;
-                this->arm_disarm_state_enter_ms_ = millis();
+              case ArmDisarmState::CODE_ENTER_PENDING: {
+                // byte[1] here is deliberately not used to judge success/failure — see the enum
+                // comment in crow_alarm_panel.h for why (logs-10/35, logs-12/37, 2026-07-12). This
+                // KEYPAD_COMMAND only proves the controller is still responding; only the
+                // independent ARMED_STATE broadcast (below) or the shared 1s watchdog resolves
+                // this state.
+                uint8_t cmd_byte = (data.size() > 1) ? data[1] : 0;
+                ESP_LOGD(TAG, "Code sequence: CMD 0x%02X after terminal key, awaiting ARMED_STATE confirmation",
+                         cmd_byte);
+                break;
               }
-              break;
+              default:
+                break;
             }
-            case ArmDisarmState::CODE_ENTER_PENDING: {
-              // byte[1] here is deliberately not used to judge success/failure — see the enum
-              // comment in crow_alarm_panel.h for why (logs-10/35, logs-12/37, 2026-07-12). This
-              // KEYPAD_COMMAND only proves the controller is still responding; only the
-              // independent ARMED_STATE broadcast (below) or the shared 1s watchdog resolves
-              // this state.
-              uint8_t cmd_byte = (data.size() > 1) ? data[1] : 0;
-              ESP_LOGD(TAG, "Code sequence: CMD 0x%02X after terminal key, awaiting ARMED_STATE confirmation",
-                       cmd_byte);
-              break;
-            }
-            default:
-              break;
           }
           // Drive zone-bypass state machine forward.
           // See docs/zone_bypass_state_machine.md for observed timing.
@@ -905,26 +948,34 @@ void CrowAlarmPanel::loop() {
 
   // Arm/disarm watchdog: abort if any non-IDLE state exceeds 1s without progress. See
   // ARM_DISARM_MAX_RETRIES in crow_alarm_panel.h for why retrying here (unlike output-select/
-  // zone-bypass above) is safe: a timeout reliably means the panel's state did not change.
-  if (this->arm_disarm_state_ != ArmDisarmState::IDLE) {
+  // zone-bypass above) is safe: intent-matched ARMED_STATE resolution plus generation-token
+  // cancellation cover a confirmation landing after the watchdog fires.
+  // Retries are paced by a growing backoff (ARM_DISARM_RETRY_BACKOFF_MS) instead of restarting
+  // immediately: back-to-back retries burned the whole budget in ~7 s during a controller
+  // degradation episode that outlasted them (HA log 2026-08-19 17:09 — see
+  // arm_disarm_state_machine.md), while a manual call ~8 s after the abort succeeded first try.
+  // Gated while a key is committed but not yet transmitted (arm_disarm_key_in_flight_): timing
+  // out an attempt whose key hasn't gone out yet is premature, and a retry started from inside
+  // that key's bus-idle wait would create a second waiter transmitting a duplicate key.
+  // arm_disarm_keypress_() restarts the no-progress window when the key actually transmits.
+  if (this->arm_disarm_state_ != ArmDisarmState::IDLE && !this->arm_disarm_key_in_flight_) {
     const uint32_t now_ms = millis();
-    if (now_ms - this->arm_disarm_state_enter_ms_ > 1000) {
-      if (this->arm_disarm_retry_count_ < ARM_DISARM_MAX_RETRIES) {
-        this->arm_disarm_retry_count_++;
-        ESP_LOGW(TAG, "Arm/disarm: timeout in state %u, retrying (%u/%u)",
-                 static_cast<uint8_t>(this->arm_disarm_state_), this->arm_disarm_retry_count_,
+    if (this->arm_disarm_retry_pending_) {
+      if (now_ms - this->arm_disarm_state_enter_ms_ >= this->arm_disarm_retry_backoff_ms_) {
+        ESP_LOGD(TAG, "Arm/disarm: starting retry %u/%u", this->arm_disarm_retry_count_,
                  ARM_DISARM_MAX_RETRIES);
-        // Refresh the watchdog timer BEFORE any keypress() below — keypress()->send_packet()
-        // can delay()/yield() and re-enter this loop(), and with the old timestamp still in
-        // place the watchdog would see itself as still timed out, firing again and sending an
-        // extra keypress (same race the output-select retry above avoids the same way).
+        // Clear the pending flag and refresh the watchdog timer BEFORE any keypress() below —
+        // keypress()->send_packet() can delay()/yield() and re-enter this loop(), and with the
+        // old values still in place this branch would fire again and send an extra keypress
+        // (same race the output-select retry above avoids the same way).
+        this->arm_disarm_retry_pending_ = false;
         this->arm_disarm_state_enter_ms_ = millis();
         switch (this->arm_disarm_state_) {
           case ArmDisarmState::ARM_AWAY_PENDING:
-            this->keypress(KEY_ARM);
+            this->arm_disarm_keypress_(KEY_ARM);
             break;
           case ArmDisarmState::ARM_STAY_PENDING:
-            this->keypress(KEY_STAY);
+            this->arm_disarm_keypress_(KEY_STAY);
             break;
           case ArmDisarmState::CODE_DIGIT_PENDING:
           case ArmDisarmState::CODE_ENTER_PENDING:
@@ -933,18 +984,30 @@ void CrowAlarmPanel::loop() {
             this->arm_disarm_code_idx_ = 1;
             this->arm_disarm_state_ = ArmDisarmState::CODE_DIGIT_PENDING;
             this->arm_disarm_digit_ack_byte_set_ = false;
-            this->keypress(this->arm_disarm_code_digits_[0]);
+            this->arm_disarm_keypress_(this->arm_disarm_code_digits_[0]);
             break;
           default:
             break;
         }
+      }
+    } else if (now_ms - this->arm_disarm_state_enter_ms_ > 1000) {
+      if (this->arm_disarm_retry_count_ < ARM_DISARM_MAX_RETRIES) {
+        this->arm_disarm_retry_count_++;
+        this->arm_disarm_retry_backoff_ms_ = ARM_DISARM_RETRY_BACKOFF_MS[this->arm_disarm_retry_count_ - 1];
+        ESP_LOGW(TAG, "Arm/disarm: timeout in state %u, retrying (%u/%u) in %u ms",
+                 static_cast<uint8_t>(this->arm_disarm_state_), this->arm_disarm_retry_count_,
+                 ARM_DISARM_MAX_RETRIES, (unsigned) this->arm_disarm_retry_backoff_ms_);
+        this->arm_disarm_retry_pending_ = true;
+        this->arm_disarm_state_enter_ms_ = now_ms;
       } else {
         ESP_LOGW(TAG, "Arm/disarm: timeout in state %u, aborting after %u retries",
                  static_cast<uint8_t>(this->arm_disarm_state_), this->arm_disarm_retry_count_);
         this->arm_disarm_state_ = ArmDisarmState::IDLE;
+        this->arm_disarm_generation_++;
         this->arm_disarm_code_digits_.clear();
         this->arm_disarm_code_idx_ = 0;
         this->arm_disarm_retry_count_ = 0;
+        this->arm_disarm_retry_pending_ = false;
         // CrowAlarmControlPanel::control() optimistically publishes ACP_STATE_ARMING/DISARMING
         // before this sequence resolves. On abort no ARMED_STATE broadcast is coming to correct
         // that, so without this the entity would be stuck in the transitional state forever,
@@ -964,8 +1027,13 @@ void CrowAlarmPanel::loop() {
     const uint32_t now_ms = millis();
     // Watchdog: if we were being polled but haven't heard from the controller in 60 s,
     // re-send registration (handles controller resets where physical keypads re-register).
+    // Also gated on last_registration_announce_ms_: resending doesn't update last_ping_ms_,
+    // so without this a still-stale ping would re-trip the watchdog on the very next loop()
+    // pass and fire a second, usually unnecessary, announce ~1 s later (before the controller
+    // has had a chance to respond to the first one) instead of waiting the full 60 s.
     if (this->registration_sent_ && this->last_ping_ms_ != 0 &&
-        (now_ms - this->last_ping_ms_) >= 60000) {
+        (now_ms - this->last_ping_ms_) >= 60000 &&
+        (now_ms - this->last_registration_announce_ms_) >= 60000) {
       ESP_LOGW(TAG, "No ping for 60 s, re-sending registration announce");
       this->registration_sent_ = false;
     }
@@ -981,7 +1049,7 @@ void CrowAlarmPanel::loop() {
   }
 }
 
-void CrowAlarmPanel::start_code_sequence_(const std::string &code, uint8_t terminal_key) {
+bool CrowAlarmPanel::start_code_sequence_(const std::string &code, uint8_t terminal_key) {
   this->arm_disarm_code_digits_.clear();
   for (char c : code) {
     if (c >= '0' && c <= '9') {
@@ -990,7 +1058,7 @@ void CrowAlarmPanel::start_code_sequence_(const std::string &code, uint8_t termi
   }
   if (this->arm_disarm_code_digits_.empty()) {
     ESP_LOGW(TAG, "start_code_sequence_: empty or non-numeric code, ignoring");
-    return;
+    return false;
   }
   ESP_LOGD(TAG, "Code sequence: %u digits, terminal key 0x%02X",
            this->arm_disarm_code_digits_.size(), terminal_key);
@@ -1000,81 +1068,142 @@ void CrowAlarmPanel::start_code_sequence_(const std::string &code, uint8_t termi
   this->arm_disarm_state_ = ArmDisarmState::CODE_DIGIT_PENDING;
   this->arm_disarm_state_enter_ms_ = millis();
   this->arm_disarm_retry_count_ = 0;
+  this->arm_disarm_retry_pending_ = false;
   this->arm_disarm_digit_ack_byte_set_ = false;
-  this->keypress(this->arm_disarm_code_digits_[0]);
+  this->arm_disarm_keypress_(this->arm_disarm_code_digits_[0]);
+  return true;
 }
 
-void CrowAlarmPanel::arm_away(const std::string &code) {
+bool CrowAlarmPanel::arm_away(const std::string &code) {
   if (!this->is_active_keypad()) {
     ESP_LOGW(TAG, "arm_away: passive monitor mode, ignoring");
-    return;
+    return false;
   }
   if (this->arm_disarm_state_ != ArmDisarmState::IDLE) {
     ESP_LOGW(TAG, "arm_away: ARM/DISARM already in progress, ignoring");
-    return;
+    return false;
+  }
+  // All three keypress state machines advance on the same KEYPAD_COMMAND frames; running
+  // two at once would double-consume confirmations.
+  if (this->output_select_state_ != OutputSelectState::IDLE ||
+      this->zone_bypass_state_ != ZoneBypassState::IDLE) {
+    ESP_LOGW(TAG, "arm_away: another keypress sequence in progress, ignoring");
+    return false;
   }
   if (!code.empty()) {
     ESP_LOGI(TAG, "Arm away (with code)");
-    this->start_code_sequence_(code, KEY_ARM);
-  } else {
-    ESP_LOGI(TAG, "Arm away");
-    this->arm_disarm_state_ = ArmDisarmState::ARM_AWAY_PENDING;
-    this->arm_disarm_state_enter_ms_ = millis();
-    this->arm_disarm_retry_count_ = 0;
-    this->keypress(KEY_ARM);
+    return this->start_code_sequence_(code, KEY_ARM);
   }
+  ESP_LOGI(TAG, "Arm away");
+  this->arm_disarm_state_ = ArmDisarmState::ARM_AWAY_PENDING;
+  this->arm_disarm_state_enter_ms_ = millis();
+  this->arm_disarm_retry_count_ = 0;
+  this->arm_disarm_retry_pending_ = false;
+  this->arm_disarm_keypress_(KEY_ARM);
+  return true;
 }
 
-void CrowAlarmPanel::arm_stay(const std::string &code) {
+bool CrowAlarmPanel::arm_stay(const std::string &code) {
   if (!this->is_active_keypad()) {
     ESP_LOGW(TAG, "arm_stay: passive monitor mode, ignoring");
-    return;
+    return false;
   }
   if (this->arm_disarm_state_ != ArmDisarmState::IDLE) {
     ESP_LOGW(TAG, "arm_stay: ARM/DISARM already in progress, ignoring");
-    return;
+    return false;
+  }
+  // All three keypress state machines advance on the same KEYPAD_COMMAND frames; running
+  // two at once would double-consume confirmations.
+  if (this->output_select_state_ != OutputSelectState::IDLE ||
+      this->zone_bypass_state_ != ZoneBypassState::IDLE) {
+    ESP_LOGW(TAG, "arm_stay: another keypress sequence in progress, ignoring");
+    return false;
   }
   if (!code.empty()) {
     ESP_LOGI(TAG, "Arm stay (with code)");
-    this->start_code_sequence_(code, KEY_STAY);
-  } else {
-    ESP_LOGI(TAG, "Arm stay");
-    this->arm_disarm_state_ = ArmDisarmState::ARM_STAY_PENDING;
-    this->arm_disarm_state_enter_ms_ = millis();
-    this->arm_disarm_retry_count_ = 0;
-    this->keypress(KEY_STAY);
+    return this->start_code_sequence_(code, KEY_STAY);
   }
+  ESP_LOGI(TAG, "Arm stay");
+  this->arm_disarm_state_ = ArmDisarmState::ARM_STAY_PENDING;
+  this->arm_disarm_state_enter_ms_ = millis();
+  this->arm_disarm_retry_count_ = 0;
+  this->arm_disarm_retry_pending_ = false;
+  this->arm_disarm_keypress_(KEY_STAY);
+  return true;
 }
 
-void CrowAlarmPanel::disarm(const std::string &code) {
+bool CrowAlarmPanel::disarm(const std::string &code) {
   if (!this->is_active_keypad()) {
     ESP_LOGW(TAG, "disarm: passive monitor mode, ignoring");
-    return;
+    return false;
   }
   if (!this->is_armed()) {
     ESP_LOGW(TAG, "disarm: not armed, ignoring");
-    return;
+    return false;
   }
   if (this->arm_disarm_state_ != ArmDisarmState::IDLE) {
     ESP_LOGW(TAG, "disarm: ARM/DISARM already in progress, ignoring");
-    return;
+    return false;
+  }
+  // All three keypress state machines advance on the same KEYPAD_COMMAND frames; running
+  // two at once would double-consume confirmations.
+  if (this->output_select_state_ != OutputSelectState::IDLE ||
+      this->zone_bypass_state_ != ZoneBypassState::IDLE) {
+    ESP_LOGW(TAG, "disarm: another keypress sequence in progress, ignoring");
+    return false;
   }
   ESP_LOGI(TAG, "Disarm");
-  this->start_code_sequence_(code, KEY_ENTER);
+  return this->start_code_sequence_(code, KEY_ENTER);
 }
 
 void CrowAlarmPanel::keypress(uint8_t key) {
   this->send_packet(KEYPRESS, {key});
 }
 
-void CrowAlarmPanel::set_output(uint8_t output, bool state) {
+void CrowAlarmPanel::arm_disarm_keypress_(uint8_t key) {
+  // The bus-idle wait delays/yields and re-enters loop(). If the sequence resolves during that
+  // window (matching ARMED_STATE broadcast, or watchdog abort), the generation bumps and this
+  // key must no longer go out: setting arm_disarm_state_ back to IDLE can't recall a keypress
+  // already committed to send_packet(), and after a disarm resolution a retry's already-typed
+  // digits + ENTER is exactly the "arm with code" gesture (could re-arm the panel).
+  // arm_disarm_key_in_flight_ gates the KEYPAD_COMMAND-driven transitions and the watchdog
+  // for the duration of the wait — see the member comment in crow_alarm_panel.h.
+  const uint32_t gen = this->arm_disarm_generation_;
+  this->arm_disarm_key_in_flight_ = true;
+  if (!this->wait_for_bus_idle_()) {
+    this->arm_disarm_key_in_flight_ = false;
+    return;
+  }
+  if (gen != this->arm_disarm_generation_) {
+    ESP_LOGD(TAG, "Arm/disarm: sequence resolved during bus-idle wait, suppressing key 0x%02X", key);
+    this->arm_disarm_key_in_flight_ = false;
+    return;
+  }
+  this->transmit_packet_(KEYPRESS, {key});
+  // Restart the no-progress window from the actual transmit — the bus-idle wait above may
+  // have consumed most (or more) of the 1 s budget before the key even went out, and the
+  // watchdog was gated during it.
+  this->arm_disarm_state_enter_ms_ = millis();
+  this->arm_disarm_key_in_flight_ = false;
+}
+
+bool CrowAlarmPanel::set_output(uint8_t output, bool state) {
   if (!this->is_active_keypad()) {
     ESP_LOGW(TAG, "set_output(%u, %s): passive monitor mode, ignoring", output, state ? "on" : "off");
-    return;
+    return false;
   }
   if (this->output_select_state_ != OutputSelectState::IDLE) {
     ESP_LOGW(TAG, "set_output(%u, %s): output-select sequence already in progress", output, state ? "on" : "off");
-    return;
+    return false;
+  }
+  // All three keypress state machines advance on the same KEYPAD_COMMAND frames; running
+  // two at once would double-consume confirmations. arm_disarm_state_ stays non-IDLE for the
+  // whole multi-second retry-backoff envelope, so this window is long enough to matter.
+  if (this->arm_disarm_state_ != ArmDisarmState::IDLE ||
+      this->zone_bypass_state_ != ZoneBypassState::IDLE) {
+    ESP_LOGW(TAG, "set_output(%u, %s): another keypress sequence in progress, ignoring", output,
+             state ? "on" : "off");
+    return false;
   }
   // Build digit queue consumed one per KEYPAD_COMMAND received after the ACK.
   this->output_select_keys_.clear();
@@ -1092,6 +1221,7 @@ void CrowAlarmPanel::set_output(uint8_t output, bool state) {
   this->output_select_state_ = OutputSelectState::OUTPUT_PENDING;
   this->output_select_state_enter_ms_ = millis();
   this->keypress(KEY_OUTPUT);
+  return true;
 }
 
 void CrowAlarmPanel::set_zone_bypass(uint8_t zone, bool state) {
@@ -1162,22 +1292,32 @@ void CrowAlarmPanel::send_packet(uint8_t type, const std::vector<uint8_t> &data)
     ESP_LOGW(TAG, "No keypad address configured — cannot send packet (passive monitor mode)");
     return;
   }
+  if (!this->wait_for_bus_idle_()) {
+    return;
+  }
+  this->transmit_packet_(type, data);
+}
+
+bool CrowAlarmPanel::wait_for_bus_idle_() {
+  uint32_t start_ms = millis();
+  while (!this->is_bus_idle_()) {
+    if (millis() - start_ms > 5000) {
+      ESP_LOGW(TAG, "Timeout waiting for bus idle before sending packet");
+      return false;
+    }
+    delay(2);
+    yield();
+  }
+  return true;
+}
+
+void CrowAlarmPanel::transmit_packet_(uint8_t type, const std::vector<uint8_t> &data) {
   std::vector<uint8_t> packet;
   packet.push_back(BOUNDARY);
   packet.push_back(type);
   packet.push_back(this->keypad_address_);
   packet.insert(packet.end(), data.begin(), data.end());
   packet.push_back(BOUNDARY);
-
-  uint32_t start_ms = millis();
-  while (!this->is_bus_idle_()) {
-    if (millis() - start_ms > 5000) {
-      ESP_LOGW(TAG, "Timeout waiting for bus idle before sending packet");
-      return;
-    }
-    delay(2);
-    yield();
-  }
 
   ESP_LOGD(TAG, "Sending packet: [%s]", format_hex_pretty(packet).c_str());
   this->send_packet_blocking_(packet);
