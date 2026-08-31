@@ -533,6 +533,20 @@ The previous code had the same recognition gap (unknown patterns were logged and
 this is not a regression, but a stay-mode capture confirming the actual broadcast bytes would
 settle it.
 
+## User-reported field pattern: disarm reliable right after arming, retries after hours armed (2026-08-31)
+
+**Source:** user report from real-world usage (not a scripted trace session), checked against the frigate long-term logger ([[project-crow-alarm-protocol-trace]]) for 2026-08-31 01:42–01:44 **UTC** (the logger stamps lines in UTC regardless of the host's local NZST clock — see the `protocol_investigations.md` `Unknown [91.]` entry's 2026-08-31 update for how that was confirmed).
+
+**Observed facts:** in the corroborating window, the panel had been armed away since sometime before `18:33:56` on 2026-08-30 (its last confirmed `Disarmed` broadcast before that) — armed via a physical keypad, not this integration's `arm_away()` (no `Arm away` trigger line appears anywhere earlier in the visible log). The `01:42:07` `disarm()` call against that multi-hour-armed state hit the full `CODE_ENTER_PENDING` retry sequence — 6/6 retries, ~42s to resolve, backoff 1s→13s — before a genuine `Disarmed` `ARMED_STATE` broadcast confirmed it. Two follow-up cycles run through this integration immediately after (`01:43:02` arm away → `01:43:34` disarm, 32s later; `01:43:56` arm away) both resolved on the first attempt with no retries at all.
+
+**Relation to prior findings:** this does not contradict "Gap-timing lead conclusively dead" (2026-08-05, logs-44/23) above — that investigation tested gaps of single- to double-digit *seconds* within rapid scripted arm/disarm test cycles and found no correlation at that scale. It never tested an armed period of *hours*, since every prior trace session was a short deliberate test run; a multi-hour armed duration is a distinct, untested variable.
+
+**Inference (low confidence — one paired example, plus a user-reported recurring pattern):** consistent with the existing "session-level bad state"/controller-degradation theory (2026-08-19 episode, "Retry backoff + intent-matched ARMED_STATE resolution" above) if degradation episodes become more likely the longer the controller/bus has been running in a given state — but equally consistent with something disarm-specific (e.g. the controller doing different internal bookkeeping for a disarm request after being armed a long time vs. moments after arming). This single example doesn't distinguish between the two.
+
+**Possible shared cause:** `protocol_investigations.md`'s `CURRENT_TIME` section has a 2026-08-31 update describing the panel stuck continuously broadcasting an invalid `day/month value 31/16` from `11:59:55` UTC on 2026-08-30 onward — still ongoing as of the last check, `18:33:56`'s last-disarmed timestamp and the `01:42:07` failed disarm both fall inside that window. If the panel is genuinely in an abnormal internal state for that whole span (rather than this being routine per-broadcast noise), it's a plausible shared root cause for both symptoms — see that entry for the reasoning and its own caveats. Not proven; a disarm attempted while that stuck state is still active would be the next useful data point either way.
+
+**Practical takeaway:** worth deliberately capturing next: a disarm attempt following a known multi-hour armed period, with a note of exactly how long the panel had been armed, to build more than one data point. No code change proposed — the existing retry/backoff machinery already handles this case correctly (resolved in 42s here); this is purely an open root-cause question.
+
 ## Notes
 
 - ARM/STAY/DISARM sequences are simpler than OUTPUT because there's no ACK handshake

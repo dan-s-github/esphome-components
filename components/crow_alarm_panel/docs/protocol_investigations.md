@@ -351,6 +351,22 @@ This does *not* explain why the "severe" behavior (multiple corrupted broadcasts
 
 **Practical takeaway:** narrows, rather than replaces, the previous entry's conclusion — still "by design" in the sense of being deterministic and tied to the panel's own clock/broadcast logic rather than random bus noise, but the day-over-day recurrence specifically is adequately explained by (per-cycle phase trigger) + (stable clock offset), so it shouldn't be read as independent evidence of a separate daily-scheduled trigger condition. No code change proposed.
 
+### Update (2026-08-31): a new, far more persistent variant — `day/month value 31/16` stuck continuously for 18+ hours, still ongoing; overlaps the disarm-retry-storm entry in `arm_disarm_state_machine.md`
+
+**Source:** the frigate-hosted long-term capture (`crow-alarm-logger`, [[project-crow-alarm-protocol-trace]]), UTC timestamps (see the `Unknown [91.]` section's 2026-08-31 update above for how the logger's timezone was confirmed).
+
+**Findings (observed facts):** every prior entry in this section characterizes the unrecoverable `invalid day/month value` variant as either a low background rate (90 occurrences in 62 hours, ~1.45/hour, 2026-08-19 update) or short "severe" bursts lasting a few minutes (2026-08-05 update). This session shows something categorically different: starting `2026-08-30 11:59:55` UTC, every single `CURRENT_TIME` broadcast — one every ~15s, no exceptions — has decoded `day/month` as exactly `31/16` (`0x1F`/`0x10`), continuously, and is **still ongoing** as of the last check (`2026-08-31 05:56:40` UTC, 3619 occurrences logged, ~17h57m elapsed). The lower time fields keep incrementing normally throughout (the byte before `0x1F` cycles `00→0F→1E→2D` every 15s as expected for a healthy running counter) — only `day`/`month` are frozen at this specific invalid pair. The logger process itself has been running continuously since `2026-08-30 05:04:56` UTC (per its own start line), nearly 7h before this began, ruling out a service-restart artifact.
+
+Immediately before onset: at `11:58:55` a `recovered doubled-bit glitch` fires and decodes to `Controller time update: Sunday 2026-08-30 21:51:01` — a valid-looking recovery, but with the already-documented wrong-minutes defect (real time was ~11:58 UTC, not 21:51) rather than anything new. At `11:59:10`, one wildly invalid `day/month value 120/32` frame appears (not a value seen in any prior entry in this section). By `11:59:55` it settles into the constant `31/16` and hasn't moved since. A `12:00:40` `Unknown [fe.]` frame — the same RX-corruption signature documented in the section below — lands 45s after onset.
+
+The disarm retry storm documented in `arm_disarm_state_machine.md`'s "User-reported field pattern" entry (`2026-08-31 01:42:07`–`49` UTC) falls entirely inside this window, ~13h43m after onset.
+
+**Inference (low-medium confidence):** the steadily-incrementing lower time field alongside a frozen, specific invalid `day`/`month` pair argues against ordinary per-broadcast bit noise (which would be expected to vary sample-to-sample, as every previously-documented "severe" burst did) and more for the panel having latched into a genuinely bad internal date/month register that it now honestly (not corruptly) keeps re-broadcasting — i.e. this may not be a "glitch" in the RX/bus-corruption sense this section otherwise documents at all, but a real fault state on the panel side. Whether it's related to the `11:58:55` recovery event immediately preceding it, or coincidental timing, isn't established. Given the disarm-retry entry's own low-confidence "controller-side degradation" hypothesis, a controller stuck in *some* abnormal internal state for 18+ hours — of which this is the one directly observable symptom — is at least a plausible shared root cause for both, though nothing here proves disarm reliability is actually affected by *this specific* symptom rather than a separate concurrent issue.
+
+**Assumption (unverified):** whether this state self-clears (and when), whether it recurs, and whether it's the same underlying condition as the previously-documented "severe" bursts (just one that never ended) or a distinct failure mode entirely, are all open. No other running instance of this repo's captures has shown a stuck period anywhere near this long.
+
+**Practical takeaway:** worth checking, next time this is investigated, (1) whether the stuck state has since cleared and if so when/what coincided with recovery, and (2) whether a fresh disarm attempt *right now*, while the panel is still in this state, reproduces the retry pattern — a second matching data point while the panel is in a directly observable, ongoing abnormal state would meaningfully strengthen (or weaken, if it disarms cleanly) the shared-cause hypothesis. No code change proposed — existing behavior (discard the frame, retry/backoff for disarm) is already safe under this condition.
+
 ## `Unknown [ff.]`/`[fe.]` RX decode corruption still recurring after the 2026-07-12 ISR fix
 
 `arm_disarm_state_machine.md`'s "Root-cause candidate: hardware-ACK release corrupts our own RX decode under rapid retransmission (2026-07-12)" entry identified this signature (a burst of `Unknown [ff.]`/`[fe.]` frames, decoded correctly by a passive monitor at the same moment but garbled on the active interface) and applied a fix to `CrowAlarmPanelStore::interrupt()`, validated against `logs-12/37` as showing zero occurrences in that one session.
@@ -403,6 +419,18 @@ This does not currently appear to cause the `CODE_ENTER_PENDING` arm/disarm fail
 
 **Practical takeaway:** no code change proposed. The registration-storm correlation is now real evidence rather than speculation, but still not proven causal (which direction, if either, is cause vs. effect isn't established) — worth deliberately targeting in a future capture (e.g. watching for `ff.`/`fe.` bursts specifically around forced re-registrations). `0x8A` should be logged if seen again but not acted on.
 
+### Update (2026-08-31): 24h background volume is far above any previously documented session; not gated by the `CURRENT_TIME` day/month-stuck state
+
+**Source:** the frigate-hosted long-term capture (`crow-alarm-logger`, [[project-crow-alarm-protocol-trace]]), 24h UTC window 2026-08-30 05:48 → 2026-08-31 05:48 (see the `Unknown [91.]` section's 2026-08-31 update for how the logger's UTC timestamping was confirmed).
+
+**Findings (observed facts):** 508 `Unknown [ff.]` + 62 `Unknown [fe.]` = 570 occurrences in 24h. Every prior session characterized in this section counted these in single or low-double digits — the largest on record (`logs-11`, the original fix's source trace) was 28. Hourly counts range 1–68 with no clean pattern; comparing against the `CURRENT_TIME` section's 2026-08-31 update (panel stuck broadcasting an invalid `day/month value 31/16` continuously from `11:59:55` UTC onward) shows this isn't gated by that state either — 139 occurrences (~20/hour) in the ~7h *before* the stuck-date state began, 431 (~24/hour) during the ~18h after, a mild increase but not the step-change a shared trigger would suggest.
+
+**Inference (low confidence):** whatever is driving this session's much higher background rate is apparently independent of the stuck-date condition — two separate anomalies happening to overlap in time, rather than one explaining the other. Given every previous session in this document's record was a short (under ~2h) deliberate test capture, it's also possible this rate has been the ongoing normal background level for this installation all along and just was never measured over a full 24h window before — the existing "session badness continuum" framing (`arm_disarm_state_machine.md`) was built entirely from short sessions and may have undersampled the long-run rate.
+
+**Assumption (unverified):** whether 500+/24h is new (a regression, hardware degradation, new bus interference source) or has always been the steady-state rate for this specific installation is not established — no long-duration baseline exists from before this capture to compare against.
+
+**Practical takeaway:** no code change proposed. Worth checking future long-term pulls for whether this rate holds steady, and whether it's specific to this installation (a from-scratch capture on a different panel install, if one ever becomes available, would help separate "always been like this here" from "something changed here recently").
+
 ## `Unknown [91.]` — new unlabeled packet type
 
 **Source:** `traces/esphome-aap-alarm-interface-logs-34.txt`, a ~1h47m standard-debug-level session with four keypads live (`AAP`, `ESPHome`, `Control 4`, `IP`), otherwise unremarkable (normal disarmed-state zone activity, the already-documented `CURRENT_TIME` glitch, one controller reset with the usual re-registration signature).
@@ -428,3 +456,67 @@ Meaning is not established. Candidates not distinguished by this data: a status/
 ### Practical takeaway
 
 No code change proposed — `0x91` correctly falls through to the `default:` "Unknown" branch already, and nothing here indicates it needs special handling yet. Logged here so it's recognized (not mistaken for noise, and not confused with the `0xff`/`0xfe`/`0x8A` corruption signatures above) if seen again in a future capture; a repeat occurrence with a fixed period or a clearer address correlation would be the next useful data point.
+
+### Update (2026-08-31): 17 more occurrences from the long-term logger; address byte and poll-slot position move together with zero exceptions
+
+**Source:** the frigate-hosted long-term capture (`crow-alarm-logger`, [[project-crow-alarm-protocol-trace]]), standard-debug level, four keypads live (`AAP`, `ESPHome`, `Control 4`, `IP`), reviewed for the 24h window 2026-08-30 05:48 → 2026-08-31 05:48 **UTC** (the logger's timestamps are UTC even though the host itself runs NZST — verified by comparing the host's local `date` against the log's own latest line, a clean 12h offset; an earlier pass at this update mistakenly built its "24h" cutoff from the host's local time and so only covered ~12h and 6 occurrences — corrected here).
+
+**Findings (observed facts):**
+
+17 occurrences, not the three seen in the original `logs-34` capture:
+
+```sh
+2026-08-30 06:03:55.773  91.82.01.46.81.00.80.11 (7)
+2026-08-30 07:39:41.073  91.83.01.46.81.00.80.11 (7)
+2026-08-30 07:41:55.934  91.83.01.46.81.00.80.11 (7)
+2026-08-30 09:00:10.921  91.82.01.46.81.00.80.11 (7)
+2026-08-30 09:23:55.719  91.82.01.46.81.00.80.11 (7)
+2026-08-30 10:04:40.737  91.83.01.46.81.00.80.11 (7)
+2026-08-30 12:23:10.563  91.83.01.46.81.00.80.11 (7)
+2026-08-30 14:17:58.144  91.82.01.46.81.00.80.11 (7)
+2026-08-30 14:19:25.697  91.83.01.46.81.00.80.11 (7)
+2026-08-30 16:47:55.488  91.82.01.46.81.00.80.11 (7)
+2026-08-30 17:14:25.466  91.82.01.46.81.00.80.11 (7)
+2026-08-30 23:42:40.524  91.82.01.46.81.00.80.11 (7)
+2026-08-30 23:57:55.577  91.82.01.46.81.00.80.11 (7)
+2026-08-31 01:33:55.520  91.83.01.46.81.00.80.11 (7)
+2026-08-31 03:31:40.970  91.83.01.46.81.00.80.11 (7)
+2026-08-31 04:08:56.074  91.83.01.46.81.00.80.11 (7)
+2026-08-31 04:21:25.953  91.83.01.46.81.00.80.11 (7)
+```
+
+Same payload as `logs-34` (`01.46.81.00.80.11`), same two leading-byte values (`0x82`/`0x83`: 8 and 9 occurrences respectively). Gaps between occurrences range from 1m27s to 6h28m15s with no clean fixed period, and no clustering by time of day.
+
+Unlike `logs-34` — where both `0x82` and `0x83` landed in the same poll-cycle slot (immediately after the `AAP Keypad` ping, before `ESPHome Keypad`'s) — here the slot moves with the leading byte, and does so with **zero exceptions across all 17 samples**: every `0x82` occurrence sits in that same AAP→ESPHome slot; every `0x83` occurrence instead lands immediately after the `Control 4 Keypad` (`0x06`) ping, two poll-slots later in the cycle.
+
+**Inference (medium confidence):** this strengthens the `data[0] = address` hypothesis from `logs-34` — if the leading byte is `0x80 | addr` for a device not visible via `KEYPAD_PING` (`0x82` → addr `0x02`, `0x83` → addr `0x03`), then each one showing up right after its numerically-nearest active keypad's poll slot (addr `0x00` for `0x02`, addr `0x06` for `0x03`) is consistent with the controller polling addresses in order and this being the response from two distinct, otherwise-silent bus devices rather than one device or corruption noise. A clean 17/17 slot/byte correlation argues fairly strongly against the `0x8A`-style decode-corruption explanation, since corruption wouldn't be expected to track a consistent per-byte-value slot this reliably over a 24h span.
+
+**Assumption (unverified):** still only two leading-byte values (`0x82`, `0x83`) seen, ever — no `0x84` or higher, so a third/fourth silent device (if the address hypothesis holds) either doesn't exist or hasn't been caught yet. `logs-34`'s original three occurrences didn't show this slot/byte correlation, but that capture only spanned ~1h47m and happened to catch both bytes in the same relative slot by chance — with 17 samples now behind it, that earlier capture looks like the outlier, not this one.
+
+**Practical takeaway:** no code change proposed. Worth specifically checking, in the next long-term capture pull, whether a `0x84`/etc. leading byte ever appears (which would further support the per-address hypothesis).
+
+### Update (2026-08-31, cont.): `0x91` has siblings sharing the identical payload — very likely one packet type with a corrupted *type* byte, not five distinct unlabeled types; poll-slot correlation holds for all of them
+
+**Source:** same 24h UTC capture as the update above, widened to search for the full `01.46.81.00.80.11` tail regardless of leading type byte.
+
+**Findings (observed facts):** 40 occurrences, not 17 — the tail payload and the `0x82`/`0x83` addressing scheme are shared by five different leading (type) bytes:
+
+| Type byte | Count | Bits vs. `0x93` |
+| --- | --- | --- |
+| `0x91` | 17 | 1 bit (bit 1) |
+| `0x93` | 10 | — |
+| `0x13` | 6 | 1 bit (bit 7) |
+| `0x83` | 4 | 1 bit (bit 4) |
+| `0xa3` | 3 | 2 bits (via `0x83`, 1 bit each hop) |
+
+Every variant is a single-bit flip from `0x93` except `0xa3`, which is a single-bit flip from `0x83` (itself one flip from `0x93`) — i.e. `0x93` minimizes total Hamming distance across all 40 samples, weighted by frequency (33, vs. 39 measured from `0x91` despite `0x91` being individually the most common single value).
+
+The poll-slot correlation from the update above holds with **zero exceptions across all 40**, regardless of which type byte is present — and a third address value shows up for the first time: `0x80` (5 occurrences, all type `0x13`) lands immediately after the `Controller`'s own `CURRENT_TIME` broadcast, i.e. the very first slot of the poll cycle, before `AAP Keypad`'s own ping. `0x82` (16 occurrences) still always follows `AAP Keypad`'s ping; `0x83` (19 occurrences) still always follows `Control 4 Keypad`'s ping.
+
+**Inference (medium-high confidence):** this is much better explained as **one packet type suffering type-byte bit corruption** than as five distinct unlabeled types — the shared payload, shared addressing scheme, and shared poll-slot behavior across all five type-byte variants would be a remarkable coincidence otherwise, whereas single/double-bit corruption on one byte of an otherwise-intact frame is exactly the failure mode this document already characterizes elsewhere (`CURRENT_TIME` day/month/year doubling, `Unknown [ff.]`/`[fe.]`). `0x93` is the best-supported candidate for the true, uncorrupted type byte by the bit-distance argument, though `0x91` being more frequent than `0x93` itself is unexplained by that alone (a real byte value is not usually rarer than its own corruption) — possibly a bit position more prone to flipping than others, consistent with the deterministic, non-random corruption patterns already documented for other fields on this bus.
+
+This also revises the `0x80|addr` framing from the previous update: `0x80` (addr `0x00`) would collide with `AAP Keypad`'s own bus address, but this packet's `0x80` instance appears in the *first* poll slot (before `AAP Keypad`'s ping), not in place of or overlapping it — so the byte more likely encodes a **poll-cycle slot index** than a literal shared keypad bus address, resolving what would otherwise be an address collision.
+
+**Assumption (unverified):** which type byte (if any of these) is the true, uncorrupted value, and what this packet actually represents, are both still open — `0x93`/`01.46.81.00.80.11` doesn't match any pattern in `keypad_protocol_types.md`'s known-type catalogue. The mechanism producing type-byte-specific (rather than random) corruption is likewise unestablished.
+
+**Practical takeaway:** no code change proposed — `default:` already handles every variant safely. If pursuing this further, `0x93.80...`, `0x91.80...`, `0x83.80...`, or `0xa3.80...` (the `0x80`-slot combinations not yet observed with any type byte but `0x13`) would be useful confirming data points, as would any type byte not a bit-neighbor of `0x93` appearing in this same payload family.
