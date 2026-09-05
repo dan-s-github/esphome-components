@@ -178,12 +178,11 @@ void IRAM_ATTR HOT CrowAlarmPanelStore::interrupt(CrowAlarmPanelStore *arg) {
       // buffer[0]=type, buffer[1]=addr (for addressed types), buffer[frame_len-1]=0x7E.
       const uint8_t frame_type = arg->buffer[0];
       const uint8_t frame_addr = arg->buffer[1];
-      //  Save data into the frame queue (see the queue's ownership-protocol comment in the
+      //  Save the frame into the queue (see the queue's ownership-protocol comment in the
       //  header). pending is computed before the head increment, so pending > 0 means this
-      //  frame completed while an earlier one was still unconsumed — exactly the case where
-      //  the old single-buffer scheme silently overwrote (lost) a frame. Zero-length frames
-      //  (boundary matched with < 8 bits accumulated, i.e. noise) are skipped without
-      //  queueing, matching the old scheme where data_length = 0 was invisible to loop().
+      //  frame completed while an earlier one was still unconsumed (counted as backlog below).
+      //  Zero-length frames (boundary matched with < 8 bits accumulated, i.e. noise) are
+      //  skipped without queueing.
       const uint8_t pending = (uint8_t) (arg->frame_head_ - arg->frame_tail_);
       if (frame_len == 0) {
         // fall through to the reset below
@@ -207,8 +206,8 @@ void IRAM_ATTR HOT CrowAlarmPanelStore::interrupt(CrowAlarmPanelStore *arg) {
       // Hardware ACK: drive DAT low for one clock cycle only for per-keypad frame types
       // addressed to us. Broadcast frame payload bytes must never be treated as an address.
       // Deliberately unconditional on the queue outcome: an overflow-dropped frame is still
-      // ACKed, matching the old overwrite path's behavior — withholding the ACK would trigger
-      // the controller's rapid-retransmission mode (logs-11/36) instead.
+      // ACKed — withholding the ACK would trigger the controller's rapid-retransmission mode
+      // instead (logs-11/36).
       if (frame_len >= 3) {
         const bool addressed_type = (frame_type == KEYPAD_COMMAND || frame_type == KEYPAD_STATE ||
                                      frame_type == OUTPUT_SELECT_ACK || frame_type == KEYPAD_PING ||
@@ -313,10 +312,9 @@ void CrowAlarmPanel::loop() {
   }
 
   if (this->store_.frame_head_ != this->store_.frame_tail_) {
-    // Pop one frame per loop() pass (same pacing as the old single-buffer scheme). Copy the
-    // slot out first, then release it back to the ISR with the tail increment — no lock, per
-    // the queue's ownership-protocol comment in the header (InterruptLock is core-local and
-    // never protected this cross-core handoff anyway).
+    // Pop one frame per loop() pass. Copy the slot out first, then release it back to the ISR
+    // with the tail increment — no lock, per the queue's ownership-protocol comment in the
+    // header (InterruptLock is core-local and never protected this cross-core handoff anyway).
     const uint8_t slot = (uint8_t) (this->store_.frame_tail_ & (CrowAlarmPanelStore::FRAME_QUEUE_LENGTH - 1));
     const uint8_t frame_len = this->store_.frame_queue_len_[slot];
     uint8_t local_frame[BUFFER_LENGTH];
@@ -325,7 +323,7 @@ void CrowAlarmPanel::loop() {
 
     const uint16_t backlog = this->store_.frame_backlog_events_;
     if (backlog != this->frame_backlog_reported_) {
-      ESP_LOGD(TAG, "Frame completed while previous still queued (lost under pre-queue scheme): %u total", backlog);
+      ESP_LOGD(TAG, "Frame completed while previous still queued: %u total", backlog);
       this->frame_backlog_reported_ = backlog;
     }
     const uint16_t overflow = this->store_.frame_overflow_events_;

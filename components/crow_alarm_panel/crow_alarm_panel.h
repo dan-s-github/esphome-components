@@ -116,25 +116,19 @@ class CrowAlarmPanelStore {
 
   uint8_t buffer[BUFFER_LENGTH];
 
-  // Completed-frame queue, ISR producer (core 0) → loop() consumer (core 1). Replaces the old
-  // single buffer2/data_length mailbox, which the ISR overwrote unconditionally — a loop()
-  // stalled past one inter-frame gap (e.g. by the raw-bit-trace ESP_LOGI, see
-  // protocol_investigations.md 2026-09-02) silently lost the unread frame, including
-  // KEYPAD_PINGs, tripping the 60s registration watchdog. Ownership protocol (no lock needed;
-  // InterruptLock is core-local and would not help anyway): the ISR writes only into free
-  // slots (frame_head_ - frame_tail_ < FRAME_QUEUE_LENGTH) and publishes each with a
-  // frame_head_ increment after the slot is filled; loop() reads only slot [frame_tail_] and
-  // releases it with a frame_tail_ increment after copying it out. Head/tail are free-running
-  // uint8_t counters (queue length divides 256, so wraparound is safe); slot index is
+  // Completed-frame queue: ISR (core 0) produces, loop() (core 1) consumes. No lock needed
+  // (InterruptLock is core-local): the ISR only writes to free slots (frame_head_ - frame_tail_ <
+  // FRAME_QUEUE_LENGTH) and publishes via frame_head_++; loop() only reads slot [frame_tail_] and
+  // releases it via frame_tail_++ after copying it out. Head/tail are free-running uint8_t
+  // counters (queue length divides 256, so wraparound is safe); slot index is
   // counter & (FRAME_QUEUE_LENGTH - 1).
   static const uint8_t FRAME_QUEUE_LENGTH = 4;  // must be a power of two
   uint8_t frame_queue_[FRAME_QUEUE_LENGTH][BUFFER_LENGTH];
   uint8_t frame_queue_len_[FRAME_QUEUE_LENGTH];
   volatile uint8_t frame_head_{0};
   volatile uint8_t frame_tail_{0};
-  // Diagnostics: backlog counts frames completed while a previous one was still queued — i.e.
-  // exactly the events where the old single-buffer scheme would have lost a frame. Overflow
-  // counts frames actually dropped because the queue was full (expected to stay 0 in practice).
+  // backlog: frame completed while the previous one was still queued. overflow: frame dropped
+  // because the queue was full (expected to stay 0 in practice).
   volatile uint16_t frame_backlog_events_{0};
   volatile uint16_t frame_overflow_events_{0};
 
