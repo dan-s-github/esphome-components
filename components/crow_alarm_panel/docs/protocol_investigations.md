@@ -351,6 +351,66 @@ This does *not* explain why the "severe" behavior (multiple corrupted broadcasts
 
 **Practical takeaway:** narrows, rather than replaces, the previous entry's conclusion — still "by design" in the sense of being deterministic and tied to the panel's own clock/broadcast logic rather than random bus noise, but the day-over-day recurrence specifically is adequately explained by (per-cycle phase trigger) + (stable clock offset), so it shouldn't be read as independent evidence of a separate daily-scheduled trigger condition. No code change proposed.
 
+### Update (2026-08-31): a new, far more persistent variant — `day/month value 31/16` stuck continuously for 18+ hours, still ongoing; overlaps the disarm-retry-storm entry in `arm_disarm_state_machine.md`
+
+**Source:** the frigate-hosted long-term capture (`crow-alarm-logger`, [[project-crow-alarm-protocol-trace]]), UTC timestamps (see the `Unknown [91.]` section's 2026-08-31 update above for how the logger's timezone was confirmed).
+
+**Findings (observed facts):** every prior entry in this section characterizes the unrecoverable `invalid day/month value` variant as either a low background rate (90 occurrences in 62 hours, ~1.45/hour, 2026-08-19 update) or short "severe" bursts lasting a few minutes (2026-08-05 update). This session shows something categorically different: starting `2026-08-30 11:59:55` UTC, every single `CURRENT_TIME` broadcast — one every ~15s, no exceptions — has decoded `day/month` as exactly `31/16` (`0x1F`/`0x10`), continuously, and is **still ongoing** as of the last check (`2026-08-31 05:56:40` UTC, 3619 occurrences logged, ~17h57m elapsed). The lower time fields keep incrementing normally throughout (the byte before `0x1F` cycles `00→0F→1E→2D` every 15s as expected for a healthy running counter) — only `day`/`month` are frozen at this specific invalid pair. The logger process itself has been running continuously since `2026-08-30 05:04:56` UTC (per its own start line), nearly 7h before this began, ruling out a service-restart artifact.
+
+Immediately before onset: at `11:58:55` a `recovered doubled-bit glitch` fires and decodes to `Controller time update: Sunday 2026-08-30 21:51:01` — a valid-looking recovery, but with the already-documented wrong-minutes defect (real time was ~11:58 UTC, not 21:51) rather than anything new. At `11:59:10`, one wildly invalid `day/month value 120/32` frame appears (not a value seen in any prior entry in this section). By `11:59:55` it settles into the constant `31/16` and hasn't moved since. A `12:00:40` `Unknown [fe.]` frame — the same RX-corruption signature documented in the section below — lands 45s after onset.
+
+The disarm retry storm documented in `arm_disarm_state_machine.md`'s "User-reported field pattern" entry (`2026-08-31 01:42:07`–`49` UTC) falls entirely inside this window, ~13h43m after onset.
+
+**Inference (low-medium confidence):** the steadily-incrementing lower time field alongside a frozen, specific invalid `day`/`month` pair argues against ordinary per-broadcast bit noise (which would be expected to vary sample-to-sample, as every previously-documented "severe" burst did) and more for the panel having latched into a genuinely bad internal date/month register that it now honestly (not corruptly) keeps re-broadcasting — i.e. this may not be a "glitch" in the RX/bus-corruption sense this section otherwise documents at all, but a real fault state on the panel side. Whether it's related to the `11:58:55` recovery event immediately preceding it, or coincidental timing, isn't established. Given the disarm-retry entry's own low-confidence "controller-side degradation" hypothesis, a controller stuck in *some* abnormal internal state for 18+ hours — of which this is the one directly observable symptom — is at least a plausible shared root cause for both, though nothing here proves disarm reliability is actually affected by *this specific* symptom rather than a separate concurrent issue.
+
+**Assumption (unverified):** whether this state self-clears (and when), whether it recurs, and whether it's the same underlying condition as the previously-documented "severe" bursts (just one that never ended) or a distinct failure mode entirely, are all open. No other running instance of this repo's captures has shown a stuck period anywhere near this long.
+
+**Practical takeaway:** worth checking, next time this is investigated, (1) whether the stuck state has since cleared and if so when/what coincided with recovery, and (2) whether a fresh disarm attempt *right now*, while the panel is still in this state, reproduces the retry pattern — a second matching data point while the panel is in a directly observable, ongoing abnormal state would meaningfully strengthen (or weaken, if it disarms cleanly) the shared-cause hypothesis. No code change proposed — existing behavior (discard the frame, retry/backoff for disarm) is already safe under this condition.
+
+### Update (2026-09-01): the stuck state did not survive the 2026-08-31 OTA cleanly — it recurred ~4h post-reboot, then self-cleared without a further reboot
+
+**Source:** the frigate long-term logger ([[project-crow-alarm-protocol-trace]]), UTC timestamps, spanning the tail of the rotated `crow-alarm.log.1` (through `2026-08-31 11:27:40`) and the full current `crow-alarm.log` (`2026-08-31 12:51:33` onward, i.e. through the following day).
+
+**Findings (observed facts):** the previous entry's "still ongoing" `31/16` stuck state was last confirmed active shortly before the OTA reboot at `2026-08-31 07:27:38` UTC (per [[project-crow-alarm-protocol-trace]]). It did **not** reappear immediately after the reboot — the first `crow_alarm_panel` activity post-boot (`07:28:02`–`.04`, a clean single registration cycle) shows no `invalid minutes` warnings. But a second episode began at `11:25:55` UTC, ~4h after the reboot, again logging `invalid minutes-since-midnight value 1470`/`1503` every ~15s with no exceptions through the last line before rotation (`11:27:40`, still ongoing at that cutoff). Unlike the first episode, this one is confirmed **not** present in the entire subsequent capture: zero `invalid minutes` lines anywhere in the current `crow-alarm.log`, which starts at `12:51:33` — meaning it cleared on its own, without another reboot, sometime in the ≤1h24m between `11:27:40` and `12:51:33`. No further recurrence through the following ~17.5h of capture to `2026-09-01 06:26`.
+
+**Inference (medium confidence):** the reboot did not permanently prevent recurrence — the fault state came back within hours — which argues against a purely interface-side latch (e.g. something in our own decode/state holding a stale value) and for a panel-side condition, consistent with this entry's original "genuinely bad internal date/month register" hypothesis rather than an RX-corruption artifact. However, this second episode was dramatically shorter than the first (bounded well under the ~90 minutes between the last bad line and the first clean window, vs. the first episode's 18+ hours) and, critically, cleared **without any reboot** — which the first episode never did in the entire period it was observed. That the state can resolve on its own contradicts a simple "stuck until power-cycled" model and suggests either a self-correcting internal timer/counter on the panel, or two distinct triggers/durations sharing the same symptom.
+
+**Assumption (unverified):** what caused the second episode's onset (`11:25:55`, no adjacent glitch/registration event stands out as a trigger in the data reviewed so far) and what caused its self-clearing are both open. Whether episode duration correlates with anything observable (time of day, bus activity level, a preceding glitch) has only two data points now and isn't enough to characterize.
+
+**Practical takeaway:** no code change proposed — same as the original entry. Worth checking in future captures: whether short (sub-2h), self-clearing episodes are actually the common case and the first 18+h episode was the outlier, or vice versa; a capture that brackets both the true onset and the true clearing moment of one episode (this session had the tail of the OTA-adjacent gap rotate out before either edge was pinned down precisely) would settle that.
+
+### Update (2026-09-03): the "wrong minutes" defect (2026-08-10 entry) is explained — `minutes_since_midnight` corrupts in exact 32-minute quanta, not arbitrarily
+
+**Source:** every `Current time: recovered doubled-bit glitch` line in the frigate long-term capture, 2026-08-30 through 2026-09-03 08:36 UTC (1972 occurrences), parsed programmatically: for each, `minutes_since_midnight` (`data[1..2]`) was compared against the expected local time (host UTC receipt timestamp + 12h for NZST — the frigate host's own zone; see [[reference-crow-alarm-frigate-logger]] for why the logger's timestamps themselves are UTC).
+
+**Findings (observed facts):** 1493/1972 (76%) decode to the exact correct minute (±0). Of the remaining 479, **100% land within ±1 minute of an exact multiple of 32** — deltas cluster tightly at 0, ±32, ±64, ±96, ±128 (e.g. −128: 85 occurrences, +64: 60, −127: 41, −64: 36, +32: 33, +96: 27 — the full distribution has no scatter outside this lattice). The ±1 is minute-boundary quantization noise from comparing an instantaneous broadcast against a live clock, not a separate error source. Byte-level inspection of the corrupted `data[2]` (low byte of `minutes_since_midnight`) confirms the mechanism directly: across a same-cycle sample its low 6 bits stayed frozen at a fixed value (e.g. `0x1F`/`31`, coincidentally the same value as the stuck day-glitch's `day` byte, apparently unrelated) while only bits 6–7 (worth 64 and 128) cycled through all four combinations — i.e. the corruption is confined to the top bits of that byte, exactly the two bit-weights (32 and 64, with 96/128/etc. as sums/carries of those) the delta lattice shows.
+
+These large-delta events are not steady-state background noise — they cluster inside short (~1–2 minute) transition bursts where the accompanying `seconds` byte is *also* invalid (`Current time has invalid seconds value 61/91`, or landing on the doubled `30/60/90` values) alongside occasional fully-unrecoverable `invalid day/month` lines in the same burst — i.e. these are instances of the already-documented "severe" variant (2026-08-05/08-19 updates above), not a new corruption class. One such burst was captured live this session: `2026-09-03 08:14:10`–`08:15:55` UTC (~1m45s, mixed invalid-seconds/invalid-day-month/large-delta-minutes lines with no gap in the otherwise-normal 15s ping cycle around it — no registration announce or watchdog trip nearby), immediately followed by the glitch's dominant phase shifting from `seconds=0x0F` (15) to `seconds=0x17` (23), where it has remained stable (one clean recovery per minute) through the end of this capture. This is at least the second observed instance of the phase-shift behavior described in the 2026-08-05 entry, and unlike that instance, this one has no adjacent registration event — weakening "shift is triggered specifically by registration announces" as the mechanism and supporting the more general "phase shifts after any severe-burst episode" framing.
+
+**Inference (high confidence on the pattern, medium on mechanism):** this directly answers the open question from the 2026-08-10 entry — the "wrong minutes" cases there (e.g. `13:19:01` logged vs. real `~15:26`, a −127 delta) are not independently/arbitrarily wrong; they're the same bit-position corruption documented here landing in a session that predates this analysis. The clean quantization to bit-weights 32/64/(128) is consistent with the same general fault family already characterized for `day`/`month`/`year` (a bit-alignment glitch inserting/dropping bits at a byte boundary) but manifesting as a partial-byte (top-bits-only) corruption in `minutes_since_midnight`'s low byte rather than a whole-byte doubling — a different symptom of a related underlying mechanism, not a coincidence, given both classes co-occur in the same severe bursts.
+
+**Practical takeaway:** no code change proposed — `CURRENT_TIME` isn't published to any entity, and the existing recovery logic correctly leaves `minutes_since_midnight` alone (it was never in scope for the day/month/year halving fix, and rightly so: unlike day/month/year, a partial-byte corruption here isn't reversible by a clean halve-and-cross-check). This closes the "unexplained" status of the 2026-08-10 wrong-minutes defect — it's now a characterized (if not fixed) instance of the severe-burst variant.
+
+### Update (2026-09-03, cont.): second independent phase-shift instance (`logs-35`), again with no registration/watchdog activity nearby
+
+**Source:** `traces/esphome-aap-alarm-interface-logs-35.txt`, a short (~10 min) manual `esphome logs` capture, `20:39:42`–`20:49:20` (device's own local-time bracket timestamps, not the frigate UTC wrapper).
+
+**Findings (observed facts):** a clean run of the mild variant at `seconds=0x17` (23) — six consecutive correct recoveries, `20:40:23` through `20:46:23` — is interrupted by a ~45s burst (`20:46:55`–`20:47:40`) containing, in order: one recovered-date-but-wrong-time occurrence (`54.05.04.9F.01...` → date correct, time printed `19:43:01` against a real `~20:46:55`, delta −63min — lands directly in the 32-minute lattice from the entry above, specifically the −64 bucket), one fully-unrecoverable `invalid day/month value 12/36` (notably: `data[4..6]` = `0x0C/0x24/0x68` all halve to `6/18/52` — `18` is still `>12`, i.e. this frame needed *two* halvings to reach a valid month, not one — a double-strength version of the usual single-bit-doubling glitch), and two more recovered-date occurrences both stuck on the same wrong `0x9F` minutes byte, each additionally carrying an invalid `seconds` value (`61`, `91`). Immediately after the burst, the mild variant resumes but at `seconds=0x1B` (27) instead of 23 — `20:48:27`, `20:49:27` — a second phase shift, this time 23→27 rather than the earlier-observed 15→23. `grep` across the entire file for registration announces or "No ping" watchdog lines returns zero matches — the four keypads' ping cycle is uninterrupted through the whole burst and shift.
+
+**Inference (medium-high confidence — strengthens the same-day finding above):** an independent, short manual capture reproducing both the 32-minute-quantized wrong-time pattern and a registration-free phase shift within 10 minutes of normal operation confirms neither is a rare/frigate-specific artifact — this is a frequent, easily-reproduced behavior. The double-halving `12/36` case is new: it suggests the same insertion mechanism can occasionally fire twice on one frame (two spurious bits instead of one), which the existing recovery code does not attempt to correct for (by design — halving twice on an already-uncertain frame would meaningfully increase the false-recovery risk the original 2026-08-05 fix was designed to avoid).
+
+**Practical takeaway:** no code change proposed. Confirms (rather than revises) the entries above; worth keeping `logs-35` on hand as a second, independently-captured reference sample for either finding.
+
+## Registration watchdog double-announce (fixed 2026-08-23, commit `374ab5b`) — confirmed no recurrence in ~22h of production traffic
+
+**Source:** the frigate long-term logger ([[project-crow-alarm-protocol-trace]]), comparing `crow-alarm.log.1` (pre-fix firmware, `2026-08-30 05:04`–`2026-08-31 07:27` UTC, i.e. before that day's OTA) against the same file's tail plus the current `crow-alarm.log` for the ~22h after the OTA landed (`2026-08-31 07:27:38` through `2026-09-01 06:26` UTC).
+
+**Findings (observed facts):** before the OTA, "No ping for 60 s, re-sending registration announce" (`crow_alarm_panel.cpp:1032` in that build) fires in duplicate/triplicate at the same or near-same timestamp dozens of times across the pre-OTA window — e.g. `07:35:40.854` and `.968` back-to-back, `13:21:40`/`:43`/`:44`/`:45` (four in 5s), consistent with the bug commit `374ab5b` describes (the watchdog re-tripping on the very next `loop()` pass because it only checked `last_ping_ms_`, not time since our own last announce). After the OTA: zero duplicate/rapid-fire announces in ~22h — every occurrence (`13:22:31`, `16:50:16`, `22:49:15`, `23:58:45` on 2026-08-31; none yet as of `2026-09-01 06:26`) is a single clean announce, each followed ~16–27s later by the expected `IP Keypad`/`AAP Keypad` re-registration and no repeat of our own announce.
+
+**Inference (high confidence):** the fix works in production, not just in code review — this is the first real-traffic confirmation since the 2026-08-23 commit. The underlying trigger (something disrupts controller polling for 60s+, prompting our watchdog and often coinciding with other keypads independently re-registering) is unaffected and still occurs on a similar cadence to before; only the redundant duplicate-announce artifact is gone.
+
+**Practical takeaway:** no further code change indicated. This does not touch the separate, still-open "registration storms co-occurring with disarm retries/`CURRENT_TIME` glitches" question discussed in `arm_disarm_state_machine.md`'s field-pattern entries and this document's `ff.`/`fe.` section below — this fix only removed a logging/announce-timing artifact of those episodes, not the episodes themselves.
+
 ## `Unknown [ff.]`/`[fe.]` RX decode corruption still recurring after the 2026-07-12 ISR fix
 
 `arm_disarm_state_machine.md`'s "Root-cause candidate: hardware-ACK release corrupts our own RX decode under rapid retransmission (2026-07-12)" entry identified this signature (a burst of `Unknown [ff.]`/`[fe.]` frames, decoded correctly by a passive monitor at the same moment but garbled on the active interface) and applied a fix to `CrowAlarmPanelStore::interrupt()`, validated against `logs-12/37` as showing zero occurrences in that one session.
@@ -403,6 +463,18 @@ This does not currently appear to cause the `CODE_ENTER_PENDING` arm/disarm fail
 
 **Practical takeaway:** no code change proposed. The registration-storm correlation is now real evidence rather than speculation, but still not proven causal (which direction, if either, is cause vs. effect isn't established) — worth deliberately targeting in a future capture (e.g. watching for `ff.`/`fe.` bursts specifically around forced re-registrations). `0x8A` should be logged if seen again but not acted on.
 
+### Update (2026-08-31): 24h background volume is far above any previously documented session; not gated by the `CURRENT_TIME` day/month-stuck state
+
+**Source:** the frigate-hosted long-term capture (`crow-alarm-logger`, [[project-crow-alarm-protocol-trace]]), 24h UTC window 2026-08-30 05:48 → 2026-08-31 05:48 (see the `Unknown [91.]` section's 2026-08-31 update for how the logger's UTC timestamping was confirmed).
+
+**Findings (observed facts):** 508 `Unknown [ff.]` + 62 `Unknown [fe.]` = 570 occurrences in 24h. Every prior session characterized in this section counted these in single or low-double digits — the largest on record (`logs-11`, the original fix's source trace) was 28. Hourly counts range 1–68 with no clean pattern; comparing against the `CURRENT_TIME` section's 2026-08-31 update (panel stuck broadcasting an invalid `day/month value 31/16` continuously from `11:59:55` UTC onward) shows this isn't gated by that state either — 139 occurrences (~20/hour) in the ~7h *before* the stuck-date state began, 431 (~24/hour) during the ~18h after, a mild increase but not the step-change a shared trigger would suggest.
+
+**Inference (low confidence):** whatever is driving this session's much higher background rate is apparently independent of the stuck-date condition — two separate anomalies happening to overlap in time, rather than one explaining the other. Given every previous session in this document's record was a short (under ~2h) deliberate test capture, it's also possible this rate has been the ongoing normal background level for this installation all along and just was never measured over a full 24h window before — the existing "session badness continuum" framing (`arm_disarm_state_machine.md`) was built entirely from short sessions and may have undersampled the long-run rate.
+
+**Assumption (unverified):** whether 500+/24h is new (a regression, hardware degradation, new bus interference source) or has always been the steady-state rate for this specific installation is not established — no long-duration baseline exists from before this capture to compare against.
+
+**Practical takeaway:** no code change proposed. Worth checking future long-term pulls for whether this rate holds steady, and whether it's specific to this installation (a from-scratch capture on a different panel install, if one ever becomes available, would help separate "always been like this here" from "something changed here recently").
+
 ## `Unknown [91.]` — new unlabeled packet type
 
 **Source:** `traces/esphome-aap-alarm-interface-logs-34.txt`, a ~1h47m standard-debug-level session with four keypads live (`AAP`, `ESPHome`, `Control 4`, `IP`), otherwise unremarkable (normal disarmed-state zone activity, the already-documented `CURRENT_TIME` glitch, one controller reset with the usual re-registration signature).
@@ -428,3 +500,161 @@ Meaning is not established. Candidates not distinguished by this data: a status/
 ### Practical takeaway
 
 No code change proposed — `0x91` correctly falls through to the `default:` "Unknown" branch already, and nothing here indicates it needs special handling yet. Logged here so it's recognized (not mistaken for noise, and not confused with the `0xff`/`0xfe`/`0x8A` corruption signatures above) if seen again in a future capture; a repeat occurrence with a fixed period or a clearer address correlation would be the next useful data point.
+
+### Update (2026-08-31): 17 more occurrences from the long-term logger; address byte and poll-slot position move together with zero exceptions
+
+**Source:** the frigate-hosted long-term capture (`crow-alarm-logger`, [[project-crow-alarm-protocol-trace]]), standard-debug level, four keypads live (`AAP`, `ESPHome`, `Control 4`, `IP`), reviewed for the 24h window 2026-08-30 05:48 → 2026-08-31 05:48 **UTC** (the logger's timestamps are UTC even though the host itself runs NZST — verified by comparing the host's local `date` against the log's own latest line, a clean 12h offset; an earlier pass at this update mistakenly built its "24h" cutoff from the host's local time and so only covered ~12h and 6 occurrences — corrected here).
+
+**Findings (observed facts):**
+
+17 occurrences, not the three seen in the original `logs-34` capture:
+
+```sh
+2026-08-30 06:03:55.773  91.82.01.46.81.00.80.11 (7)
+2026-08-30 07:39:41.073  91.83.01.46.81.00.80.11 (7)
+2026-08-30 07:41:55.934  91.83.01.46.81.00.80.11 (7)
+2026-08-30 09:00:10.921  91.82.01.46.81.00.80.11 (7)
+2026-08-30 09:23:55.719  91.82.01.46.81.00.80.11 (7)
+2026-08-30 10:04:40.737  91.83.01.46.81.00.80.11 (7)
+2026-08-30 12:23:10.563  91.83.01.46.81.00.80.11 (7)
+2026-08-30 14:17:58.144  91.82.01.46.81.00.80.11 (7)
+2026-08-30 14:19:25.697  91.83.01.46.81.00.80.11 (7)
+2026-08-30 16:47:55.488  91.82.01.46.81.00.80.11 (7)
+2026-08-30 17:14:25.466  91.82.01.46.81.00.80.11 (7)
+2026-08-30 23:42:40.524  91.82.01.46.81.00.80.11 (7)
+2026-08-30 23:57:55.577  91.82.01.46.81.00.80.11 (7)
+2026-08-31 01:33:55.520  91.83.01.46.81.00.80.11 (7)
+2026-08-31 03:31:40.970  91.83.01.46.81.00.80.11 (7)
+2026-08-31 04:08:56.074  91.83.01.46.81.00.80.11 (7)
+2026-08-31 04:21:25.953  91.83.01.46.81.00.80.11 (7)
+```
+
+Same payload as `logs-34` (`01.46.81.00.80.11`), same two leading-byte values (`0x82`/`0x83`: 8 and 9 occurrences respectively). Gaps between occurrences range from 1m27s to 6h28m15s with no clean fixed period, and no clustering by time of day.
+
+Unlike `logs-34` — where both `0x82` and `0x83` landed in the same poll-cycle slot (immediately after the `AAP Keypad` ping, before `ESPHome Keypad`'s) — here the slot moves with the leading byte, and does so with **zero exceptions across all 17 samples**: every `0x82` occurrence sits in that same AAP→ESPHome slot; every `0x83` occurrence instead lands immediately after the `Control 4 Keypad` (`0x06`) ping, two poll-slots later in the cycle.
+
+**Inference (medium confidence):** this strengthens the `data[0] = address` hypothesis from `logs-34` — if the leading byte is `0x80 | addr` for a device not visible via `KEYPAD_PING` (`0x82` → addr `0x02`, `0x83` → addr `0x03`), then each one showing up right after its numerically-nearest active keypad's poll slot (addr `0x00` for `0x02`, addr `0x06` for `0x03`) is consistent with the controller polling addresses in order and this being the response from two distinct, otherwise-silent bus devices rather than one device or corruption noise. A clean 17/17 slot/byte correlation argues fairly strongly against the `0x8A`-style decode-corruption explanation, since corruption wouldn't be expected to track a consistent per-byte-value slot this reliably over a 24h span.
+
+**Assumption (unverified):** still only two leading-byte values (`0x82`, `0x83`) seen, ever — no `0x84` or higher, so a third/fourth silent device (if the address hypothesis holds) either doesn't exist or hasn't been caught yet. `logs-34`'s original three occurrences didn't show this slot/byte correlation, but that capture only spanned ~1h47m and happened to catch both bytes in the same relative slot by chance — with 17 samples now behind it, that earlier capture looks like the outlier, not this one.
+
+**Practical takeaway:** no code change proposed. Worth specifically checking, in the next long-term capture pull, whether a `0x84`/etc. leading byte ever appears (which would further support the per-address hypothesis).
+
+### Update (2026-08-31, cont.): `0x91` has siblings sharing the identical payload — very likely one packet type with a corrupted *type* byte, not five distinct unlabeled types; poll-slot correlation holds for all of them
+
+**Source:** same 24h UTC capture as the update above, widened to search for the full `01.46.81.00.80.11` tail regardless of leading type byte.
+
+**Findings (observed facts):** 40 occurrences, not 17 — the tail payload and the `0x82`/`0x83` addressing scheme are shared by five different leading (type) bytes:
+
+| Type byte | Count | Bits vs. `0x93` |
+| --- | --- | --- |
+| `0x91` | 17 | 1 bit (bit 1) |
+| `0x93` | 10 | — |
+| `0x13` | 6 | 1 bit (bit 7) |
+| `0x83` | 4 | 1 bit (bit 4) |
+| `0xa3` | 3 | 2 bits (via `0x83`, 1 bit each hop) |
+
+Every variant is a single-bit flip from `0x93` except `0xa3`, which is a single-bit flip from `0x83` (itself one flip from `0x93`) — i.e. `0x93` minimizes total Hamming distance across all 40 samples, weighted by frequency (33, vs. 39 measured from `0x91` despite `0x91` being individually the most common single value).
+
+The poll-slot correlation from the update above holds with **zero exceptions across all 40**, regardless of which type byte is present — and a third address value shows up for the first time: `0x80` (5 occurrences, all type `0x13`) lands immediately after the `Controller`'s own `CURRENT_TIME` broadcast, i.e. the very first slot of the poll cycle, before `AAP Keypad`'s own ping. `0x82` (16 occurrences) still always follows `AAP Keypad`'s ping; `0x83` (19 occurrences) still always follows `Control 4 Keypad`'s ping.
+
+**Inference (medium-high confidence):** this is much better explained as **one packet type suffering type-byte bit corruption** than as five distinct unlabeled types — the shared payload, shared addressing scheme, and shared poll-slot behavior across all five type-byte variants would be a remarkable coincidence otherwise, whereas single/double-bit corruption on one byte of an otherwise-intact frame is exactly the failure mode this document already characterizes elsewhere (`CURRENT_TIME` day/month/year doubling, `Unknown [ff.]`/`[fe.]`). `0x93` is the best-supported candidate for the true, uncorrupted type byte by the bit-distance argument, though `0x91` being more frequent than `0x93` itself is unexplained by that alone (a real byte value is not usually rarer than its own corruption) — possibly a bit position more prone to flipping than others, consistent with the deterministic, non-random corruption patterns already documented for other fields on this bus.
+
+This also revises the `0x80|addr` framing from the previous update: `0x80` (addr `0x00`) would collide with `AAP Keypad`'s own bus address, but this packet's `0x80` instance appears in the *first* poll slot (before `AAP Keypad`'s ping), not in place of or overlapping it — so the byte more likely encodes a **poll-cycle slot index** than a literal shared keypad bus address, resolving what would otherwise be an address collision.
+
+**Assumption (unverified):** which type byte (if any of these) is the true, uncorrupted value, and what this packet actually represents, are both still open — `0x93`/`01.46.81.00.80.11` doesn't match any pattern in `keypad_protocol_types.md`'s known-type catalogue. The mechanism producing type-byte-specific (rather than random) corruption is likewise unestablished.
+
+**Practical takeaway:** no code change proposed — `default:` already handles every variant safely. If pursuing this further, `0x93.80...`, `0x91.80...`, `0x83.80...`, or `0xa3.80...` (the `0x80`-slot combinations not yet observed with any type byte but `0x13`) would be useful confirming data points, as would any type byte not a bit-neighbor of `0x93` appearing in this same payload family.
+
+## Raw bit trace diagnostic logging appears to make `loop()` fall behind on frame processing — registration-watchdog trips up ~15x while enabled (2026-09-02, unconfirmed)
+
+**Source:** the frigate long-term logger (`crow-alarm-logger`, [[project-crow-alarm-protocol-trace]] in memory), comparing the window before and after `set_raw_bit_trace_enabled(true)` was called on the real device on 2026-09-01. All timestamps UTC (the logger's timestamps are UTC, not the frigate host's local NZST — see the earlier gotcha note in this doc's log-sourcing conventions).
+
+**Findings (observed facts):**
+
+Raw bit trace (and debug-level `[D]` logging generally, which had also been off) came back on at **2026-09-01 18:52:09 UTC** — first `Raw bit trace:` line in the capture, zero before it. In the ~14.4h since, it logged continuously at ~12/s (172,744 lines by 2026-09-02 09:15).
+
+"No ping for 60 s, re-sending registration announce" (the watchdog that fires when 60s pass with no `KEYPAD_PING` addressed to us successfully processed — see the "Registration watchdog double-announce" section above) jumped sharply at the same boundary:
+
+| Window (UTC) | Duration | Watchdog trips | Rate |
+| --- | --- | --- | --- |
+| 2026-09-01 06:26 → 18:52:09 (debug + raw trace off) | ~12.4h | 3 | ~0.24/h |
+| 2026-09-01 18:52:09 → 2026-09-02 09:15 (debug + raw trace on) | ~14.4h | 52 | ~3.6/h |
+
+For reference, the "Registration watchdog double-announce" section above confirmed a clean ~4/22h (~0.18/h) baseline for this same watchdog in a 22h post-OTA window that had neither raw trace nor an elevated announce rate. No duplicate/rapid-fire announces appear in the post-enable window either — each of the 52 is a single clean announce, so the `374ab5b` double-announce fix is not regressing; this is a volume increase in the watchdog's *trigger*, not a return of that bug.
+
+Two other signals stayed flat across the same boundary, arguing the effect is localized:
+
+- `Unknown [ff.]`/`[fe.]` decode-corruption count (the documented signature of hardware-ACK-timing problems) is 494 in the post-enable window, ≈23.5/h — matching the pre-existing ~24/h baseline from the fully-debug-logged 2026-08-30/31 24h capture, which had no raw trace running at all. (The pre-enable window today can't be used for this comparison — debug-level logging, which gates `Unknown` lines, was itself off until 18:52:09, so it shows 0 by construction, not by absence of corruption.)
+- No `Discarding short frame` warnings in either window.
+
+**Inference (medium confidence, code-grounded but not directly observed):** the hardware ACK that tells the controller "we heard you" is driven entirely inside the GPIO ISR (`CrowAlarmPanelStore::interrupt()`) on clock edges, independent of `loop()` — consistent with the flat `ff.`/`fe.` rate above, raw trace does not appear to disturb ACK-level bus timing. The more likely mechanism is downstream of the ISR: `loop()` drains a completed frame from `store_.buffer2`/`store_.data_length`, but the ISR's frame-boundary branch overwrites `buffer2`/`data_length` unconditionally, with no "has `loop()` read the last one yet?" guard — unlike the bit-trace buffer immediately below it in the same ISR, which explicitly checks `!bit_trace_ready_` before writing, specifically because (per that code's own comment) `InterruptLock` protects only same-core reentrancy and does nothing against the ISR, which runs on the other core. `last_ping_ms_` (what the watchdog checks) only updates when `loop()` actually processes a `KEYPAD_PING` frame addressed to us. The raw-trace path adds a ~150-char blocking `ESP_LOGI` call inside `loop()` roughly every 106ms while the bus is active — real core-1 time not spent draining the frame buffer — which is a plausible way to make this pre-existing race fire often enough to lose whichever `KEYPAD_PING` frame collides with it.
+
+**Assumption (unverified):** this is inferred from code reading plus a tight timing correlation, not confirmed from the logs — a frame dropped by this race leaves no trace (no warning is logged for "new frame overwrote an unread one," only the separate `Discarding short frame` case is logged). Whether it's really this race, rather than some other loop()-load effect of enabling debug/raw trace, is not established. No test has yet been done toggling raw trace on/off in isolation to confirm the correlation holds outside this one session, or gating out the confound of debug-level logging (both were enabled at the same instant here).
+
+**Practical takeaway (implemented 2026-09-02):** a simple skip-guard mirroring the `bit_trace_ready_` pattern (don't overwrite `buffer2` while unread) was considered and rejected — it only changes *which* frame is lost under backlog (drop-newest instead of drop-oldest; a `KEYPAD_PING` is equally likely to be the casualty either way, so the watchdog symptom would persist), and it tangles with the hardware ACK, whose decision reads the completed frame after the copy: ACKing a frame we just dropped reproduces the same watchdog trip, while withholding the ACK triggers the controller's rapid-retransmission mode (logs-11/36). Instead, the single `buffer2`/`data_length` mailbox was replaced with a 4-slot frame FIFO (ISR producer / `loop()` consumer, lock-free via the ownership protocol documented at the queue's declaration in `crow_alarm_panel.h`): a slow `loop()` now delays frame processing instead of losing frames, ACK behavior is unchanged in every case (including the queue-full case, which still ACKs, matching the old overwrite path), and the pre-existing cross-core torn-read hazard (ISR overwriting `buffer2` mid-copy while `loop()` drained it — `InterruptLock` is core-local and never protected this) is fixed as a side effect. Two diagnostic counters make the hypothesis testable in production: `frame_backlog_events_` counts frames completed while a previous one was still queued (exactly the events the old scheme turned into silent losses; logged at DEBUG on change), and `frame_overflow_events_` counts frames actually dropped at 4-deep backlog (logged at WARN; expected to stay 0). After the next OTA, the confirming signature is: watchdog rate back near the ~0.2/h baseline *while* backlog events accrue during raw-trace operation. If the watchdog rate stays elevated despite the queue, the hypothesis is wrong and something else about debug/raw-trace load is responsible. The earlier advice stands regardless: treat raw bit trace as a short, deliberate diagnostic capture, not a leave-it-on setting.
+
+### Update (2026-09-03): frame-FIFO fix confirmed — watchdog back to baseline, with zero backlog/overflow events, not just reduced ones
+
+**Source:** the same frigate long-term logger, `crow-alarm.log`/`crow-alarm.log.1`, filtered to the window from the OTA that shipped commit `7e8044f` onward.
+
+**Findings (observed facts):** the OTA landed at **2026-09-02 09:50:44 UTC** (`ESPHome version 2026.8.2 compiled on 2026-09-02 21:49:11 +1200`, immediately following commit `7e8044f`'s 09:47:09 UTC commit time — the compile window confirms this build includes the fix). Raw bit trace has run continuously and heavily (roughly 10,000+ `Raw bit trace:` lines per hour) for the entire ~22.7h since, i.e. the exact condition the original hypothesis needed to be tested under.
+
+In that window:
+
+| Signal | Post-fix (2026-09-02 09:50:44 → 2026-09-03 08:32 UTC, ~22.7h) | Pre-fix reference (raw trace on, 2026-09-01 18:52 → 09-02 09:15) |
+| --- | --- | --- |
+| "No ping for 60 s" watchdog trips | 3 (~0.13/h) | 52 (~3.6/h) |
+| `frame_backlog_events_` (DEBUG "Frame completed while previous still queued") | 0 | not tracked (pre-fix build had no counter) |
+| `frame_overflow_events_` (WARN "Frame queue overflow, frame(s) dropped") | 0 | not tracked (pre-fix build had no counter) |
+
+The watchdog rate is back at the documented ~0.2/h baseline (and below the 22h post-OTA baseline of ~0.18/h cited in the section above) despite raw trace running the entire time.
+
+**Inference (high confidence):** this confirms the `loop()`-starvation hypothesis and that the 4-slot FIFO fixes it. The result is actually stronger than the "backlog accrues but overflow stays 0" signature originally proposed as confirmation: backlog stayed at *zero* too, meaning `loop()` is draining the FIFO fast enough that a second frame is never even completing before the first is consumed — raw-trace logging is no longer measurably contending with frame processing at all, not merely being absorbed by queue depth. The 3 remaining watchdog trips are consistent with the pre-existing ~0.2/h baseline cause (whatever intermittently drops/delays a `KEYPAD_PING` outside the raw-trace confound), not a residual instance of this bug.
+
+**Practical takeaway:** no further action needed on this issue — treat it as resolved. The frame FIFO and its two counters stay in place as ongoing diagnostics (cheap, and `frame_overflow_events_ > 0` would be a clear signal if backlog ever gets deep enough to actually lose a frame under some heavier future load). Raw bit trace can now be left on for longer diagnostic sessions than before without the confound of it lying about the underlying watchdog rate, though the general advice to keep it as a deliberate short capture rather than a permanent setting still stands (it's still ~12/s of log volume).
+
+### Update (2026-09-05): both watchdog trips in the latest window line up with an `Unknown [ff.]/[fe.]` burst landing exactly in the `ESPHome Keypad` poll slot — a candidate cause for the residual ~0.2/h baseline
+
+**Source:** the frigate long-term logger, `crow-alarm.log`/`crow-alarm.log.1`/`crow-alarm.log.2.gz`, window 2026-09-03 08:36 → 2026-09-04 23:36 UTC (~39h, the first full window checked since the 2026-09-03 updates above), raw bit trace + debug running throughout.
+
+**Findings (observed facts):** exactly 2 "No ping for 60 s" watchdog trips in ~39h (2026-09-03 20:12:54 and 2026-09-04 16:06:55 UTC), ~0.05/h — at or below the established ~0.13–0.2/h post-fix baseline. `frame_backlog_events_` and `frame_overflow_events_` both stayed at 0 the entire window, confirming the `7e8044f` frame-FIFO fix continues to hold.
+
+Both trips, traced back frame-by-frame, show the same pattern: the last clean `[ESPHome Keypad] Ping` before the gap is immediately followed — at exactly the next ~15s poll-cycle slot where that keypad's ping is due — by a multi-line burst of `Unknown [ff.]`/`[fe.]` decode failures (11 lines at 20:12:09–10 for trip 1, 9 lines at 16:06:10–11 for trip 2), and no further `[ESPHome Keypad] Ping` line appears until the registration announce recovers it 60s later. `AAP Keypad`/`Control 4 Keypad`/`IP Keypad` pings continue on their normal ~15s cadence throughout both gaps — only the `ESPHome Keypad` slot is missing.
+
+By contrast, this window's two other `Unknown [ff.]`/[fe.]` occurrences (2026-09-03 17:42:40 and 21:51:40) are each single, isolated lines that land immediately *after* a normal `[ESPHome Keypad] Ping` already logged that cycle, and neither causes a watchdog trip.
+
+**Inference (medium-high confidence, small sample):** this looks like the concrete mechanism behind the "whatever intermittently drops/delays a `KEYPAD_PING`" baseline cause left open in the frame-FIFO section above. A single stray `ff.`/`fe.` corrupted frame elsewhere in the poll cycle is harmless background noise, but when the corruption specifically clobbers the frame(s) occupying the `ESPHome Keypad`'s own poll slot, our `KEYPAD_PING` never arrives to reset `last_ping_ms_` — and the address then appears to drop out of the poll rotation entirely for the rest of the 60s window (not just one cycle) until the registration re-announce recovers it. Both available instances fit this pattern with no exceptions, though 2 events is a small sample.
+
+**Assumption (unverified):** whether the controller genuinely stops polling the address, versus keeps sending pings to it that keep getting corrupted the same way for the full 60s, isn't distinguishable from this log alone — either way no clean ping arrives. A raw bit trace captured around a future instance of this would settle it.
+
+**Practical takeaway:** no code change proposed — the watchdog already recovers correctly and the double-announce fix (`374ab5b`) isn't implicated. Worth checking whether this pattern holds with no exceptions across future watchdog trips; if it does, this closes the "baseline cause unknown" thread from the frame-FIFO section above as characterized (root-caused to bus-level `ff.`/`fe.` corruption landing in the wrong slot), even though `ff.`/`fe.` corruption itself has no established fix.
+
+### Update (2026-09-05): `invalid day/month value */36` recurs 64 times in ~39h, always on the exact same corrupted month — the `logs-35` double-halving case is a repeating pattern, not a one-off
+
+**Source:** same window as above, all 64 `Current time has invalid day/month value` lines in it.
+
+**Findings (observed facts):** every one of the 64 lines has month = 36 exactly (day varies: 41× day=16, 17× day=20, 6× day=12) — the same fixed corrupted month value recurring, not scattered noise across different invalid values. This is the same value flagged as a one-off in the `logs-35` update above (2026-09-03), where month byte `0x24` (36) needed *two* halvings (36→18→9) to reach a valid month; here it's the dominant (in fact only) invalid-month value seen over a much larger sample.
+
+**Inference (medium confidence):** reinforces and narrows the double-halving finding — this isn't a random double-bit-insertion landing on an arbitrary value, it's the same fixed byte value (`0x24`) recurring, consistent with a specific, reproducible fault (e.g. a marginal bit position on this device) rather than generic random bus noise.
+
+**Practical takeaway:** no code change — `CURRENT_TIME` still isn't user-facing, and the existing recovery logic correctly leaves an irreversible day/month value alone rather than guessing. Worth checking in future captures whether other corrupted fields also show a "fixed value repeats" signature rather than scattered corruption, which would further support a reproducible-fault theory over generic noise.
+
+### Update (2026-09-06): watchdog trips and `ff.`/`fe.` corruption both collapse to near-zero in the latest window; one new `invalid minutes-since-midnight` WARN traced to the known bit-32/64 glitch crossing the midnight boundary
+
+**Source:** the frigate long-term logger, `crow-alarm.log`/`crow-alarm.log.1`, window 2026-09-04 23:36 → 2026-09-05 20:47 UTC (~21h11m), raw bit trace + debug running almost the entire window (245,313 of 295,756 lines are `Raw bit trace:`, no gap/reboot detected).
+
+**Findings (observed facts):**
+
+- Zero "No ping for 60 s" watchdog trips in ~21h (previous baselines: ~0.13–0.2/h post-fix, ~0.05/h in the 2026-09-05 39h window). `frame_backlog_events_`/`frame_overflow_events_` both stayed at 0 throughout — the `7e8044f` frame-FIFO fix continues to hold.
+- Only **2** `Unknown [ff.]`/`[fe.]` decode-corruption lines in the entire ~21h window (`06:06:40` and `20:38:59` UTC) — far below every previously measured baseline (~24–48/day). With no `ff.`/`fe.` bursts landing in the `ESPHome Keypad` poll slot to begin with, the zero watchdog trips are consistent with (though not an independent new confirming instance of) the 2026-09-05 poll-slot hypothesis above.
+- One episode of the WARN-level `Current time has invalid minutes-since-midnight value` check (line 583, `hour >= 24`) firing — previously never seen in any reviewed window. 8 occurrences over ~105s (`11:25:55`–`11:27:40` UTC), value `1470` (`0x05BE`) for the first 4, `1503` (`0x05DF`) for the next 4, then a clean `Controller time update` resumed at `11:27:55` with no discontinuity in the surrounding time-of-day — a short self-clearing episode, not a lasting stuck state.
+- Decoding the raw bytes: `0x05BE` and `0x05DF` are each exactly `0x20`/`0x40` (32/64) above a valid, in-range minutes-since-midnight value (`0x059E` = 23:58 and `0x059F` = 23:59 respectively) — the same low-byte bit-weight-32/64 corruption already root-caused in the 2026-09-03 `CURRENT_TIME` minutes-corruption update, just this time landing close enough to the 1440-minute day boundary to push the result over 24h and trip the rarer `hour >= 24` WARN branch instead of silently producing an in-range wrong-minute value.
+- `invalid day/month value */36` recurred 40 more times (24× day=20/`0x14`, 16× day=24/`0x18`), month still exclusively `36`/`0x24` (the `logs-35` fixed-value fault). This adds `24` to the set of observed day values (previously `12`/`16`/`20`) — all four are exactly 4 apart (`0x0C`/`0x10`/`0x14`/`0x18`), consistent with the existing "fixed marginal bit" theory rather than a new fault.
+- Three previously-uncatalogued truncated/malformed-frame warnings appeared, each once or twice: `Controller status too short, discarding` (×2), `Zone state invalid length, discarding` (×1), `Output state too short, discarding` (×1) — roughly 1 every 5h, no prior mention in this doc.
+- No arm/disarm activity (no `Arm/disarm:`/`Arm/stay:`/`ARMED_STATE` lines) in this window — nothing to add to the arm/disarm retry-correlation table.
+
+**Inference (medium confidence):** the minutes-since-midnight WARN is not a new bug — it's the first observed instance of the already-understood low-byte glitch crossing the day boundary, which is a low-probability alignment (needs the true time to be within 32–64 minutes of midnight when the glitch fires) rather than a new failure mode. The `ff.`/`fe.` and watchdog collapse this window is the more open finding: no mechanism is established for why background corruption would drop by ~10-25x session-to-session; could be genuine bus-condition variance (temperature, load) or an artifact of this particular window, and isn't yet distinguishable from either.
+
+**Assumption (unverified):** whether the `ff.`/`fe.` rate genuinely varies this much day-to-day (vs. some measurement artifact) is unconfirmed — only one low-rate window has been observed so far. The three new short-frame WARNs are too rare (1-2 instances each) to characterize beyond "rare, exists."
+
+**Practical takeaway:** no code change. Next window should keep tracking the `ff.`/`fe.` baseline rate specifically (is 2026-09-05 an outlier or the new normal?) alongside the existing poll-slot/watchdog and month=36/day-value checks, and watch for another `invalid minutes-since-midnight` instance to see if it's always this same 32/64-crossing-midnight signature or something else.

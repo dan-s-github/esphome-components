@@ -20,8 +20,10 @@ void CrowAlarmPanelStore::setup(InternalGPIOPin *clock_pin, InternalGPIOPin *dat
   this->clock_pin_ = clock_pin->to_isr();
   this->data_pin_ = data_pin->to_isr();
   memset(this->buffer, 0, sizeof(this->buffer));
-  memset(this->buffer2, 0, sizeof(this->buffer2));
-  this->data_length = 0;
+  memset(this->frame_queue_, 0, sizeof(this->frame_queue_));
+  memset(this->frame_queue_len_, 0, sizeof(this->frame_queue_len_));
+  this->frame_head_ = 0;
+  this->frame_tail_ = 0;
   this->num_bits_ = 0;
   this->boundary_buffer_ = 0;
   clock_pin->attach_interrupt(CrowAlarmPanelStore::interrupt, this, gpio::INTERRUPT_FALLING_EDGE);
@@ -171,9 +173,30 @@ void IRAM_ATTR HOT CrowAlarmPanelStore::interrupt(CrowAlarmPanelStore *arg) {
     arg->num_bits_++;
 
     if (arg->boundary_buffer_ == BOUNDARY) {
-      //  Save data
-      memcpy(arg->buffer2, arg->buffer, arg->num_bits_ / 8);
-      arg->data_length = arg->num_bits_ / 8;
+      const uint8_t frame_len = arg->num_bits_ / 8;
+      // ACK decision fields, captured before the buffer reset below.
+      // buffer[0]=type, buffer[1]=addr (for addressed types), buffer[frame_len-1]=0x7E.
+      const uint8_t frame_type = arg->buffer[0];
+      const uint8_t frame_addr = arg->buffer[1];
+      //  Save the frame into the queue (see the queue's ownership-protocol comment in the
+      //  header). pending is computed before the head increment, so pending > 0 means this
+      //  frame completed while an earlier one was still unconsumed (counted as backlog below).
+      //  Zero-length frames (boundary matched with < 8 bits accumulated, i.e. noise) are
+      //  skipped without queueing.
+      const uint8_t pending = (uint8_t) (arg->frame_head_ - arg->frame_tail_);
+      if (frame_len == 0) {
+        // fall through to the reset below
+      } else if (pending < FRAME_QUEUE_LENGTH) {
+        const uint8_t slot = arg->frame_head_ & (FRAME_QUEUE_LENGTH - 1);
+        memcpy(arg->frame_queue_[slot], arg->buffer, frame_len);
+        arg->frame_queue_len_[slot] = frame_len;
+        arg->frame_head_++;
+        if (pending > 0) {
+          arg->frame_backlog_events_++;
+        }
+      } else {
+        arg->frame_overflow_events_++;
+      }
       //  Reset
       memset(arg->buffer, 0, BUFFER_LENGTH);
       arg->boundary_buffer_ = 0;
@@ -182,12 +205,14 @@ void IRAM_ATTR HOT CrowAlarmPanelStore::interrupt(CrowAlarmPanelStore *arg) {
       arg->data = false;
       // Hardware ACK: drive DAT low for one clock cycle only for per-keypad frame types
       // addressed to us. Broadcast frame payload bytes must never be treated as an address.
-      // buffer2[0]=type, buffer2[1]=addr (for addressed types), buffer2[data_length-1]=0x7E.
-      if (arg->data_length >= 3) {
-        const uint8_t type = arg->buffer2[0];
-        const bool addressed_type = (type == KEYPAD_COMMAND || type == KEYPAD_STATE || type == OUTPUT_SELECT_ACK ||
-                                     type == KEYPAD_PING || type == BYPASS_STATUS);
-        if (addressed_type && arg->buffer2[1] == arg->ack_keypad_address_) {
+      // Deliberately unconditional on the queue outcome: an overflow-dropped frame is still
+      // ACKed — withholding the ACK would trigger the controller's rapid-retransmission mode
+      // instead (logs-11/36).
+      if (frame_len >= 3) {
+        const bool addressed_type = (frame_type == KEYPAD_COMMAND || frame_type == KEYPAD_STATE ||
+                                     frame_type == OUTPUT_SELECT_ACK || frame_type == KEYPAD_PING ||
+                                     frame_type == BYPASS_STATUS);
+        if (addressed_type && frame_addr == arg->ack_keypad_address_) {
           arg->data_pin_.pin_mode(gpio::FLAG_OUTPUT);
           arg->data_pin_.digital_write(0);
           arg->ack_set_time_us_ = now;
@@ -286,24 +311,35 @@ void CrowAlarmPanel::loop() {
     ESP_LOGI(TAG, "Raw bit trace: %s", local_bits);
   }
 
-  if (this->store_.data_length) {
-    if (this->store_.data_length < 2) {
-      ESP_LOGW(TAG, "Discarding short frame (%d bytes)", this->store_.data_length);
-      InterruptLock lock;
-      memset(this->store_.buffer2, 0, BUFFER_LENGTH);
-      this->store_.data_length = 0;
+  if (this->store_.frame_head_ != this->store_.frame_tail_) {
+    // Pop one frame per loop() pass. Copy the slot out first, then release it back to the ISR
+    // with the tail increment — no lock, per the queue's ownership-protocol comment in the
+    // header (InterruptLock is core-local and never protected this cross-core handoff anyway).
+    const uint8_t slot = (uint8_t) (this->store_.frame_tail_ & (CrowAlarmPanelStore::FRAME_QUEUE_LENGTH - 1));
+    const uint8_t frame_len = this->store_.frame_queue_len_[slot];
+    uint8_t local_frame[BUFFER_LENGTH];
+    memcpy(local_frame, this->store_.frame_queue_[slot], BUFFER_LENGTH);
+    this->store_.frame_tail_++;
+
+    const uint16_t backlog = this->store_.frame_backlog_events_;
+    if (backlog != this->frame_backlog_reported_) {
+      ESP_LOGD(TAG, "Frame completed while previous still queued: %u total", backlog);
+      this->frame_backlog_reported_ = backlog;
+    }
+    const uint16_t overflow = this->store_.frame_overflow_events_;
+    if (overflow != this->frame_overflow_reported_) {
+      ESP_LOGW(TAG, "Frame queue overflow, frame(s) dropped: %u total", overflow);
+      this->frame_overflow_reported_ = overflow;
+    }
+
+    if (frame_len < 2) {
+      ESP_LOGW(TAG, "Discarding short frame (%d bytes)", frame_len);
       return;
     }
 
-    uint8_t type;
+    uint8_t type = local_frame[0];
     std::vector<uint8_t> data;
-    {
-      InterruptLock lock;
-      type = this->store_.buffer2[0];
-      data.insert(data.begin(), this->store_.buffer2 + 1, this->store_.buffer2 + this->store_.data_length - 1);
-      memset(this->store_.buffer2, 0, BUFFER_LENGTH);
-      this->store_.data_length = 0;
-    }
+    data.insert(data.begin(), local_frame + 1, local_frame + frame_len - 1);
 
     if (this->raw_frame_logging_enabled_) {
       ESP_LOGI(TAG, "Received raw frame [%02x.%s]", type, format_hex_pretty(data).c_str());

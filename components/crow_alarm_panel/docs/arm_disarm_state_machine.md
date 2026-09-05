@@ -254,7 +254,7 @@ Three distinct failure patterns observed when arm/disarm doesn't work:
 
 ## Digit-ack byte is keypad-address-specific, not a validity signal (2026-07-08)
 
-**Observed facts** (`esphome-aap-alarm-interface-logs-7.txt`, `esphome-aap-keypad-monitor-logs-33.txt`, captured simultaneously from the active interface and a passive monitor): across four separate code-entry attempts (2 disarm, 2 arm-away) by the ESPHome virtual keypad (address `0x05`), the controller's response to the *first* code digit was `Command [14.05.07...]` (byte[1] = `0x07`) every single time — never `0x01`. In the same window, a manual disarm entered on the physical IP keypad (address `0x07`) got byte[1] = `0x01` on every digit and completed successfully with the *same* code (`4286`, confirmed against `secrets.yaml`). The `0x07` responses occurred both while armed (`armed_state` byte = `0x01`, during disarm) and while disarmed (`armed_state` byte = `0x00`, during the subsequent arm attempts), ruling out an "alarm-pending" explanation tied to armed state.
+**Observed facts** (`esphome-aap-alarm-interface-logs-7.txt`, `esphome-aap-keypad-monitor-logs-33.txt`, captured simultaneously from the active interface and a passive monitor): across four separate code-entry attempts (2 disarm, 2 arm-away) by the ESPHome virtual keypad (address `0x05`), the controller's response to the *first* code digit was `Command [14.05.07...]` (byte[1] = `0x07`) every single time — never `0x01`. In the same window, a manual disarm entered on the physical IP keypad (address `0x07`) got byte[1] = `0x01` on every digit and completed successfully with the *same* code (confirmed identical to the entry sent by the ESPHome keypad, cross-checked against `secrets.yaml`; value redacted here). The `0x07` responses occurred both while armed (`armed_state` byte = `0x01`, during disarm) and while disarmed (`armed_state` byte = `0x00`, during the subsequent arm attempts), ruling out an "alarm-pending" explanation tied to armed state.
 
 **Inference (medium confidence — 4 consistent observations, single session):** byte[1] of `KEYPAD_COMMAND` in the digit-ack context is a per-keypad-address display code (LED/beep style), not a code-correctness signal. Different keypad types/addresses apparently use different codes for the same "digit accepted, more expected" semantic — address `0x05` uses `0x07` where the IP keypad uses `0x01`. This is consistent with `protocol_wire_format.md`'s `display_code` table describing byte[1] as display/mode instructions, not a validation result, and with the fact that the controller only appears to check code correctness at ENTER (per keypad_protocol_types.md: "Invalid code: Controller timeout ~10s, then reject" — no per-digit rejection documented for the IP keypad).
 
@@ -532,6 +532,53 @@ resolve via broadcast at all and would fall to the watchdog/retry path, re-press
 The previous code had the same recognition gap (unknown patterns were logged and ignored), so
 this is not a regression, but a stay-mode capture confirming the actual broadcast bytes would
 settle it.
+
+## User-reported field pattern: disarm reliable right after arming, retries after hours armed (2026-08-31)
+
+**Source:** user report from real-world usage (not a scripted trace session), checked against the frigate long-term logger ([[project-crow-alarm-protocol-trace]]) for 2026-08-31 01:42–01:44 **UTC** (the logger stamps lines in UTC regardless of the host's local NZST clock — see the `protocol_investigations.md` `Unknown [91.]` entry's 2026-08-31 update for how that was confirmed).
+
+**Observed facts:** in the corroborating window, the panel had been armed away since sometime before `18:33:56` on 2026-08-30 (its last confirmed `Disarmed` broadcast before that) — armed via a physical keypad, not this integration's `arm_away()` (no `Arm away` trigger line appears anywhere earlier in the visible log). The `01:42:07` `disarm()` call against that multi-hour-armed state hit the full `CODE_ENTER_PENDING` retry sequence — 6/6 retries, ~42s to resolve, backoff 1s→13s — before a genuine `Disarmed` `ARMED_STATE` broadcast confirmed it. Two follow-up cycles run through this integration immediately after (`01:43:02` arm away → `01:43:34` disarm, 32s later; `01:43:56` arm away) both resolved on the first attempt with no retries at all.
+
+**Relation to prior findings:** this does not contradict "Gap-timing lead conclusively dead" (2026-08-05, logs-44/23) above — that investigation tested gaps of single- to double-digit *seconds* within rapid scripted arm/disarm test cycles and found no correlation at that scale. It never tested an armed period of *hours*, since every prior trace session was a short deliberate test run; a multi-hour armed duration is a distinct, untested variable.
+
+**Inference (low confidence — one paired example, plus a user-reported recurring pattern):** consistent with the existing "session-level bad state"/controller-degradation theory (2026-08-19 episode, "Retry backoff + intent-matched ARMED_STATE resolution" above) if degradation episodes become more likely the longer the controller/bus has been running in a given state — but equally consistent with something disarm-specific (e.g. the controller doing different internal bookkeeping for a disarm request after being armed a long time vs. moments after arming). This single example doesn't distinguish between the two.
+
+**Possible shared cause:** `protocol_investigations.md`'s `CURRENT_TIME` section has a 2026-08-31 update describing the panel stuck continuously broadcasting an invalid `day/month value 31/16` from `11:59:55` UTC on 2026-08-30 onward — still ongoing as of the last check, `18:33:56`'s last-disarmed timestamp and the `01:42:07` failed disarm both fall inside that window. If the panel is genuinely in an abnormal internal state for that whole span (rather than this being routine per-broadcast noise), it's a plausible shared root cause for both symptoms — see that entry for the reasoning and its own caveats. Not proven; a disarm attempted while that stuck state is still active would be the next useful data point either way.
+
+**Practical takeaway:** worth deliberately capturing next: a disarm attempt following a known multi-hour armed period, with a note of exactly how long the panel had been armed, to build more than one data point. No code change proposed — the existing retry/backoff machinery already handles this case correctly (resolved in 42s here); this is purely an open root-cause question.
+
+### Update (2026-09-03): five more days of frigate data — "armed for hours" alone doesn't predict retries; the `CURRENT_TIME`-stuck correlation holds up better
+
+**Source:** the frigate long-term logger, full range 2026-08-30 through 2026-09-03 08:32 UTC ([[project-crow-alarm-protocol-trace]]). Every `alarm_control_panel` state transition in that window was pulled and matched against the `Arm away`/`Arm stay`/`Disarm` `[I]` log lines that mark an integration-initiated (vs. physical-keypad-initiated) sequence, then cross-checked against `CURRENT_TIME` decode status at the same moment.
+
+**Observed facts — every integration-initiated disarm in the window, with armed duration and retry outcome:**
+
+| Disarm (UTC) | Armed since | Duration armed | Retries | `CURRENT_TIME` at disarm |
+| --- | --- | --- | --- | --- |
+| 08-31 01:42:07 | 08-30 18:59:14 (physical arm) | ~6h43m | **6/6, ~42s** | stuck `31/16` (confirmed) |
+| 08-31 01:43:34 | 08-31 01:43:02 (`arm_away`) | ~3s | none, instant | still stuck `31/16` (confirmed) |
+| 09-01 18:27:49 | 09-01 17:47:35 (physical arm) | ~40m | **3/6, ~11s** | unknown — debug logging was off 09-01 06:26–18:52:09, spans this event |
+| 09-01 23:20:34 | 09-01 18:52:47 (physical arm) | ~4h28m | none, instant | normal, confirmed (`Controller time update` broadcasting correctly at 23:15–23:26) |
+| 09-02 23:57:28 | 09-02 18:31:44 (physical arm) | ~5h26m | none, instant | normal, confirmed (post-fix, `7e8044f` OTA'd, raw trace running the whole time) |
+
+**Inference (medium confidence — revises the 2026-08-31 entry above):** duration-since-arming alone is not the predictor — the ~40m case retried while both multi-hour cases (4h28m, 5h26m) resolved instantly. The `CURRENT_TIME`-stuck correlation from the "Possible shared cause" note above holds up better with this larger sample: the one case with *confirmed* stuck time retried (full 6/6), and the two cases with *confirmed* normal time — including one armed for 5h26m — both resolved instantly. The 40m/retry case can't confirm or refute either theory since debug logging (which gates the `CURRENT_TIME` decode warnings) happened to be off for that entire window; it's a missing data point, not a counterexample. The 3s/instant case is a genuine wrinkle: `CURRENT_TIME` was confirmed still stuck at that moment yet the disarm resolved cleanly on the first try — so "stuck time present" isn't sufficient on its own to force a retry, only (so far) correlated with the cases that did retry. Possibly retry-triggering requires the stuck condition to coincide with the specific bus exchange the state machine is waiting on, which a 3-second-old arm sequence may not have had time to hit.
+
+**Practical takeaway:** no code change proposed. The next useful data point is a disarm attempted with `CURRENT_TIME` decode status *known* at the moment of the call (i.e., debug logging on) that either retries with time stuck, or retries with time confirmed normal — either would sharpen this considerably. Given debug + raw trace are now left on for extended stretches post-`7e8044f`, this should arrive naturally in future capture windows without a dedicated test.
+
+### Update (2026-09-05): two more disarms, both instant/no-retry with `CURRENT_TIME` confirmed normal — no new wrinkle, reinforces the 2026-09-03 correlation
+
+**Source:** the frigate long-term logger, window 2026-09-03 08:36 → 2026-09-04 23:36 UTC.
+
+**Observed facts:** two full arm/disarm cycles occurred in this window:
+
+| Disarm (UTC) | Initiator | Armed since | Duration armed | Retries | `CURRENT_TIME` at disarm |
+| --- | --- | --- | --- | --- | --- |
+| 09-03 19:50:10 | physical (`AAP Keypad`, code+ENTER) | 09-03 18:03:11 (`arm_away`) | ~1h47m | none, instant | normal (glitch recovered cleanly to the correct date/time same second) |
+| 09-04 20:49:05 | integration (`disarm()`, `ESPHome Keypad`) | 09-04 20:11:57 (physical arm) | ~37m | none, instant | normal, confirmed (`Controller time update` broadcasting correctly seconds before and after) |
+
+**Inference (medium confidence, consistent with the 2026-09-03 entry above, not new):** both cases have `CURRENT_TIME` confirmed normal and both resolved instantly with zero retries, regardless of who initiated them (physical keypad vs. integration) or how long the panel had been armed (1h47m vs. 37m) — fitting neatly into the existing "normal time → instant disarm" bucket from the table above rather than adding a new data point for the harder "stuck time" side of the correlation. No `CURRENT_TIME` `31/16`-style stuck state occurred anywhere in this ~39h window (0 occurrences), so no retry case was available to test this session.
+
+**Practical takeaway:** no code change proposed. Still waiting on a disarm that coincides with a confirmed-stuck `CURRENT_TIME` state to further test the correlation — none occurred in this window.
 
 ## Notes
 
