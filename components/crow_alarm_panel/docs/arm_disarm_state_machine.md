@@ -580,6 +580,26 @@ settle it.
 
 **Practical takeaway:** no code change proposed. Still waiting on a disarm that coincides with a confirmed-stuck `CURRENT_TIME` state to further test the correlation — none occurred in this window.
 
+### Update (2026-09-07): an 8h36m-armed disarm retried (2/6) with `CURRENT_TIME` confirmed *normal* the whole time — a genuine counter-example on the other side of the correlation
+
+**Source:** the frigate long-term logger, window 2026-09-05 20:47 → 2026-09-07 05:14 UTC (~32.5h, spans an OTA reboot at 2026-09-05 22:22:48 UTC — docs/comment-only, no functional change, see `protocol_investigations.md`'s 2026-09-07 update).
+
+**Observed facts — three arm/disarm cycles this window:**
+
+| Disarm (UTC) | Initiator | Armed since | Duration armed | Retries | `CURRENT_TIME` at disarm |
+| --- | --- | --- | --- | --- | --- |
+| 09-06 01:17:02 | physical (`AAP Keypad`) | 09-05 23:26:39 (physical arm) | ~1h50m | none, instant | normal |
+| 09-07 03:20:50 | integration (`disarm()`, `ESPHome Keypad`) | 09-06 18:44:23 (physical arm) | ~8h36m | **2/6, ~6.7s (backoff 1s→2s)** | normal, confirmed (surrounding `Controller time update`/glitch-recovery broadcasts all self-correct cleanly, no stuck-state broadcast anywhere near the retry) |
+| 09-07 04:08:02 | integration (`disarm()`, `ESPHome Keypad`) | 09-07 03:21:37 (physical arm) | ~46m25s | none, instant | normal |
+
+(A third arm event, 09-06 18:44:23, and its corresponding disarm above bracket the retried cycle; all three arms this window were physical-keypad-initiated, consistent with prior windows where most arms are physical and most disarms are the integration.)
+
+**Inference (medium confidence — revises the 2026-09-03/09-05 correlation):** the middle row is a clean counter-example on the side of the correlation that had, until now, no exceptions: every previously-confirmed-normal-time disarm resolved instantly (2026-09-03 table: 2/2; 2026-09-05 update: 2/2), while every retry case had either confirmed-stuck time or unknown status. This is the first retry observed with `CURRENT_TIME` *confirmed normal* throughout. Combined with the existing 2026-08-31 counter-example on the other side (confirmed-stuck time, instant 3s-later disarm), the `CURRENT_TIME`-stuck correlation no longer looks like even a partial predictor — stuck time is neither necessary nor sufficient for a retry, across the full sample gathered so far. Duration-armed also doesn't split cleanly: this window's longest-armed case (8h36m) retried while a prior window's longest (5h26m) didn't, and this window's two instant cases (1h50m, 46m) bracket the retried one without an obvious threshold.
+
+**Assumption (unverified):** what actually distinguishes the small number of retry cases from the larger number of instant ones is now back to being an open question rather than one with a leading candidate. No other signal (bus corruption rate, watchdog activity, time-of-day) has been checked yet for correlation with this specific retry.
+
+**Practical takeaway:** no code change proposed — the retry/backoff machinery again resolved correctly (2/6, ~6.7s) regardless of cause. Given `CURRENT_TIME`-stuck no longer looks predictive, future sessions should stop treating it as the leading hypothesis and instead capture whatever else is observable at the moment of a retry (recent `ff.`/`fe.` corruption, watchdog trips, or anything else nearby in the log) to look for a different pattern from scratch.
+
 ## Notes
 
 - ARM/STAY/DISARM sequences are simpler than OUTPUT because there's no ACK handshake
