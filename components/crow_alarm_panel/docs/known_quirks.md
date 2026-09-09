@@ -1,4 +1,4 @@
-# Known Issues
+# Known Quirks
 
 Plain-language descriptions of quirks a user of this integration might actually notice —
 in Home Assistant, in the ESPHome logs, or physically at the panel. These are all
