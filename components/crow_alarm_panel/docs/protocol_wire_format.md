@@ -376,6 +376,7 @@ semantics are unknown. Variant A is the normal operational poll.
 | 0 | 1 | `output_bitmap` | Bit N-1 = output N active | High |
 
 Output numbering matches the zone bitmap convention (bit 0 = output 1).
+Output 1 (external siren) = `0x01`. Output 2 (internal siren) = `0x02`.
 Output 4 (garage door relay) = `0x08`.
 
 **Examples:**
@@ -428,6 +429,40 @@ value can coincidentally land back in a valid range).
 → Monday 2026-05-11 02:01:15
   day_of_week=2(Mon), minutes=0x0079=121→02:01, sec=15, day=11, month=5, year=0x1A=26
 ```
+
+---
+
+### 0x7C — Unlabeled, likely RF remote arm/disarm event
+
+*Direction:* Unknown source → broadcast (not yet attributable to a keypad address; no `keypad_addr` byte pattern matches the existing keypad-address convention)  
+*Trigger (inferred):* An arm/disarm triggered by the official RF remote — not observed for any physical-keypad or integration-initiated arm/disarm  
+*Min length:* 8 payload bytes  
+*Confidence:* Medium-high on the RF-remote attribution (two independent corroborating signals — see below); low on byte semantics, which remain undecoded
+
+**Observed facts (2026-09-09, frigate long-term logger, [[project-crow-alarm-protocol-trace]]):** across ~3 days of continuous capture spanning two remote-triggered arm/disarm cycles (confirmed by the user via the remote's distinct chime — one beep on arm, two on disarm), exactly 8 `Unknown [7c...]` lines appeared, and *only* at those two cycles — never at any of the several physical-keypad or integration-initiated arm/disarm events in the same capture. Each arm and each disarm produces a pair of near-identical lines ~0.6–0.7s apart (looks like the bus's usual same-event retransmit-for-reliability pattern seen elsewhere, e.g. `KEYPAD_COMMAND` bursts):
+
+```
+23:23:41  7c 90 00 36 BC F6 45 DC DE   (arm,    seq 1)
+23:23:42  7c 90 00 36 BC F6 49 D8 DE   (arm,    seq 1, retransmit)
+23:25:00  7c 90 00 36 C0 FA 46 CC EE   (disarm, seq 1)
+23:25:01  7c 90 00 36 C0 FA 4A C8 EE   (disarm, seq 1, retransmit)
+
+02:11:49  7c 90 00 36 BC F6 45 DC BE   (arm,    seq 2)
+02:11:50  7c 90 00 36 BC F6 49 D8 BE   (arm,    seq 2, retransmit)
+02:12:30  7c 90 00 36 C0 FA 46 CC BE   (disarm, seq 2)
+02:12:30  7c 90 00 36 C0 FA 4A C8 BE   (disarm, seq 2, retransmit)
+```
+
+**Byte-level pattern (observed, semantics not established):**
+
+- data[0..1] (`90 00`) and data[2] (`36`) are constant across all 8 lines.
+- data[3]/data[4] (`BC F6` vs `C0 FA`) distinguish arm from disarm, consistently, in both sequences — `C0 - BC = 4` and `FA - F6 = 4`, the same `+4` step seen elsewhere in this device's fixed-offset fields (e.g. the `CURRENT_TIME` day/month fault set in `protocol_investigations.md`), though here it looks like intentional encoding rather than corruption since it's 100% consistent, not a rare fault.
+- data[5]/data[6] (e.g. `45 DC` → `49 D8`) shift by exactly `+4`/`-4` between the initial send and its retransmit ~0.6–0.7s later — plausibly a counter or partial-timestamp field ticking between the two transmissions.
+- data[7] (`DE` vs `BE`) is stable across an entire arm+disarm cycle but differs between the two cycles (different calendar dates, ~3h apart) — could be date-dependent, a rolling code/session counter from the remote itself, or something else; not enough samples to distinguish.
+
+**Inference (medium-high confidence on attribution, low confidence on mechanism):** the perfect correlation with remote-triggered events only (0/many at keypad or integration events, 8/8 at exactly the two remote cycles) makes it very likely this packet is specific to whatever hardware handles the RF remote (a receiver module wired into the panel, presumably not enumerated as a normal keypad address) reporting the arm/disarm event it just triggered. A second, independent signal points the same way: the external siren (`OUTPUT_STATE` Output 1 — see `0x50` above) chirps once on arm / twice on disarm with the same 8/8-vs-0 exclusivity to remote-triggered events (`protocol_investigations.md`, 2026-09-09 second follow-up) — two unrelated fields both singling out exactly the same two events is stronger evidence than either alone, even though neither packet's payload obviously *encodes* the 1-vs-2 beep count itself (0x7C sends one arm-flavored pair and one disarm-flavored pair regardless; the siren chirp count is presumably driven by the controller's own arm/disarm logic, not read out of the 0x7C payload). Still open: whether 0x7C is cause (controller reacts to it) or a parallel effect of the same remote-triggered event as the siren chirp.
+
+**Practical takeaway:** no code change — not a keypad-address-scoped message, doesn't fit any existing entity. Worth another remote-triggered capture (ideally 3+ more cycles, and across more calendar dates) to test whether data[7] tracks date, a counter, or something else, and whether the `+4` fields ever take a third value (e.g. for `arm_stay` if the remote supports it, which hasn't been observed yet).
 
 ---
 

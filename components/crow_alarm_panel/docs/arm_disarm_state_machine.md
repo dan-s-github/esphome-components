@@ -600,6 +600,22 @@ settle it.
 
 **Practical takeaway:** no code change proposed — the retry/backoff machinery again resolved correctly (2/6, ~6.7s) regardless of cause. Given `CURRENT_TIME`-stuck no longer looks predictive, future sessions should stop treating it as the leading hypothesis and instead capture whatever else is observable at the moment of a retry (recent `ff.`/`fe.` corruption, watchdog trips, or anything else nearby in the log) to look for a different pattern from scratch.
 
+### Update (2026-09-09): first data point for the "other signals" search — a retry ~5 minutes after a corruption-burst/watchdog-trip episode, vs. three bus-clean instant cycles
+
+**Source:** the frigate long-term logger, window 2026-09-08 08:40 → 2026-09-09 05:09 UTC. Three arm/disarm sequences this window; the first two were confirmed by the user to be triggered by the official RF remote (distinct chime pattern: once on arm, twice on disarm) rather than a keypad or this integration — the bus itself can't distinguish remote-fob input from any other non-integration source, since both simply appear as Controller `ARMED_STATE` broadcasts with no accompanying keypress/command traffic.
+
+**Observed facts:**
+
+| Sequence | Arm (UTC) | Disarm (UTC) | Duration armed | Retries | Nearby `ff.`/`fe.`/watchdog activity |
+| --- | --- | --- | --- | --- | --- |
+| 1 (remote) | 23:23:41 → confirmed 23:24:10 (09-08) | 23:25:00 | ~50s | none, instant | none within ±10min |
+| 2 (remote) | 02:11:49 → confirmed 02:12:17 (09-09) | 02:12:30 | ~13s | none, instant | none within ±10min |
+| 3 (integration) | `arm_away()` 03:48:43 → confirmed 03:49:11 | `disarm()` 04:43:55 | ~54m44s | **2/6, ~6.2s (backoff 1s→2s)** | clustered burst `04:37:40–42` (8 lines) → watchdog trip `04:38:40` → 3 repeated `Armed Away` re-broadcasts, all ending **~5min before** the `04:43:55` disarm call; nothing closer, nothing during the retry window itself |
+
+**Inference (low confidence — one data point):** this is the first retry-associated case where a bus-corruption/watchdog episode occurred anywhere near the event, in either direction — the two remote-triggered cycles (bus-clean, instant) and the earlier `CURRENT_TIME`-normal instant cases from prior windows give no reason to expect corruption alone to force a retry, but this is also the first time anyone has actually looked. The ~5-minute gap is a meaningful caveat against reading too much into it: nothing in the doc's existing model gives an episode that already resolved (watchdog trip fired, ping resumed) a mechanism for causing trouble 5 minutes later — a "controller side-effects from the re-registration/state-resend persist briefly" theory is speculative, not evidenced. Equally consistent with pure coincidence given this integration's baseline retry rate is already nonzero without any corruption present (e.g. the 2026-09-07 8h36m-armed retry had a fully bus-clean surrounding window).
+
+**Practical takeaway:** no code change. Record as the first candidate data point for the "other signals" search opened in the 2026-09-07 update, but do not treat corruption/watchdog proximity as a working hypothesis yet — one data point with a 5-minute gap is far weaker than the exact-concurrency signature that would make it convincing. Next retry should be checked specifically for whether corruption/watchdog activity is concurrent (same or adjacent minute) rather than just "somewhere in the preceding window," which would be the actual bar for this to become a real lead.
+
 ## Notes
 
 - ARM/STAY/DISARM sequences are simpler than OUTPUT because there's no ACK handshake
@@ -608,3 +624,4 @@ settle it.
 - ARMED_STATE messages (0x11) are published independently regardless of `arm_disarm_state_` (entities always reflect them). As of 2026-08-22, an ARMED_STATE broadcast matching the request's intent resolves the sequence from **any** non-IDLE state (including a retry backoff wait) — see "Retry backoff + intent-matched ARMED_STATE resolution" above. `CODE_ENTER_PENDING` remains the only state that *requires* one to succeed (`ARM_AWAY_PENDING`/`ARM_STAY_PENDING` still resolve on their KEYPAD_COMMAND ack).
 - All three keypads receive Command broadcasts during arming/disarming; only the originating keypad controls the sequence
 - `disarm()` also guards against calling when already disarmed — it returns early if `is_armed()` is false
+- Audible chime count on the official RF remote distinguishes it from other input sources when reading a trace: **one chime on arm, two chimes on disarm** (confirmed by the user, 2026-09-09). Useful because the bus itself can't tell remote-fob input apart from any other non-integration source — both simply appear as a Controller `ARMED_STATE` broadcast with no accompanying keypress/command traffic, unlike physical-keypad or integration-initiated sequences which leave a `Code sequence:`/keypress trail
