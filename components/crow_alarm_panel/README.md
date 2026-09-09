@@ -248,3 +248,7 @@ logger:
   logs:
     crow_alarm_panel: DEBUG
 ```
+
+Seeing an occasional `WARN` line or a disarm/arm that takes a few extra seconds? Check
+[`docs/known_issues.md`](docs/known_issues.md) before assuming it's a new bug — most
+recurring log noise from this component is already understood and benign.

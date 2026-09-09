@@ -41,6 +41,7 @@ There is no source-code lint target or unit-test suite; ESPHome config validatio
 - `keypad_protocol_types.md` — packet type catalogue (known vs inferred meanings)
 - `arm_disarm_state_machine.md` / `output_select_state_machine.md` — state machine design rationale
 - `protocol_investigations.md` — raw observations and open questions
+- `known_issues.md` — user-facing translation of the above: symptoms a user could actually notice (log warnings, delayed disarms, siren chirps), why they happen, and whether action is needed. Update it when an investigation finding has a user-visible symptom, not just internal byte-level detail.
 
 Distinguish observed facts from inferred hypotheses when adding to these docs or to log messages; unknown packet meanings are labeled conservatively. `skills/protocol-reverse-engineering/skill.md` defines the analysis methodology used for trace work.
 
