@@ -36,6 +36,11 @@ static const uint8_t OUTPUT_STATE = 0x50;
 static const uint8_t CURRENT_TIME = 0x54;
 static const uint8_t KEYPAD_PING = 0x23;  // Observed recurring keypad keep-alive/ping traffic
 static const uint8_t KEYPAD_REGISTRATION = 0xA0;  // Keypad announce: [a0.address.00]; sent on power-up/reset
+
+// RF remote button-press event, not tied to any keypad address. data[0..2] is a fixed per-remote
+// identity; data[3..4] is a per-remote, per-button code (not portable across remote units — see
+// docs/protocol_wire_format.md's 0x7C entry).
+static const uint8_t RF_REMOTE_EVENT = 0x7C;
 static const uint8_t BOUNDARY = 0x7E;
 // static const uint8_t KEYPRESS = 0xD1; // This is from upstream, but doesn't get sent by arrowhead panels that I can see
 static const uint8_t KEYPRESS = 0xA1;
