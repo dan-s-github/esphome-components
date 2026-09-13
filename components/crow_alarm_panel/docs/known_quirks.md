@@ -36,6 +36,30 @@ ever exhausts all 6 retries and gives up (`Arm/disarm: timeout in state %u, abor
 
 ---
 
+## Output changes (e.g. garage door) occasionally retry once before completing
+
+**What you'll see:** calling `set_output()` (garage door, gate, etc. from Home Assistant)
+usually completes in well under a second, but occasionally the log shows a couple of
+WARN-level lines partway through before it finishes successfully a moment later:
+
+```text
+[W] Output-select: timeout in state 3, retrying (output select)
+[W] Output-select: KEYPAD_COMMAND in OUTPUT_PENDING (no 0x1D), recovering
+```
+
+**Cause:** the same bus-corruption noise documented below (`Unknown [ff.]`/`Unknown [fe.]`)
+can occasionally land in the slot where the controller's next confirmation was expected
+during an output-select sequence, same as it can for arm/disarm. The state machine's
+built-in timeout/retry and out-of-sequence recovery logic re-synchronizes and completes
+the sequence normally — confirmed in a real capture (`protocol_investigations.md`,
+2026-09-13 entry), where the output still switched correctly ~1.4s after the corruption
+event.
+
+**What to do:** nothing — the output still ends up in the correct state. Only worth
+reporting if an output-select sequence ever fails outright rather than retrying through.
+
+---
+
 ## Occasional `Unknown [ff.]` / `Unknown [fe.]` log lines
 
 **What you'll see:** at `DEBUG` level, occasional lines like `Unknown [ff.]` or
