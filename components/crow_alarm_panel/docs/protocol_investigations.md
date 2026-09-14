@@ -495,6 +495,16 @@ This does not currently appear to cause the `CODE_ENTER_PENDING` arm/disarm fail
 
 **Practical takeaway:** no code change — already a log-only, non-actionable artifact. Update `protocol_trace_2026-08-05_disarm_after_arm.md`'s framing if it comes up again, to describe this as a rare receiver-side decode glitch rather than a disarm-after-arm-specific one.
 
+### Update (2026-09-14): `ff.`/`fe.` corruption and watchdog trips both drop to zero for a full ~27h window; third `ARMED_STATE` malformed-decode occurrence has a different type byte than the first two
+
+**Source:** frigate long-term logger, window 2026-09-13 04:14 → 2026-09-14 07:26 UTC (~27h13m, no reboot/OTA in-window) ([[project-crow-alarm-protocol-trace]]).
+
+**Findings (observed facts):** zero `Unknown [ff.]`/`[fe.]` lines anywhere in the entire window — a sharper version of the 2026-09-06 dip (2-in-21h) with no corruption at all this time, against an established baseline of ~0.84–0.94/h. Registration-watchdog trips: also zero, consistent with (not a counter-example to) the poll-slot/watchdog mechanism, since there was no corruption burst to trigger one. Frame-FIFO backlog/overflow counters stayed at zero throughout, and no truncated-frame WARNs (`Controller status too short`, `Zone state invalid length`, `Output state too short`, `Current time too short`) occurred. A third instance of the malformed 7-byte `Armed state unknown` decode appeared at `2026-09-13 15:40:25` UTC — `[13.83.01.46.81.00.80.11 (7)]`, identical to the previous two except the leading type byte is `0x13` rather than `0x11` (bytes 2–7 unchanged) — again with no adjacent arm/disarm activity, consistent with the 2026-09-13 revision to "rare receiver-side glitch, not context-gated."
+
+**Inference (medium confidence):** the zero-corruption window is a second data point that the `ff.`/`fe.` rate is genuinely variable session-to-session rather than a stable ~1/h baseline — worth tracking as its own signal rather than assuming a dip is anomalous. The new `0x13` variant of the malformed `ARMED_STATE` decode is consistent with the existing "single/few-bit corruption on the type byte" framing used elsewhere in this doc (e.g. the `0x91` family) — `0x11` and `0x13` differ by one bit (`0x02`) — rather than suggesting a new, distinct artifact.
+
+**Practical takeaway:** no code change. Next log-mining check should start from **2026-09-14 07:26 UTC**. Standing checklist: poll-slot/watchdog exceptions (still 15+/15+, zero exceptions on record), the October month-value flip (due on/after 2026-10-01, see the `×4`-multiplier entry below), any new arm/disarm retry (see `arm_disarm_state_machine.md`'s 2026-09-14 update — this window's retry had zero corruption/watchdog activity anywhere in the surrounding 27h, a clean data point against the corruption-proximity lead), and whether the `ff.`/`fe.` rate returns to baseline or this dip persists.
+
 ## `Unknown [91.]` — new unlabeled packet type
 
 **Source:** `traces/esphome-aap-alarm-interface-logs-34.txt`, a ~1h47m standard-debug-level session with four keypads live (`AAP`, `ESPHome`, `Control 4`, `IP`), otherwise unremarkable (normal disarmed-state zone activity, the already-documented `CURRENT_TIME` glitch, one controller reset with the usual re-registration signature).

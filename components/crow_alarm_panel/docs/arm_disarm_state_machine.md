@@ -616,6 +616,20 @@ settle it.
 
 **Practical takeaway:** no code change. Record as the first candidate data point for the "other signals" search opened in the 2026-09-07 update, but do not treat corruption/watchdog proximity as a working hypothesis yet — one data point with a 5-minute gap is far weaker than the exact-concurrency signature that would make it convincing. Next retry should be checked specifically for whether corruption/watchdog activity is concurrent (same or adjacent minute) rather than just "somewhere in the preceding window," which would be the actual bar for this to become a real lead.
 
+### Update (2026-09-14): a 9h31m-armed disarm retried (2/6) with zero `ff.`/`fe.` corruption or watchdog activity anywhere in the entire surrounding ~27h window — the cleanest data point yet against the corruption-proximity lead
+
+**Source:** the frigate long-term logger, window 2026-09-13 04:14 → 2026-09-14 07:26 UTC (~27h13m). Only one integration-initiated arm/disarm sequence this window.
+
+**Observed facts:**
+
+| Disarm (UTC) | Initiator | Armed since | Duration armed | Retries | `CURRENT_TIME` at disarm | Nearby `ff.`/`fe.`/watchdog activity |
+| --- | --- | --- | --- | --- | --- | --- |
+| 09-14 04:29:50 | integration (`disarm()`, `ESPHome Keypad`) | 09-13 18:58:41 (physical arm) | ~9h31m | **2/6, ~6.4s (backoff 1s→2s)** | normal, confirmed (glitch-recovery and `Controller time update` broadcasts self-correcting cleanly seconds before and after) | **none** — zero `ff.`/`fe.` occurrences anywhere in the entire 27h13m window, not just nearby (see `protocol_investigations.md`'s 2026-09-14 update) |
+
+**Inference (medium confidence — reinforces the 2026-09-07 revision, further undermines the 2026-09-09 corruption-proximity lead):** this retry occurred in a window with no bus corruption at all, ruling out even loose proximity as an explanation this time — stronger than the 2026-09-09 data point, which at least had a corruption/watchdog episode 5 minutes prior. Combined with the 2026-09-07 8h36m-armed/normal-time retry, this is now the second long-armed, normal-`CURRENT_TIME`, bus-clean retry on record. Neither `CURRENT_TIME`-stuck state, corruption proximity, nor duration-armed alone has held up as a predictor across the full sample; the "other signals" search opened 2026-09-07 has now run through its most obvious candidates without finding one.
+
+**Practical takeaway:** no code change proposed — retry/backoff resolved correctly again (2/6, ~6.4s). Given corruption proximity, `CURRENT_TIME` state, and armed-duration have each been tried and each produced clean counter-examples, a future session should treat this as a lower-priority open question rather than actively hunting for a new candidate signal each time — revisit if a strikingly different case shows up (e.g. a retry that fails to resolve within the existing 6-attempt budget), but routine single retries no longer need dedicated investigation each occurrence.
+
 ## Notes
 
 - ARM/STAY/DISARM sequences are simpler than OUTPUT because there's no ACK handshake
