@@ -922,8 +922,8 @@ void CrowAlarmPanel::loop() {
           ESP_LOGW(TAG, "RF remote event too short, discarding");
           break;
         }
-        ESP_LOGD(TAG, "[RF Remote %02x:%02x:%02x] Button event [%02x.%s]", data[0], data[1], data[2], type,
-                 format_hex_pretty(data).c_str());
+        ESP_LOGD(TAG, "[RF Remote %02x:%02x:%02x] Button event, code %02x:%02x [%02x.%s]", data[0], data[1],
+                 data[2], data[3], data[4], type, format_hex_pretty(data).c_str());
         break;
       }
       default:
