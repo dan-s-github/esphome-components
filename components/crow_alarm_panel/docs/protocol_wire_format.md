@@ -448,7 +448,7 @@ that pins this down.
 
 ### 0x7C — RF remote button-press event
 
-*Direction:* Unknown source → broadcast (not yet attributable to a keypad address; no `keypad_addr` byte pattern matches the existing keypad-address convention)  
+*Direction:* RF receiver card → Controller (confirmed by the causality analysis below; not a keypad address — see the manual cross-reference below for why `data[0..2]` never matches the keypad-address convention)  
 *Trigger:* A button press on one of the official RF remotes — never observed for any physical-keypad or integration-initiated command  
 *Min length:* 8 payload bytes  
 *Confidence:* Confirmed on the RF-remote attribution and on which button was pressed (vendor manual, cross-checked below against four independent trace-derived signals per button); low on the exact byte-level encoding mechanism
@@ -491,7 +491,7 @@ that pins this down.
 
 **Inference (high confidence on attribution and per-button identification):** four independent buttons on two separate remote units all show the same signature: an exclusive `0x7C` pair, occurring only when that specific button is pressed, on top of the corroborating `OUTPUT_STATE` (`0x50`) evidence below — reproduced identically across two physically distinct remotes rules out coincidence. The `+N`/`-N` vs. gate's different retransmit pattern (medium confidence, mechanism unknown) suggests gate's button encoding on the remote itself works differently from the other three, not a receiver-side artifact, since it's consistent across both remotes.
 
-**Causality (high confidence, resolves the previously-open question):** the first `0x7C` frame of each pair precedes the controller's resulting action (the `ARMED_STATE`/`Disarmed` broadcast, or the `OUTPUT_STATE` pulse) by ~100–150ms in all 8 button presses checked (both remotes × all 4 buttons) — never simultaneous-or-after. `0x7C` is therefore the RF receiver reporting the button press *to* the controller, which then acts on it ~100ms later — a cause, not a parallel echo of an action already taken.
+**Causality (high confidence, resolves the previously-open question):** the first `0x7C` frame of each pair precedes the controller's resulting action (the `ARMED_STATE`/`Disarmed` broadcast, or the `OUTPUT_STATE` pulse) in all 8 button presses checked (both remotes × all 4 buttons) — never simultaneous-or-after. Measured deltas range from +98ms to +147ms, with one exception (Remote A's arm case landed in the same logged millisecond, `0x7C` still ordered first in the log). `0x7C` is therefore the RF receiver reporting the button press *to* the controller, which then acts on it roughly 100ms later — a cause, not a parallel echo of an action already taken.
 
 A second, independent signal confirms each button-to-function mapping: `OUTPUT_STATE` (`0x50`) pulses the output that function drives, every time, for every press, on both remotes:
 

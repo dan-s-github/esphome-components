@@ -918,7 +918,7 @@ void CrowAlarmPanel::loop() {
         break;
       }
       case RF_REMOTE_EVENT: {
-        if (data.size() < 3) {
+        if (data.size() < 5) {
           ESP_LOGW(TAG, "RF remote event too short, discarding");
           break;
         }

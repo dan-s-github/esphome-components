@@ -25,10 +25,12 @@ the final one. The log (at `DEBUG`) will show lines like:
 
 **Cause:** the component's retry/backoff logic re-sends the keypress sequence when the
 controller doesn't confirm in time. This has always resolved successfully within the
-6-retry budget in every case observed so far (worst case seen: ~42s). No single root
-cause has been confirmed — a `CURRENT_TIME` correlation theory was tested and later ruled
-out; a bus-corruption/watchdog-proximity theory is the current (unconfirmed, single-data-point)
-lead. See `arm_disarm_state_machine.md` for the full retry investigation history.
+6-retry budget in every case observed so far (worst case seen: ~42s). No root cause has
+been confirmed — a `CURRENT_TIME` correlation theory and a bus-corruption/watchdog-proximity
+theory were each tested and later ruled out by counter-examples (most recently a retry
+that occurred during a full ~27h window with zero corruption or watchdog activity
+anywhere). The cause remains genuinely open and is currently a low-priority thread, not
+an active lead. See `arm_disarm_state_machine.md` for the full retry investigation history.
 
 **What to do:** nothing — this is the retry logic working as intended. If a disarm/arm
 ever exhausts all 6 retries and gives up (`Arm/disarm: timeout in state %u, aborting after
@@ -83,22 +85,24 @@ captures, followed immediately by the integration re-registering itself on the b
 functional interruption — entities keep working normally.
 
 **Cause:** established with no exceptions across many observed instances — this fires
-exactly when a `Unknown [ff.]`/`[fe.]` corruption burst (see above) happens to land in
+exactly when an `Unknown [ff.]`/`[fe.]` corruption burst (see above) happens to land in
 this integration's own poll slot, so the controller's periodic "ping" is missed for one
 cycle. The component's watchdog notices and re-announces, recovering automatically.
 
 **What to do:** nothing — this is the existing watchdog recovering exactly as designed.
-If it ever happened much more frequently than roughly hourly, that would be worth a fresh
-look; the current rate has been stable across many days of capture.
+The observed baseline has varied between capture windows, including at least one full
+~21-27h window with zero trips, so treat "roughly hourly" as a loose upper bound rather
+than a stable rate; a sustained rate well above that would still be worth a fresh look.
 
 ---
 
-## Occasional `WARN`-level "Current time has invalid ..." log lines
+## Occasional "Current time has invalid ..." log lines
 
-**What you'll see:** at `DEBUG`/`WARN` level, occasional lines like `Current time has
-invalid day/month value 36/36`, `invalid seconds value 90`, or `invalid
-minutes-since-midnight value 1470`. Not visible anywhere in Home Assistant — the panel's
-`CURRENT_TIME` broadcast isn't exposed as an entity.
+**What you'll see:** lines like `Current time has invalid day/month value 36/36` or
+`invalid seconds value 90` (logged at `DEBUG`), or `invalid minutes-since-midnight value
+1470` (logged at `WARN`, since it means the whole frame's time-of-day is unusable, not
+just one field). Not visible anywhere in Home Assistant — the panel's `CURRENT_TIME`
+broadcast isn't exposed as an entity.
 
 **Cause:** a well-characterized bus-level bit glitch on the `CURRENT_TIME` (`0x54`)
 broadcast (a spurious extra bit shifts later fields by one position, indistinguishable
@@ -107,8 +111,10 @@ rather than varying randomly, and the minutes-since-midnight variant has recurre
 same ~2-minute wall-clock window on multiple consecutive days — see the dated
 `CURRENT_TIME` sections of `protocol_investigations.md` for the full byte-level analysis.
 
-**What to do:** nothing — the component already discards corrupted `CURRENT_TIME` frames
-rather than acting on them, and no entity depends on this data.
+**What to do:** nothing — for day/month/year the component tries to recover the known
+doubled-bit glitch first (cross-checked against the frame's own weekday field before
+trusting the recovery) and only discards the frame if that check fails; other invalid
+fields are discarded outright. Either way, no entity depends on this data.
 
 ---
 
