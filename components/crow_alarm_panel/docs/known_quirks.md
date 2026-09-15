@@ -24,17 +24,20 @@ the final one. The log (at `DEBUG`) will show lines like:
 ```
 
 **Cause:** the component's retry/backoff logic re-sends the keypress sequence when the
-controller doesn't confirm in time. This has always resolved successfully within the
-6-retry budget in every case observed so far (worst case seen: ~42s). No root cause has
-been confirmed — a `CURRENT_TIME` correlation theory and a bus-corruption/watchdog-proximity
-theory were each tested and later ruled out by counter-examples (most recently a retry
-that occurred during a full ~27h window with zero corruption or watchdog activity
-anywhere). The cause remains genuinely open and is currently a low-priority thread, not
-an active lead. See `arm_disarm_state_machine.md` for the full retry investigation history.
+controller doesn't confirm in time. Since the retry budget was raised from 5 to 6 (with a
+growing 1s–13s backoff), every case observed has resolved successfully within budget
+(worst case seen: ~42s, a full 6/6-retry sequence). No root cause has been confirmed — a
+`CURRENT_TIME` correlation theory and a bus-corruption/watchdog-proximity theory were each
+tested and later ruled out by counter-examples (most recently a retry that occurred during
+a full ~27h window with zero corruption or watchdog activity anywhere). The cause remains
+genuinely open and is currently a low-priority thread, not an active lead. See
+`arm_disarm_state_machine.md` for the full retry investigation history.
 
-**What to do:** nothing — this is the retry logic working as intended. If a disarm/arm
-ever exhausts all 6 retries and gives up (`Arm/disarm: timeout in state %u, aborting after
-%u retries`), that would be worth reporting; it has not been observed in any capture so far.
+**What to do:** nothing — this is the retry logic working as intended. Before the budget
+was raised, two `disarm()` calls did exhaust the then-5-retry budget and abort
+(`arm_disarm_state_machine.md`, 2026-08-19 entry) — the motivation for the fix. Since the
+budget increase to 6, exhaustion (`Arm/disarm: timeout in state %u, aborting after %u
+retries`) has not recurred in any capture; if it ever does, that would be worth reporting.
 
 ---
 
@@ -51,11 +54,13 @@ WARN-level lines partway through before it finishes successfully a moment later:
 
 **Cause:** the same bus-corruption noise documented below (`Unknown [ff.]`/`Unknown [fe.]`)
 can occasionally land in the slot where the controller's next confirmation was expected
-during an output-select sequence, same as it can for arm/disarm. The state machine's
-built-in timeout/retry and out-of-sequence recovery logic re-synchronizes and completes
-the sequence normally — confirmed in a real capture (`protocol_investigations.md`,
-2026-09-13 entry), where the output still switched correctly ~1.4s after the corruption
-event.
+during an output-select sequence. The state machine's built-in timeout/retry and
+out-of-sequence recovery logic re-synchronizes and completes the sequence normally —
+confirmed in a real capture (`protocol_investigations.md`, 2026-09-13 entry), where the
+output still switched correctly ~1.4s after the corruption event. (The arm/disarm retries
+above look similar but corruption proximity was specifically tested as a cause there and
+ruled out by counter-examples — this output-select mechanism is confirmed, arm/disarm's
+isn't.)
 
 **What to do:** nothing — the output still ends up in the correct state. Only worth
 reporting if an output-select sequence ever fails outright rather than retrying through.
@@ -73,15 +78,20 @@ anything this integration does) faster than our receiver can cleanly decode it �
 receiver sees the retransmission burst as corrupted data rather than as a repeated valid
 frame. Documented and bit-level-confirmed in `protocol_investigations.md`.
 
-**What to do:** nothing — purely cosmetic log noise from bus-level behavior outside this
-integration's control.
+**What to do:** nothing for an isolated line — that's purely cosmetic log noise from
+bus-level behavior outside this integration's control. A clustered burst is the same
+underlying cause but can occasionally trigger the watchdog re-announce or an output-select
+retry documented elsewhere on this page; those are self-recovering too, so still nothing
+to act on, just don't be surprised if one of those other entries' symptoms shows up right
+after a burst.
 
 ---
 
 ## Occasional "No ping for 60 s, re-sending registration announce" warning
 
-**What you'll see:** a `WARN`-level log line, roughly every few hours in long-term
-captures, followed immediately by the integration re-registering itself on the bus. No
+**What you'll see:** a `WARN`-level log line, at a rate that's varied a lot between
+capture windows — roughly 0.05–0.9/h in most windows, with some full 21–27h windows at
+zero — followed immediately by the integration re-registering itself on the bus. No
 functional interruption — entities keep working normally.
 
 **Cause:** established with no exceptions across many observed instances — this fires
@@ -114,7 +124,9 @@ same ~2-minute wall-clock window on multiple consecutive days — see the dated
 **What to do:** nothing — for day/month/year the component tries to recover the known
 doubled-bit glitch first (cross-checked against the frame's own weekday field before
 trusting the recovery) and only discards the frame if that check fails; other invalid
-fields are discarded outright. Either way, no entity depends on this data.
+fields are discarded outright. No entity depends on this data either way, so even the
+theoretical edge case where a rarer `×4`-corrupted date could pass the weekday check by
+chance (`protocol_wire_format.md`'s `CURRENT_TIME` entry) isn't user-actionable.
 
 ---
 

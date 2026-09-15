@@ -807,6 +807,8 @@ Other signatures this window, all continuing established patterns with no except
 
 **Practical takeaway:** no code change. Next window should start from 2026-09-10 04:55 UTC. Keep watching for: the month-value prediction above (expect `40` after the October rollover, a ways off yet); any exception to the now-10/10 poll-slot/watchdog correlation; and another integration disarm retry to keep testing the corruption-proximity question.
 
+## RF remote (`0x7C`) button-press event — investigation thread
+
 ### Update (2026-09-09, follow-up): the two remote-triggered sequences both carry a previously-unseen `Unknown [7c...]` packet pair, exclusively — new unlabeled type documented in `protocol_wire_format.md`
 
 **Source:** re-checked ~3 days of frigate capture (`crow-alarm.log.2.gz`/`.1`/current) around all arm/disarm events after the user flagged that an `Unknown` log line might be the RF remote's chime.
@@ -891,6 +893,8 @@ Checked the same field across the integration-initiated cycle (`arm_away()` 03:4
 **Inference:** none needed — this is the vendor's own documented mechanism name, matching the trace behavior exactly. Promotes the 2026-09-09 "Inference (medium-high confidence)" siren-chirp finding to confirmed: it is the panel's `P50E`/`P52E` Pendant Chirp feature, output-assignable and enabled on this installation to Output 1 (the external siren).
 
 **Practical takeaway:** no code change — updates the "Whether this is fixed factory behavior or a programmable controller option... isn't established either way" line from the 2026-09-09 entry above: it's now known to be the latter, a programmable option (`P50E`–`P53E`), confirmed enabled to Output 1 on this panel. Doesn't change any parsing, since `OUTPUT_STATE` was already correctly decoded — this only firms up the *why*.
+
+## `CURRENT_TIME` daily periodicity investigation — what triggers the `invalid minutes-since-midnight` episode at the same wall-clock window every day
 
 ### Update (2026-09-10, cont.): manual's Automatic Test Call feature is a plausible (unconfirmed) trigger for the daily `invalid minutes-since-midnight` episode — the first candidate mechanism for the "what happens near 11:26 UTC" question open since 2026-09-05
 

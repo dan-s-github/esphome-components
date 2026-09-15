@@ -426,9 +426,12 @@ alignment by one position for the rest of the frame — for `day`/`month`/`year`
 of those three bytes being doubled. It recurs deterministically once per
 minute, at the `seconds = 15` broadcast. See `protocol_investigations.md`
 ("`CURRENT_TIME` (0x54) periodic bit-corruption glitch") for the full
-byte-level analysis. All fields must be validated individually before use,
-and corrupted frames should be discarded rather than corrected (a doubled
-value can coincidentally land back in a valid range).
+byte-level analysis. Naive per-field range validation alone isn't enough — a doubled
+value can coincidentally land back in a valid range — so the implementation only
+"corrects" this specific known glitch (halve day/month/year, then cross-check the
+recovered date's weekday against the frame's own untouched weekday byte before trusting
+it) and discards the frame outright if that cross-check fails. Any other corruption not
+matching this exact recovered-and-verified pattern is discarded, not guessed at.
 
 A related but distinct variant exists: `day`/`month` corrupted by a `×4` (not `×2`)
 multiplier. Confirmed (2026-09-10) as `real_value × 4`, not arbitrary garbage — see
@@ -455,7 +458,7 @@ recovery logic's guarantees, not a confirmed live bug.
 
 *Direction:* RF receiver card → Controller (confirmed by the causality analysis below; not a keypad address — see the manual cross-reference below for why `data[0..2]` never matches the keypad-address convention)  
 *Trigger:* A button press on one of the official RF remotes — never observed for any physical-keypad or integration-initiated command  
-*Min length:* every capture observed is 8 payload bytes; the parser only requires 5 (`data[0..2]` identity + `data[3..4]` button code) since those are all it decodes  
+*Min length:* 5 payload bytes (`data[0..2]` identity + `data[3..4]` button code — all the parser decodes; 8 bytes seen in practice in every capture)  
 *Confidence:* Confirmed on the RF-remote attribution and on which button was pressed (vendor manual, cross-checked below against four independent trace-derived signals per button); low on the exact byte-level encoding mechanism
 
 **Manual cross-reference (`ESL-2 Install & Program Manual (E.V).pdf`, pages 17–19, 48–54):** the panel's RF path is a separate plug-in receiver card, the RX-16 MF349, connected via the "ARRI4" cable — the manual notes explicitly that if this cable is unavailable, "you can wire the receiver the same as a keypad," i.e. the receiver rides the same physical clock/data bus as keypads and presumably reuses the same frame format, which is why `0x7C` shows up as a normal-looking frame despite not coming from a keypad. Remotes are enrolled as **Radio Users** in User slots 21–100 — a completely different addressing space from keypad bus addresses — which is *why* `data[0..2]` never matches the keypad-address convention: it isn't a malformed/omitted keypad address, radio users are categorically not keypads. Each physical 4-button pendant is manual-documented as up to **five separate learned radio-user identities**, one per function class, each with its own program-address block and independent "press the button you wish to learn in" enrollment step: Arm-only (`P18E40E`–`P18E49E` for pendants 0–9), Disarm-only (`P18E50E`–`P18E59E`), **Door 2 Control, linked to Output 3** (`P18E60E`–`P18E69E`), **Door 1 Control, linked to Output 4** (`P18E70E`–`P18E79E`), and Panic (`P18E80E`–`P18E89E`). This structurally explains why `data[3..4]` differs per button even on the *same* physical remote (observed below): each button isn't a sub-code of one remote identity, it's independently enrolled as its own radio user. It also independently confirms the output mapping found by trace: "Door 1" (garage, Output 4) and "Door 2" (Output 3 — wired to the user's gate in this installation, but generically named "Door 2" by the panel) match our button 4/button 3 findings exactly. The manual doesn't document `0x7C`'s on-wire byte layout (it's user/installer-facing, not a protocol reference) — the retransmit-pattern and checksum-byte details below remain trace-only.
