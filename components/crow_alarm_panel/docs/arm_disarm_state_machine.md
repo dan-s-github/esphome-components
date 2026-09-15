@@ -580,6 +580,56 @@ settle it.
 
 **Practical takeaway:** no code change proposed. Still waiting on a disarm that coincides with a confirmed-stuck `CURRENT_TIME` state to further test the correlation — none occurred in this window.
 
+### Update (2026-09-07): an 8h36m-armed disarm retried (2/6) with `CURRENT_TIME` confirmed *normal* the whole time — a genuine counter-example on the other side of the correlation
+
+**Source:** the frigate long-term logger, window 2026-09-05 20:47 → 2026-09-07 05:14 UTC (~32.5h, spans an OTA reboot at 2026-09-05 22:22:48 UTC — docs/comment-only, no functional change, see `protocol_investigations.md`'s 2026-09-07 update).
+
+**Observed facts — three arm/disarm cycles this window:**
+
+| Disarm (UTC) | Initiator | Armed since | Duration armed | Retries | `CURRENT_TIME` at disarm |
+| --- | --- | --- | --- | --- | --- |
+| 09-06 01:17:02 | physical (`AAP Keypad`) | 09-05 23:26:39 (physical arm) | ~1h50m | none, instant | normal |
+| 09-07 03:20:50 | integration (`disarm()`, `ESPHome Keypad`) | 09-06 18:44:23 (physical arm) | ~8h36m | **2/6, ~6.7s (backoff 1s→2s)** | normal, confirmed (surrounding `Controller time update`/glitch-recovery broadcasts all self-correct cleanly, no stuck-state broadcast anywhere near the retry) |
+| 09-07 04:08:02 | integration (`disarm()`, `ESPHome Keypad`) | 09-07 03:21:37 (physical arm) | ~46m25s | none, instant | normal |
+
+(A third arm event, 09-06 18:44:23, and its corresponding disarm above bracket the retried cycle; all three arms this window were physical-keypad-initiated, consistent with prior windows where most arms are physical and most disarms are the integration.)
+
+**Inference (medium confidence — revises the 2026-09-03/09-05 correlation):** the middle row is a clean counter-example on the side of the correlation that had, until now, no exceptions: every previously-confirmed-normal-time disarm resolved instantly (2026-09-03 table: 2/2; 2026-09-05 update: 2/2), while every retry case had either confirmed-stuck time or unknown status. This is the first retry observed with `CURRENT_TIME` *confirmed normal* throughout. Combined with the existing 2026-08-31 counter-example on the other side (confirmed-stuck time, instant 3s-later disarm), the `CURRENT_TIME`-stuck correlation no longer looks like even a partial predictor — stuck time is neither necessary nor sufficient for a retry, across the full sample gathered so far. Duration-armed also doesn't split cleanly: this window's longest-armed case (8h36m) retried while a prior window's longest (5h26m) didn't, and this window's two instant cases (1h50m, 46m) bracket the retried one without an obvious threshold.
+
+**Assumption (unverified):** what actually distinguishes the small number of retry cases from the larger number of instant ones is now back to being an open question rather than one with a leading candidate. No other signal (bus corruption rate, watchdog activity, time-of-day) has been checked yet for correlation with this specific retry.
+
+**Practical takeaway:** no code change proposed — the retry/backoff machinery again resolved correctly (2/6, ~6.7s) regardless of cause. Given `CURRENT_TIME`-stuck no longer looks predictive, future sessions should stop treating it as the leading hypothesis and instead capture whatever else is observable at the moment of a retry (recent `ff.`/`fe.` corruption, watchdog trips, or anything else nearby in the log) to look for a different pattern from scratch.
+
+### Update (2026-09-09): first data point for the "other signals" search — a retry ~5 minutes after a corruption-burst/watchdog-trip episode, vs. three bus-clean instant cycles
+
+**Source:** the frigate long-term logger, window 2026-09-08 08:40 → 2026-09-09 05:09 UTC. Three arm/disarm sequences this window; the first two were confirmed by the user to be triggered by the official RF remote (distinct chime pattern: once on arm, twice on disarm) rather than a keypad or this integration — at the time of this entry, an `ARMED_STATE` broadcast considered in isolation couldn't distinguish remote-fob input from any other non-integration source, since both simply appear as Controller `ARMED_STATE` broadcasts with no accompanying keypress/command traffic. (A direct RF-remote signature, the `0x7C` frame preceding the broadcast, was decoded later — see `protocol_wire_format.md`'s `0x7C` entry — but wasn't yet identified when this window was analyzed.)
+
+**Observed facts:**
+
+| Sequence | Arm (UTC) | Disarm (UTC) | Duration armed | Retries | Nearby `ff.`/`fe.`/watchdog activity |
+| --- | --- | --- | --- | --- | --- |
+| 1 (remote) | 23:23:41 → confirmed 23:24:10 (09-08) | 23:25:00 | ~50s | none, instant | none within ±10min |
+| 2 (remote) | 02:11:49 → confirmed 02:12:17 (09-09) | 02:12:30 | ~13s | none, instant | none within ±10min |
+| 3 (integration) | `arm_away()` 03:48:43 → confirmed 03:49:11 | `disarm()` 04:43:55 | ~54m44s | **2/6, ~6.2s (backoff 1s→2s)** | clustered burst `04:37:40–42` (8 lines) → watchdog trip `04:38:40` → 3 repeated `Armed Away` re-broadcasts, all ending **~5min before** the `04:43:55` disarm call; nothing closer, nothing during the retry window itself |
+
+**Inference (low confidence — one data point):** this is the first retry-associated case where a bus-corruption/watchdog episode occurred anywhere near the event, in either direction — the two remote-triggered cycles (bus-clean, instant) and the earlier `CURRENT_TIME`-normal instant cases from prior windows give no reason to expect corruption alone to force a retry, but this is also the first time anyone has actually looked. The ~5-minute gap is a meaningful caveat against reading too much into it: nothing in the doc's existing model gives an episode that already resolved (watchdog trip fired, ping resumed) a mechanism for causing trouble 5 minutes later — a "controller side-effects from the re-registration/state-resend persist briefly" theory is speculative, not evidenced. Equally consistent with pure coincidence given this integration's baseline retry rate is already nonzero without any corruption present (e.g. the 2026-09-07 8h36m-armed retry had a fully bus-clean surrounding window).
+
+**Practical takeaway:** no code change. Record as the first candidate data point for the "other signals" search opened in the 2026-09-07 update, but do not treat corruption/watchdog proximity as a working hypothesis yet — one data point with a 5-minute gap is far weaker than the exact-concurrency signature that would make it convincing. Next retry should be checked specifically for whether corruption/watchdog activity is concurrent (same or adjacent minute) rather than just "somewhere in the preceding window," which would be the actual bar for this to become a real lead.
+
+### Update (2026-09-14): a 9h31m-armed disarm retried (2/6) with zero `ff.`/`fe.` corruption or watchdog activity anywhere in the entire surrounding ~27h window — the cleanest data point yet against the corruption-proximity lead
+
+**Source:** the frigate long-term logger, window 2026-09-13 04:14 → 2026-09-14 07:26 UTC (~27h13m). Only one integration-initiated arm/disarm sequence this window.
+
+**Observed facts:**
+
+| Disarm (UTC) | Initiator | Armed since | Duration armed | Retries | `CURRENT_TIME` at disarm | Nearby `ff.`/`fe.`/watchdog activity |
+| --- | --- | --- | --- | --- | --- | --- |
+| 09-14 04:29:50 | integration (`disarm()`, `ESPHome Keypad`) | 09-13 18:58:41 (physical arm) | ~9h31m | **2/6, ~6.4s (backoff 1s→2s)** | normal, confirmed (glitch-recovery and `Controller time update` broadcasts self-correcting cleanly seconds before and after) | **none** — zero `ff.`/`fe.` occurrences anywhere in the entire 27h13m window, not just nearby (see `protocol_investigations.md`'s 2026-09-14 update) |
+
+**Inference (medium confidence — reinforces the 2026-09-07 revision, further undermines the 2026-09-09 corruption-proximity lead):** this retry occurred in a window with no bus corruption at all, ruling out even loose proximity as an explanation this time — stronger than the 2026-09-09 data point, which at least had a corruption/watchdog episode 5 minutes prior. Combined with the 2026-09-07 8h36m-armed/normal-time retry, this is now the second long-armed, normal-`CURRENT_TIME`, bus-clean retry on record. Neither `CURRENT_TIME`-stuck state, corruption proximity, nor duration-armed alone has held up as a predictor across the full sample; the "other signals" search opened 2026-09-07 has now run through its most obvious candidates without finding one.
+
+**Practical takeaway:** no code change proposed — retry/backoff resolved correctly again (2/6, ~6.4s). Given corruption proximity, `CURRENT_TIME` state, and armed-duration have each been tried and each produced clean counter-examples, a future session should treat this as a lower-priority open question rather than actively hunting for a new candidate signal each time — revisit if a strikingly different case shows up (e.g. a retry that fails to resolve within the existing 6-attempt budget), but routine single retries no longer need dedicated investigation each occurrence.
+
 ## Notes
 
 - ARM/STAY/DISARM sequences are simpler than OUTPUT because there's no ACK handshake
@@ -588,3 +638,4 @@ settle it.
 - ARMED_STATE messages (0x11) are published independently regardless of `arm_disarm_state_` (entities always reflect them). As of 2026-08-22, an ARMED_STATE broadcast matching the request's intent resolves the sequence from **any** non-IDLE state (including a retry backoff wait) — see "Retry backoff + intent-matched ARMED_STATE resolution" above. `CODE_ENTER_PENDING` remains the only state that *requires* one to succeed (`ARM_AWAY_PENDING`/`ARM_STAY_PENDING` still resolve on their KEYPAD_COMMAND ack).
 - All three keypads receive Command broadcasts during arming/disarming; only the originating keypad controls the sequence
 - `disarm()` also guards against calling when already disarmed — it returns early if `is_armed()` is false
+- Audible chime count on the official RF remote distinguishes it from other input sources when reading a trace: **one chime on arm, two chimes on disarm** (confirmed by the user, 2026-09-09). This was historically the only way to tell, since an `ARMED_STATE` broadcast considered in isolation looks the same as any other non-integration source — no accompanying keypress/command traffic, unlike physical-keypad or integration-initiated sequences which leave a `Code sequence:`/keypress trail. A direct on-bus signature now also exists: the `0x7C` RF-remote-event frame (see `protocol_wire_format.md`) precedes the resulting `ARMED_STATE` broadcast, typically by ~100–150ms (one case logged in the same millisecond, `0x7C` still ordered first), so a trace no longer has to rely on the chime alone

@@ -376,7 +376,15 @@ semantics are unknown. Variant A is the normal operational poll.
 | 0 | 1 | `output_bitmap` | Bit N-1 = output N active | High |
 
 Output numbering matches the zone bitmap convention (bit 0 = output 1).
-Output 4 (garage door relay) = `0x08`.
+Output 1 (external siren) = `0x01`. Output 2 (internal siren) = `0x02`.
+Output 3 (gate relay) = `0x04`. Output 4 (garage door relay) = `0x08`.
+
+The single-pulse-per-arm / double-pulse-per-disarm burst seen on RF-remote-triggered
+events (see the `0x7C` entry below, and `protocol_investigations.md`) is a vendor-documented,
+output-assignable panel feature — "Pendant Arm/Disarm Chirp to Output" (`P50E`–`P53E` in the
+ESL-2 manual) — confirmed enabled to Output 1 on this installation, not incidental behavior.
+A separate single-pulse-no-chirp-count option also exists (`P54E`–`P57E`, e.g. for triggering
+a video recorder); an output pulse that doesn't fit the arm=1/disarm=2 pattern may be this.
 
 **Examples:**
 ```
@@ -418,9 +426,24 @@ alignment by one position for the rest of the frame — for `day`/`month`/`year`
 of those three bytes being doubled. It recurs deterministically once per
 minute, at the `seconds = 15` broadcast. See `protocol_investigations.md`
 ("`CURRENT_TIME` (0x54) periodic bit-corruption glitch") for the full
-byte-level analysis. All fields must be validated individually before use,
-and corrupted frames should be discarded rather than corrected (a doubled
-value can coincidentally land back in a valid range).
+byte-level analysis. Naive per-field range validation alone isn't enough — a doubled
+value can coincidentally land back in a valid range — so the implementation only
+"corrects" this specific known glitch (halve day/month/year, then cross-check the
+recovered date's weekday against the frame's own untouched weekday byte before trusting
+it) and discards the frame outright if that cross-check fails. Any other corruption not
+matching this exact recovered-and-verified pattern is discarded, not guessed at.
+
+A related but distinct variant exists: `day`/`month` corrupted by a `×4` (not `×2`)
+multiplier. Confirmed (2026-09-10) as `real_value × 4`, not arbitrary garbage — see
+`protocol_investigations.md`'s 2026-09-10 update for the live midnight-crossing capture
+that pins this down. Every occurrence observed so far has had `real_month ≥ 7`
+(September in the confirming capture), where the single-halving recovery above computes
+`rec_month = real_month × 2`, which is `>12` and so out of range — the frame is correctly
+discarded rather than silently mis-recovered. For `real_month ≤ 6` this range check alone
+would *not* catch it (`rec_month` would land in-range but wrong); only the weekday
+cross-check would have a chance of rejecting it, and only probabilistically (~1/7). This
+case hasn't been observed in any capture yet — flagged here as a theoretical gap in the
+recovery logic's guarantees, not a confirmed live bug.
 
 **Verified example:**
 ```
@@ -428,6 +451,66 @@ value can coincidentally land back in a valid range).
 → Monday 2026-05-11 02:01:15
   day_of_week=2(Mon), minutes=0x0079=121→02:01, sec=15, day=11, month=5, year=0x1A=26
 ```
+
+---
+
+### 0x7C — RF remote button-press event
+
+*Direction:* RF receiver card → Controller (confirmed by the causality analysis below; not a keypad address — see the manual cross-reference below for why `data[0..2]` never matches the keypad-address convention)  
+*Trigger:* A button press on one of the official RF remotes — never observed for any physical-keypad or integration-initiated command  
+*Min length:* 5 payload bytes (`data[0..2]` identity + `data[3..4]` button code — all the parser decodes; 8 bytes seen in practice in every capture)  
+*Confidence:* Confirmed on the RF-remote attribution and on which button was pressed (vendor manual, cross-checked below against four independent trace-derived signals per button); low on the exact byte-level encoding mechanism
+
+**Manual cross-reference (`ESL-2 Install & Program Manual (E.V).pdf`, pages 17–19, 48–54):** the panel's RF path is a separate plug-in receiver card, the RX-16 MF349, connected via the "ARRI4" cable — the manual notes explicitly that if this cable is unavailable, "you can wire the receiver the same as a keypad," i.e. the receiver rides the same physical clock/data bus as keypads and presumably reuses the same frame format, which is why `0x7C` shows up as a normal-looking frame despite not coming from a keypad. Remotes are enrolled as **Radio Users** in User slots 21–100 — a completely different addressing space from keypad bus addresses — which is *why* `data[0..2]` never matches the keypad-address convention: it isn't a malformed/omitted keypad address, radio users are categorically not keypads. Each physical 4-button pendant is manual-documented as up to **five separate learned radio-user identities**, one per function class, each with its own program-address block and independent "press the button you wish to learn in" enrollment step: Arm-only (`P18E40E`–`P18E49E` for pendants 0–9), Disarm-only (`P18E50E`–`P18E59E`), **Door 2 Control, linked to Output 3** (`P18E60E`–`P18E69E`), **Door 1 Control, linked to Output 4** (`P18E70E`–`P18E79E`), and Panic (`P18E80E`–`P18E89E`). This structurally explains why `data[3..4]` differs per button even on the *same* physical remote (observed below): each button isn't a sub-code of one remote identity, it's independently enrolled as its own radio user. It also independently confirms the output mapping found by trace: "Door 1" (garage, Output 4) and "Door 2" (Output 3 — wired to the user's gate in this installation, but generically named "Door 2" by the panel) match our button 4/button 3 findings exactly. The manual doesn't document `0x7C`'s on-wire byte layout (it's user/installer-facing, not a protocol reference) — the retransmit-pattern and checksum-byte details below remain trace-only.
+
+**Observed facts (2026-09-09, frigate long-term logger, [[project-crow-alarm-protocol-trace]]):** across ~3 days of continuous capture spanning two remote-triggered arm/disarm cycles (confirmed by the user via the remote's distinct chime — one beep on arm, two on disarm), exactly 8 `Unknown [7c...]` lines appeared, and *only* at those two cycles — never at any physical-keypad or integration-initiated arm/disarm event in the same capture.
+
+**Observed facts (2026-09-10 follow-up, scripted two-remote capture, [[project-crow-alarm-protocol-trace]]):** the user ran a deliberate test sequence on both of their RF remotes — button 1 (arm), button 2 (disarm), button 3 ×3 (gate), button 4 ×3 (garage) — repeated once per remote. Each press produces a pair of near-identical `0x7C` lines ~0.5–0.8s apart (the bus's usual same-event retransmit-for-reliability pattern seen elsewhere, e.g. `KEYPAD_COMMAND` bursts). data[0..2] is a fixed per-remote identity tuple — `90 00 36` for remote A, `42 00 C4` for remote B — constant across every button on that remote and never seen from the other remote. data[3..4] identifies the button, but the value is per-remote (not a shared code across remotes):
+
+| Button | Remote A (`90 00 36`) data[3..4] | Remote B (`42 00 C4`) data[3..4] |
+|---|---|---|
+| 1 — arm | `BC F6` | `7C ED` |
+| 2 — disarm | `C0 FA` | `00 FB` |
+| 3 — gate | `B4 EE` | `F4 EE` |
+| 4 — garage | `84 3E` | `C4 3E` |
+
+```
+04:17:41  7c 90 00 36 BC F6 45 DC F6   remote A, arm
+04:17:42  7c 90 00 36 BC F6 49 D8 F6   remote A, arm, retransmit
+04:17:47  7c 90 00 36 C0 FA 46 CC EE   remote A, disarm
+04:17:47  7c 90 00 36 C0 FA 4A C8 EE   remote A, disarm, retransmit
+04:17:50  7c 90 00 36 B4 EE 43 7C DD   remote A, gate, press 1
+04:17:51  7c 90 00 36 B4 EE 25 7C EE   remote A, gate, press 1, retransmit
+04:18:04  7c 90 00 36 84 3E 47 BC CF   remote A, garage, press 1
+04:18:05  7c 90 00 36 84 3E 4B B8 CF   remote A, garage, press 1, retransmit
+
+04:18:33  7c 42 00 C4 7C ED 8B B8 EB   remote B, arm
+04:18:36  7c 42 00 C4 00 FB 46 CC F5   remote B, disarm
+04:18:41  7c 42 00 C4 F4 EE 43 7C F3   remote B, gate, press 1
+04:18:53  7c 42 00 C4 C4 3E 47 BC EE   remote B, garage, press 1
+```
+
+**Byte-level pattern (observed, semantics not established):**
+
+- data[0..2] — fixed per-remote identity, see above.
+- data[3..4] — per-remote-per-button code (see table above). Not a shared code across remotes and not obviously derived from the remote's identity tuple by any simple transform (XOR, bit-reverse, or addition tried, none match) — consistent with a hardware encoder chip whose per-button output happens to differ between physical units, not a documented protocol field.
+- data[5..6] — for buttons 1 (arm), 2 (disarm), and 4 (garage), shifts by a small `+N`/`-N` between the initial send and its retransmit (e.g. `45 DC → 49 D8`, `+4`/`-4`; remote B's arm shows `+8`/`-8` over a longer ~0.75s gap) — plausibly a coarse counter ticking during the retransmit gap, roughly consistent in rate across both remotes and both offsets. Button 3 (gate) breaks this pattern on both remotes: data[5] shifts by a much larger step (`43 → 25`, `-30`) while data[6] stays unchanged (`7C → 7C`) — not yet understood why gate's retransmit encodes differently from the other three buttons.
+- data[7] — checksum-like trailing byte. For buttons 1, 2, and 4 it stays identical between the initial send and its retransmit; for button 3 (gate) it changes within the pair too, on both remotes — the same buttons/pattern split as data[5..6] above.
+
+**Inference (high confidence on attribution and per-button identification):** four independent buttons on two separate remote units all show the same signature: an exclusive `0x7C` pair, occurring only when that specific button is pressed, on top of the corroborating `OUTPUT_STATE` (`0x50`) evidence below — reproduced identically across two physically distinct remotes rules out coincidence. The `+N`/`-N` vs. gate's different retransmit pattern (medium confidence, mechanism unknown) suggests gate's button encoding on the remote itself works differently from the other three, not a receiver-side artifact, since it's consistent across both remotes.
+
+**Causality (high confidence, resolves the previously-open question):** the first `0x7C` frame of each pair precedes the controller's resulting action (the `ARMED_STATE`/`Disarmed` broadcast, or the `OUTPUT_STATE` pulse) in all 8 button/remote combinations checked (both remotes × all 4 buttons; one representative press per combination, not all 16 physical presses from the scripted test) — never simultaneous-or-after. Measured deltas range from +98ms to +147ms, with one exception (Remote A's arm case landed in the same logged millisecond, `0x7C` still ordered first in the log). `0x7C` is therefore the RF receiver reporting the button press *to* the controller, which then acts on it roughly 100ms later — a cause, not a parallel echo of an action already taken.
+
+A second, independent signal confirms each button-to-function mapping: `OUTPUT_STATE` (`0x50`) pulses the output that function drives, every time, for every press, on both remotes:
+
+| Button | `OUTPUT_STATE` pulse | Notes |
+|---|---|---|
+| 1 — arm | Output 1 (`0x01`), once | External siren chirp — see `protocol_investigations.md` 2026-09-09 |
+| 2 — disarm | Output 1 (`0x01`), twice | External siren chirp |
+| 3 — gate | Output 3 (`0x04`), once per press | Also followed within ~1s by a `ZONE_STATE` "Zone 3 active" transition each time |
+| 4 — garage | Output 4 (`0x08`), once per press | Matches the already-documented garage-door relay mapping (`0x50` above) |
+
+**Practical takeaway:** no code change — not a keypad-address-scoped message, doesn't fit any existing entity, and the manual confirms this is fundamental (radio users, not keypads). The button-to-output mapping (arm/disarm → Output 1 siren, gate/"Door 2" → Output 3, garage/"Door 1" → Output 4) is now vendor-confirmed and reusable for any future "what did the remote do" feature. A fifth pendant function, Panic, is documented (`P18E80E`–`P18E89E`, triggers internal+external siren, with immediate/delayed/entry-delay-only variants at `P8E`) but not yet observed on the bus — worth a trace if a panic-button `0x7C` sample becomes available. Still open: the gate-specific retransmit-pattern anomaly in data[5..7], and whether `arm_stay` (if either remote supports it) produces a distinct data[3..4] code.
 
 ---
 
