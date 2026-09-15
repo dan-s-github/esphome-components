@@ -430,12 +430,17 @@ byte-level analysis. All fields must be validated individually before use,
 and corrupted frames should be discarded rather than corrected (a doubled
 value can coincidentally land back in a valid range).
 
-A related but distinct variant fails this recovery outright: `day`/`month` corrupted by
-a `×4` (not `×2`) multiplier, which still halves to an even number but lands `month` out
-of the valid `1–12` range, so the frame is discarded rather than silently mis-recovered.
-Confirmed (2026-09-10) as `real_value × 4`, not arbitrary garbage — see
+A related but distinct variant exists: `day`/`month` corrupted by a `×4` (not `×2`)
+multiplier. Confirmed (2026-09-10) as `real_value × 4`, not arbitrary garbage — see
 `protocol_investigations.md`'s 2026-09-10 update for the live midnight-crossing capture
-that pins this down.
+that pins this down. Every occurrence observed so far has had `real_month ≥ 7`
+(September in the confirming capture), where the single-halving recovery above computes
+`rec_month = real_month × 2`, which is `>12` and so out of range — the frame is correctly
+discarded rather than silently mis-recovered. For `real_month ≤ 6` this range check alone
+would *not* catch it (`rec_month` would land in-range but wrong); only the weekday
+cross-check would have a chance of rejecting it, and only probabilistically (~1/7). This
+case hasn't been observed in any capture yet — flagged here as a theoretical gap in the
+recovery logic's guarantees, not a confirmed live bug.
 
 **Verified example:**
 ```
