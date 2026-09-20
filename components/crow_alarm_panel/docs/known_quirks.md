@@ -146,6 +146,27 @@ than acting on partial data.
 
 ---
 
+## Occasional `crow_alarm_panel took a long time for an operation` warning
+
+**What you'll see:** rarely, a `WARN` line like `crow_alarm_panel took a long time for an
+operation (91 ms), max is 50 ms`. This is ESPHome core's own loop-timing watchdog (not
+specific to this integration in general — it names whichever component's `loop()` call ran
+over the scheduler's threshold), so it will show up under this component's name whenever
+`crow_alarm_panel`'s `loop()` happens to be the one running long.
+
+**Cause:** first observed 2026-09-17 (2 instances so far). Both coincided with several
+separate message-processing paths landing in the same `loop()` tick — once right after a
+post-OTA boot (setup, registration announce, and a disarm-state broadcast all at once), once
+mid an `Output-select` sequence (an ACK, a `KEYPAD_COMMAND`, and a digit-send all at once).
+Neither instance coincided with `ff.`/`fe.` bus corruption or a watchdog re-announce. Too
+rare so far to characterize further — see the 2026-09-20 entry in `protocol_investigations.md`.
+
+**What to do:** nothing observed so far — both instances were followed by the in-flight
+operation completing normally a moment later. Worth a fresh look if this becomes frequent,
+or is ever seen alongside an operation that actually fails rather than just running long.
+
+---
+
 ## Cross-references
 
 | Topic | Document |
