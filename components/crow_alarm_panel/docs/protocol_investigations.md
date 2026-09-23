@@ -965,3 +965,18 @@ Comparing every `Controller time update` line's decoded value against real NZST 
 - Zero ERROR-level lines.
 
 **How to apply going forward:** next log-mining check should start from **2026-09-22 06:15 UTC**. Standing checklist unchanged: poll-slot/watchdog exceptions (now exhaustively checked twice running, still zero ever), the October month-value flip (due on/after 2026-10-01 — the first session landing on/after that date should check explicitly), the corruption-hits-keypress-machine mechanism (still 1 confirmed instance, from 2026-09-13), and whether the `component:419` timing WARN recurs (still only 2, both 09-17).
+
+**Status as of 2026-09-23 (general log-mining check, 2026-09-22 06:15 → 2026-09-23 09:29 UTC, ~27h14m, no reboot/OTA in-window): quiet window, everything matched established baselines — no doc revision needed.**
+
+- **Poll-slot/watchdog burst→trip mechanism: 4/4 trips exhaustively checked, every one cleanly preceded by an `ff.`/`fe.` burst landing ~45s earlier in the `ESPHome Keypad` poll slot** — zero exceptions. Cumulative tally now well past 52/52 with zero exceptions ever recorded across the whole project.
+- `ff.`/`fe.` corruption: 17 distinct burst events / ~27.25h (~0.62/h) — within the established baseline range.
+- `invalid minutes-since-midnight`: recurred once at `11:26:33`–`11:28:18` UTC (09-22) — the post-resync steady-state window now holds for an 8th consecutive day with zero further drift.
+- `invalid day/month value */36` ×4-multiplier theory held exactly: `88/36` (09-22) → `92/36` (09-23, so far) = day×4 incrementing daily, month×4 flat at September's `36`. Still on track for the October flip to `40`, due on/after 2026-10-01 — not yet due (this session lands before the rollover).
+- No `31/16`-style `CURRENT_TIME` stuck state.
+- New `component:419` "took a long time for an operation" WARN: did not recur — still 2 total instances, both 2026-09-17.
+- **No arm/disarm activity at all this window** — the panel stayed continuously disarmed the entire ~27h (1368/1368 `Alarm Status` samples read `disarmed`, zero `Armed` transitions). No new data point for the deprioritized disarm-retry investigation.
+- No RF remote (`0x7C`/`0x7c`) activity, no Output-select/zone-bypass activity this window.
+- 1 truncated-frame WARN, the already-catalogued `Current time too short, discarding` variant.
+- Zero ERROR-level lines.
+
+**How to apply going forward:** next log-mining check should start from **2026-09-23 09:29 UTC**. Standing checklist unchanged: poll-slot/watchdog exceptions (now exhaustively checked three windows running, still zero ever), the October month-value flip (due on/after 2026-10-01 — the first session landing on/after that date should check explicitly), the corruption-hits-keypress-machine mechanism (still 1 confirmed instance, from 2026-09-13), and whether the `component:419` timing WARN recurs (still only 2, both 09-17).
