@@ -94,10 +94,14 @@ capture windows — roughly 0.05–0.9/h in most windows, with some full 21–27
 zero — followed immediately by the integration re-registering itself on the bus. No
 functional interruption — entities keep working normally.
 
-**Cause:** established with no exceptions across many observed instances — this fires
+**Cause:** in the large majority of observed instances (77/78 as of 2026-09-28), this fires
 exactly when an `Unknown [ff.]`/`[fe.]` corruption burst (see above) happens to land in
 this integration's own poll slot, so the controller's periodic "ping" is missed for one
-cycle. The component's watchdog notices and re-announces, recovering automatically.
+cycle. The component's watchdog notices and re-announces, recovering automatically. One
+exception is on record (2026-09-25) with no corruption anywhere nearby and no other
+visible cause — still just as harmless/self-recovering, but the corruption-burst
+explanation isn't the *only* possible cause. See `protocol_investigations.md`'s
+2026-09-28 entry.
 
 **What to do:** nothing — this is the existing watchdog recovering exactly as designed.
 The observed baseline has varied between capture windows, including at least one full
