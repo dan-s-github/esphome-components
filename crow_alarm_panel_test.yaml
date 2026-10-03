@@ -80,6 +80,14 @@ binary_sensor:
     type: zone
     zone: 3
 
+  - platform: crow_alarm_panel
+    name: "Trouble"
+    type: trouble
+
+  - platform: crow_alarm_panel
+    name: "Trouble Latched"
+    type: trouble_latched
+
 alarm_control_panel:
   - platform: crow_alarm_panel
     name: "Crow Alarm"

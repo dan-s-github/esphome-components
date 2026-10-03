@@ -181,16 +181,17 @@ or is ever seen alongside an operation that actually fails rather than just runn
 
 **What you'll see:** the physical keypad's TROUBLE indicator comes on, and the fault list
 (MEM key) shows the panel's RF interference alarm. In the ESPHome log, around the moment it
-starts: status lines from `[Keypad 0x80     ] Controller status ... [10.80.00.C5.04.00]`
-instead of the usual `[AAP Keypad      ] ... [10.00.00.C1.00.00]`, one
+starts: status lines ending `trouble:current,latched [10.80.00.C5.04.00]` instead of
+the usual `trouble:none [10.00.00.C1.00.00]`, one
 `Unknown [70.6E.5A.02]` line, all keypads re-registering, and usually a
 "No ping for 60 s" warning about a minute later. Seen twice so far (2026-09-25 and
 2026-10-02), both in the early hours.
 
 **Cause:** the panel's own radio-receiver supervision decided its receiver was being
 interfered with (manual event `RFIA`). While the fault is current the controller sets
-extra bits in its status broadcast — this integration doesn't decode them yet, which is why
-the log shows a phantom "Keypad 0x80". The fault restores by itself the next time the
+extra bits in its status broadcast, which the optional `trouble` /
+`trouble_latched` binary sensors expose (older firmware logged these frames as a
+phantom "Keypad 0x80"). The fault restores by itself the next time the
 receiver hears an RF remote; the TROUBLE light stays on until someone views the fault on a
 keypad or arms the system. What causes the interference isn't known (see
 `protocol_investigations.md`, "RF-interference fault (2026-10-03)").

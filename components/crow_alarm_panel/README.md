@@ -115,9 +115,10 @@ panel's zone-state bitmap, never set optimistically. The bypass sequence is
 
 ### `binary_sensor`
 
-Standalone zone sensor for zones not using `zones:`. For bypass state, use the
-`switch` platform's `type: bypass` (or the `zones:` parent config) instead — the
-bypass switch is both the control and the state indicator.
+Standalone zone sensor for zones not using `zones:`, plus panel trouble
+indicators. For bypass state, use the `switch` platform's `type: bypass` (or the
+`zones:` parent config) instead — the bypass switch is both the control and the
+state indicator.
 
 ```yaml
 binary_sensor:
@@ -126,12 +127,29 @@ binary_sensor:
     zone: 3
     name: "Back Door"
     device_class: door
+
+  - platform: crow_alarm_panel
+    type: trouble
+    name: "Alarm Trouble"
+
+  - platform: crow_alarm_panel
+    type: trouble_latched
+    name: "Alarm Trouble Latched"
 ```
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `type` | yes | `zone` — active state sensor |
-| `zone` | yes | Zone number (1–16) |
+| `type` | yes | `zone` — active state sensor; `trouble` — on while the panel reports a current fault; `trouble_latched` — on while the keypad TROUBLE light is latched |
+| `zone` | `zone` only | Zone number (1–16) |
+
+The trouble sensors default to `device_class: problem`. They are decoded from the
+controller's status broadcast and have so far only been observed for the panel's
+RF interference alarm: `trouble` turns off when the fault restores (for RF
+interference, the next time an RF remote is received), while
+`trouble_latched` stays on until someone views the fault on a keypad
+(MEM key) or arms the system. Each changes only after two consecutive status
+broadcasts agree, so expect a few seconds' delay. See
+`docs/protocol_wire_format.md` ("Fault bits") and `docs/known_quirks.md`.
 
 All standard binary sensor options (`name`, `device_class`, `icon`, etc.) are supported.
 

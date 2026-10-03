@@ -97,7 +97,7 @@ where `N = data.size()` (payload bytes, excluding type and closing boundary).
 
 | Offset | Size | Name | Description | Confidence |
 |---|---|---|---|---|
-| 0 | 1 | `keypad_addr` | Target keypad address. Bit 7 (`0x80`) is set while a system fault is current — see "Fault bits" below; the parser currently logs this as `Keypad 0x80` | High (address); medium (bit 7) |
+| 0 | 1 | `keypad_addr` | Target keypad address. Bit 7 (`0x80`) is set while a system fault is current — see "Fault bits" below; the parser masks it off before the keypad lookup | High (address); medium (bit 7) |
 | 1 | 1 | `UNKNOWN_01` | Observed: `0x00`, `0x01` | Low |
 | 2 | 1 | `flags` | System status flags (see below) | High |
 | 3 | 1 | `UNKNOWN_02` | `0x00`, or `0x04` while a fault is latched and not yet acknowledged — see "Fault bits" below | Medium (`0x04`) |
@@ -121,7 +121,7 @@ three bits change together when the panel raises a fault, and they clear in two 
 | data[0] bit 7 (`0x80`) + flags bit 2 (`0x04`) | at fault onset | when the fault restores: on the first RF remote frame (`0x7C`) received afterwards, in both episodes | fault **current** |
 | data[3] = `0x04` | at fault onset | when acknowledged: MEMORY + ENTER on a keypad (10-02), or arming (09-25); stays set after the fault restores | fault **latched / not yet viewed** — the keypad's red TROUBLE light |
 
-The one fault seen so far is the panel's RF-interference alarm (`RFIA`/`RFIR` in the manual's event list), identified from what the user saw on the AAP keypad display plus the clear-on-RF-reception behaviour. Whether other fault types (AC fail, keypad missing, …) use the same bits, or other bits in the same bytes, is not known yet.
+The one fault seen so far is the panel's RF-interference alarm (`RFIA`/`RFIR` in the manual's event list), identified from what the user saw on the AAP keypad display plus the clear-on-RF-reception behaviour. Whether other fault types (AC fail, keypad missing, …) use the same bits, or other bits in the same bytes, is not known yet. Exposed as the `binary_sensor` types `trouble` (data[0] bit 7 or flags bit 2) and `trouble_latched` (data[3] bit 2); each publishes only after two consecutive status frames agree.
 
 **Examples:**
 ```

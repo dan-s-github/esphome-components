@@ -353,18 +353,37 @@ void CrowAlarmPanel::loop() {
           ESP_LOGW(TAG, "Controller status too short, discarding");
           break;
         }
-        CrowAlarmPanelKeypad keypad = this->find_keypad_(data[0]);
+        // Fault bits (docs/protocol_wire_format.md, "Fault bits"; observed for the panel's RF
+        // interference alarm only): data[0] bit 7 + flags bit 2 while the fault is current,
+        // data[3] = 0x04 while the keypad TROUBLE latch is set. Bit 7 is not part of the
+        // keypad address, so mask it off before the lookup.
+        const uint8_t keypad_address = data[0] & 0x7F;
+        const bool trouble_current = (data[0] & 0x80) != 0 || (data[2] & 0x04) != 0;
+        const bool trouble_latched = (data[3] & 0x04) != 0;
+        CrowAlarmPanelKeypad keypad = this->find_keypad_(keypad_address);
         std::string bits = binary_indices(data[2]);
         if (bits.empty()) {
           bits = "none";
         }
         ESP_LOGD(TAG,
                  "[%-*s] Controller status: b1=0x%02X flags=0x%02X bits=%s b3=0x%02X b4=0x%02X profile:%s state:%s "
-                 "[%02x.%s]",
-                 this->keypad_label_width_, keypad_label(keypad, data[0]).c_str(), data[1], data[2], bits.c_str(),
-                 data[3], data[4],
-                 controller_status_profile(data[2]), controller_status_state(data[2]), type,
-                 format_hex_pretty(data).c_str());
+                 "trouble:%s%s [%02x.%s]",
+                 this->keypad_label_width_, keypad_label(keypad, keypad_address).c_str(), data[1], data[2],
+                 bits.c_str(), data[3], data[4], controller_status_profile(data[2]),
+                 controller_status_state(data[2]), trouble_current ? "current" : "none",
+                 trouble_latched ? ",latched" : "", type, format_hex_pretty(data).c_str());
+
+        const uint8_t reading = (trouble_current ? 0x01 : 0x00) | (trouble_latched ? 0x02 : 0x00);
+        if (reading != this->last_trouble_reading_) {
+          this->last_trouble_reading_ = reading;
+          break;
+        }
+        if (this->trouble_ != nullptr) {
+          this->trouble_->publish_state(trouble_current);
+        }
+        if (this->trouble_latched_ != nullptr) {
+          this->trouble_latched_->publish_state(trouble_latched);
+        }
         break;
       }
       case OUTPUT_STATE:

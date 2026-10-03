@@ -266,6 +266,11 @@ class CrowAlarmPanel : public Component {
   }
 
   void register_armed_state(text_sensor::TextSensor *armed_state_sensor) { this->armed_state_ = armed_state_sensor; }
+  // Panel fault indicators decoded from CONTROLLER_STATUS (see docs/protocol_wire_format.md,
+  // "Fault bits"): `trouble` = a fault is current, `trouble_latched` = the keypad's
+  // TROUBLE latch (cleared by viewing the fault on a keypad or arming).
+  void register_trouble(binary_sensor::BinarySensor *sensor) { this->trouble_ = sensor; }
+  void register_trouble_latched(binary_sensor::BinarySensor *sensor) { this->trouble_latched_ = sensor; }
   void register_output_switch(switch_::Switch *output_switch, uint8_t output_number) {
     this->outputs_.push_back(std::move(CrowAlarmPanelOutput{
         .the_switch = output_switch,
@@ -426,6 +431,12 @@ class CrowAlarmPanel : public Component {
   uint8_t keypad_address_{0xFF};  // 0xFF = not configured (passive monitor mode)
   std::string code_;
   text_sensor::TextSensor *armed_state_{nullptr};
+  binary_sensor::BinarySensor *trouble_{nullptr};
+  binary_sensor::BinarySensor *trouble_latched_{nullptr};
+  // Fault bits from the previous CONTROLLER_STATUS (bit 0 = current, bit 1 = latched;
+  // 0xFF = none seen yet). The trouble sensors publish only once two consecutive frames agree,
+  // so a single-bit receive glitch can't toggle them.
+  uint8_t last_trouble_reading_{0xFF};
   alarm_control_panel::AlarmControlPanel *alarm_control_panel_{nullptr};
   // Last non-optimistic published ACP state — set from the controller's own ARMED_STATE
   // broadcasts (controller-confirmed), and also from heuristic zone-activity publishes (zone
