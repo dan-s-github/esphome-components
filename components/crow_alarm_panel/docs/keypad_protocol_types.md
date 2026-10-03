@@ -259,7 +259,7 @@ implemented with Command-gating and 1 s watchdog timeouts.
 
 ### Open questions
 1. **Confirm `0xAA` semantics** — observed during arming countdown on multiple keypads; likely exit-delay/countdown indicator
-2. **Verify `0x7E` in payload** — no payload byte equal to `0x7E` has been observed; unknown whether the protocol reserves this value or byte-stuffing exists for unseen message types
+2. ~~**Verify `0x7E` in payload**~~ — answered 2026-10-01: the bus uses HDLC-style bit-stuffing (a `0` inserted after five consecutive `1` bits), so `0x7E` can be carried in a payload without ever appearing on the wire; the receiver does not yet un-stuff. See `protocol_wire_format.md` "Frame Format"
 3. **Capture Armed-Stay state encoding** — `0x11` armed_stay variant has not been observed (assumed to use a fourth `armed`/`arming` byte combination)
 4. **Clarify `BYPASS_STATUS` (0x1b) scope** — observed only during bypass sequences; unknown whether it also appears in other contexts (e.g. on boot, or whenever bypass state is queried)
 

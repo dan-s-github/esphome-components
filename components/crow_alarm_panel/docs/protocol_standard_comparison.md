@@ -101,18 +101,17 @@ no equivalent in the Crow protocol.
 | Dimension | HDLC | Crow |
 |---|---|---|
 | Frame delimiter | `0x7E` | `0x7E` — identical |
-| Byte-stuffing | `0x7D 0x5E` escapes `0x7E` in payload | Not observed; no stuffing in any captured frame |
+| Stuffing | Sync HDLC: zero-bit insertion after five `1`s. Async HDLC/PPP: `0x7D 0x5E` byte escapes | Zero-bit insertion after five `1`s — same as synchronous HDLC (confirmed 2026-10-01). No byte escapes |
 | Physical transport | Typically async UART or synchronous HDLC | Synchronous, externally-clocked open-drain bus |
 | ESPHome support | No HDLC component exists | — |
 
-**Verdict: Framing coincidence only; not reusable.**
-The `0x7E` delimiter is a coincidental match with HDLC. No ESPHome HDLC component
-exists and the physical transport is incompatible. One open question remains: if a
-payload byte value ever equals `0x7E`, the current parser would misinterpret it as an
-end-of-frame boundary. No byte-stuffing has been observed in captures, suggesting
-either the protocol reserves `0x7E` from payload values or the observed message types
-simply never produce that byte value in practice. This should be tracked as a robustness
-concern if additional message types are reverse-engineered.
+**Verdict: genuinely HDLC-style framing at the bit level; still not reusable.**
+Both the `0x7E` flag and the zero-bit-insertion rule match synchronous HDLC (see
+`protocol_investigations.md`, "Bit-stuffing on the wire", 2026-10-01), so the delimiter is
+not a coincidence. No ESPHome HDLC component exists and the externally-clocked open-drain
+transport is incompatible with UART-based implementations, so the framing still has to be
+done in this component's ISR — which currently detects the flag but does not remove
+stuffed bits.
 
 ---
 

@@ -94,14 +94,18 @@ capture windows — roughly 0.05–0.9/h in most windows, with some full 21–27
 zero — followed immediately by the integration re-registering itself on the bus. No
 functional interruption — entities keep working normally.
 
-**Cause:** in the large majority of observed instances (77/78 as of 2026-09-28), this fires
-exactly when an `Unknown [ff.]`/`[fe.]` corruption burst (see above) happens to land in
-this integration's own poll slot, so the controller's periodic "ping" is missed for one
-cycle. The component's watchdog notices and re-announces, recovering automatically. One
-exception is on record (2026-09-25) with no corruption anywhere nearby and no other
-visible cause — still just as harmless/self-recovering, but the corruption-burst
-explanation isn't the *only* possible cause. See `protocol_investigations.md`'s
-2026-09-28 entry.
+**Cause:** in almost every observed instance, this fires exactly when an
+`Unknown [ff.]`/`[fe.]` corruption burst (see above) happens to land in this integration's
+own poll slot, so the controller's periodic "ping" is missed for one cycle. The
+component's watchdog notices and re-announces, recovering automatically. The panel also
+pauses polling for ~15–20s when it raises a fault, which trips the watchdog in the same
+way — see "Keypad TROUBLE light / RF interference warning" below. (The 2026-09-25
+instance once listed here as unexplained turned out to be one of these.)
+
+Since mid-September 2026 most of these bursts line up with another device on the bus —
+the keypad at address `0x07` re-announcing itself every 5 minutes — rather than random
+noise; about 1 in 20 of its announces disturbs the bus enough to trigger this. See
+`protocol_investigations.md`, "Keypad registration-announce patterns" (2026-10-01).
 
 **What to do:** nothing — this is the existing watchdog recovering exactly as designed.
 The observed baseline has varied between capture windows, including at least one full
@@ -118,12 +122,14 @@ than a stable rate; a sustained rate well above that would still be worth a fres
 just one field). Not visible anywhere in Home Assistant — the panel's `CURRENT_TIME`
 broadcast isn't exposed as an entity.
 
-**Cause:** a well-characterized bus-level bit glitch on the `CURRENT_TIME` (`0x54`)
-broadcast (a spurious extra bit shifts later fields by one position, indistinguishable
-from those fields being doubled). Several specific corrupted values recur consistently
-rather than varying randomly, and the minutes-since-midnight variant has recurred at the
-same ~2-minute wall-clock window on multiple consecutive days — see the dated
-`CURRENT_TIME` sections of `protocol_investigations.md` for the full byte-level analysis.
+**Cause:** the bus bit-stuffs (the panel inserts a `0` after five consecutive `1` bits so
+the `0x7E` frame marker stays unique) and this component does not yet remove the inserted
+bit. Whenever the current time happens to contain such a run, the fields after it are
+shifted and read as doubled (or quadrupled). That is why the same values recur on a fixed
+schedule rather than randomly: once a minute during half of every ~4¼-hour cycle, at
+23:26–23:27 panel-local time every night (the `invalid minutes-since-midnight` WARN, values
+1470 and 1503), and all day on the 31st of a month. See `protocol_investigations.md`,
+"Bit-stuffing on the wire" (2026-10-01).
 
 **What to do:** nothing — for day/month/year the component tries to recover the known
 doubled-bit glitch first (cross-checked against the frame's own weekday field before
@@ -168,6 +174,30 @@ rare so far to characterize further — see the 2026-09-20 entry in `protocol_in
 **What to do:** nothing observed so far — both instances were followed by the in-flight
 operation completing normally a moment later. Worth a fresh look if this becomes frequent,
 or is ever seen alongside an operation that actually fails rather than just running long.
+
+---
+
+## Keypad TROUBLE light / RF interference warning
+
+**What you'll see:** the physical keypad's TROUBLE indicator comes on, and the fault list
+(MEM key) shows the panel's RF interference alarm. In the ESPHome log, around the moment it
+starts: status lines from `[Keypad 0x80     ] Controller status ... [10.80.00.C5.04.00]`
+instead of the usual `[AAP Keypad      ] ... [10.00.00.C1.00.00]`, one
+`Unknown [70.6E.5A.02]` line, all keypads re-registering, and usually a
+"No ping for 60 s" warning about a minute later. Seen twice so far (2026-09-25 and
+2026-10-02), both in the early hours.
+
+**Cause:** the panel's own radio-receiver supervision decided its receiver was being
+interfered with (manual event `RFIA`). While the fault is current the controller sets
+extra bits in its status broadcast — this integration doesn't decode them yet, which is why
+the log shows a phantom "Keypad 0x80". The fault restores by itself the next time the
+receiver hears an RF remote; the TROUBLE light stays on until someone views the fault on a
+keypad or arms the system. What causes the interference isn't known (see
+`protocol_investigations.md`, "RF-interference fault (2026-10-03)").
+
+**What to do:** nothing required — press an RF remote button (or wait for the next use) and
+view/clear the fault on the keypad. Alarm state and entities are unaffected. If it starts
+happening often, check for a new radio source near the panel.
 
 ---
 
