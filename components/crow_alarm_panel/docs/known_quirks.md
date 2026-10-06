@@ -114,6 +114,31 @@ than a stable rate; a sustained rate well above that would still be worth a fres
 
 ---
 
+## "Never pinged since announce, re-sending registration announce" warning after a power cut
+
+**What you'll see:** right after the alarm panel and this device power up together (power
+cut, or the panel being powered down for maintenance), one or more of these `WARN` lines
+about a minute apart, then normal polling resumes.
+
+**Cause:** the integration announces itself 15 s after boot. If the panel is still starting up
+at that point, it can miss the announce and never poll this device. Observed 2026-10-06, when
+the panel was powered down to remove the `0x07` IP module. Before this fix the watchdog only
+re-announced after it had been polled at least once, so the device sat unpolled until it was
+rebooted by hand. During that time arm/disarm from Home Assistant would not work.
+
+Separately, after both observed panel power-ups (2026-09-15 and 2026-10-06), the controller
+also polled an unconfigured address `0x02` for about 5 minutes. Something hardware-ACKed it
+during that time. Then 10 rapid unanswered pings ran and `0x02` was dropped. The device behind
+`0x02` is not identified. It can't be this integration, which only ACKs its own `address:`.
+On 2026-09-15 `0x02` was polled alongside `0x05`. Also on 2026-09-15, the Control4 keypad at
+`0x06` went missing from polling until the 2026-10-06 power-up.
+
+**What to do:** nothing — the watchdog now re-announces every 60 s until the controller
+starts polling. If it keeps repeating for minutes on end, check that the configured `address:`
+is free and that the panel has fully started up.
+
+---
+
 ## Occasional "Current time has invalid ..." log lines
 
 **What you'll see:** lines like `Current time has invalid day/month value 36/36` or

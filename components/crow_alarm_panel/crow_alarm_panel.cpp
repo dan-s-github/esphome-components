@@ -1095,11 +1095,17 @@ void CrowAlarmPanel::loop() {
     // so without this a still-stale ping would re-trip the watchdog on the very next loop()
     // pass and fire a second, usually unnecessary, announce ~1 s later (before the controller
     // has had a chance to respond to the first one) instead of waiting the full 60 s.
-    if (this->registration_sent_ && this->last_ping_ms_ != 0 &&
-        (now_ms - this->last_ping_ms_) >= 60000 &&
-        (now_ms - this->last_registration_announce_ms_) >= 60000) {
-      ESP_LOGW(TAG, "No ping for 60 s, re-sending registration announce");
-      this->registration_sent_ = false;
+    // Never pinged since boot counts as stale too: when the panel and this device power up
+    // together, the first announce can land while the panel is still booting and be lost,
+    // leaving us unpolled indefinitely (observed 2026-10-06, see known_quirks.md).
+    if (this->registration_sent_ && (now_ms - this->last_registration_announce_ms_) >= 60000) {
+      if (this->last_ping_ms_ == 0) {
+        ESP_LOGW(TAG, "Never pinged since announce, re-sending registration announce");
+        this->registration_sent_ = false;
+      } else if ((now_ms - this->last_ping_ms_) >= 60000) {
+        ESP_LOGW(TAG, "No ping for 60 s, re-sending registration announce");
+        this->registration_sent_ = false;
+      }
     }
     if (!this->registration_sent_ && now_ms >= this->registration_after_ms_ && this->is_bus_idle_() &&
         (now_ms - this->last_registration_announce_ms_) >= REGISTRATION_ANNOUNCE_MIN_INTERVAL_MS) {
