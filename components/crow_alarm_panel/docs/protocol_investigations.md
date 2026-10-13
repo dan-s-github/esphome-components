@@ -1119,3 +1119,40 @@ Every predicted combination above has been logged, and no logged variant falls o
 **Assumption (unverified):** that `0x70` is the RF receiver reporting interference (see `protocol_wire_format.md`), and that the `0x07` timer coincidence (both onsets exactly 302s after its announce) means the APP POD's re-announce is involved — e.g. a storm on the bus being judged as radio interference, or the pod itself emitting RF noise when it cycles. Only two faults against ~2,000 `0x07` cycles in the week between them, so this could equally be coincidence: storms land on that timer anyway, and the fault may simply be detected during the resulting pause. Nothing on the bus says what the radio receiver actually heard.
 
 **Practical takeaway:** the fault bits are now exposed as `binary_sensor` types `trouble` (current) and `trouble_latched` (latched), debounced over two consecutive status frames, and data[0] bit 7 is masked off before the keypad lookup so it no longer logs as `Keypad 0x80`. Replaying every status frame from 2026-09-25 → 2026-10-03 through that logic switches the sensors only during these two episodes. Removing keypad `0x07` remains the planned test; when it happens, check whether RF-interference faults stop too, and what bits a `KPSA` keypad-missing fault sets (expected to differ from or add to the ones above).
+
+## Mains and battery faults (2026-10-14) — a controlled test decodes `CONTROLLER_STATUS` data[1] and `flags` bit 1
+
+The user simulated a mains power failure and then a backup-battery failure at the panel, each restored after about 30s, and asked whether either was visible on the bus. Capture: the frigate long-term logger, `crow-alarm.log` for 2026-10-13 (UTC).
+
+**Observed facts:**
+
+| | Mains failure | Battery failure |
+|---|---|---|
+| Onset (first status frame) | 21:32:02.995 UTC (10:32 NZDT) | 21:33:46.488 UTC (10:33 NZDT) |
+| Status frames during the fault | `10.00.02.C3.00.00`, `10.00.02.82.00.00` | `10.00.01.C3.00.00`, `10.00.01.82.00.00` |
+| Restore (first clean frame) | 21:32:33.003 UTC, `10.00.00.C1.00.00` | 21:34:16.174 UTC, `10.00.00.C1.00.00` |
+
+- Only data[1] and `flags` bit 1 (`0x02`) changed. The flags' zone-activity part (`0x80`/`0xC1`) kept following zone changes as usual, and data[0] bit 7, `flags` bit 2 and data[3] (the RF-interference fault bits) stayed clear throughout, so the existing `trouble` sensors reported `trouble:none`.
+- Keypad polling continued without a pause (33 pings between 21:31:50 and 21:34:30), and there were no announces, `Unknown` frames or watchdog warnings. This differs from the RF-interference onset (2026-10-03 entry).
+- Across the full archive (2026-09-14 → 2026-10-14, 59,343 status frames), non-zero data[1] occurs in only two other frames: `10.00.01.C3.00.00` at 2026-09-15 04:39:14 UTC (16:39 NZST; the next status frame, at 04:46:59, is clean) and `10.00.02.C3.00.00` at 2026-10-06 04:06:03 UTC (17:06 NZDT; next frame, clean, at 04:17:50). `flags` bit 1 is set in exactly the frames where data[1] is non-zero, with no exceptions.
+- The user reports that the physical keypad showed the fault only while it was current, and cleared it on restore with no lingering indication. This matches the bus: the fault bits clear in the restore frame, and data[3] (the TROUBLE latch for the RF-interference fault) stays `0x00` throughout.
+- The real outage at about 2026-10-14 03:58 NZDT (all Frigate cameras dropped at 03:58:02) was not captured: the logger had been stuck since 2026-10-11.
+
+**Inference (medium confidence — one controlled test, matched order and timing):** data[1] bit 1 = the manual's current fault `AC` ("AC Failure — no mains power detected at alarm panel") and data[1] bit 0 = `BATT` ("Battery Low — alarm backup battery is low or missing"). The manual's fault list has no separate "battery failed" code: low and missing are one condition, and the panel load-tests the battery every 15s. The simulated failure most likely raised `BATT`, the same fault a draining battery would, but a genuinely low battery hasn't been observed on the bus. `flags` bit 1 is a summary "supply fault current" bit, which answers the long-open "bit 1 meaning unknown" for `0x82`/`0xC3`. Neither fault latches, on the bus or on the keypad (confirmed by the user for these ~30s faults), unlike the RF-interference fault.
+
+**Assumption (unverified):** that the two earlier single frames were real short supply events. If so, the 2026-09-15 battery fault may be the panel's periodic battery test. Also unverified: what a long outage looks like (whether a latch eventually sets, and whether a mains fault drags the battery bit along as the battery drains), that both faults together would give data[1] = `0x03`, and that a draining (rather than disconnected) battery sets bit 0 and not some other bit. To confirm the last one, look for `b1=0x01` whenever the keypad's MEM list shows `BATT`.
+
+**Status frames are only sent on change:** the 09-15 and 10-06 blips each produced one fault frame, with the next status frame 7–11 minutes later. A two-consecutive-frames debounce like the `trouble` sensors' would never publish such a fault. The new `mains_fault` / `battery_fault` binary sensors instead publish from a single frame when data[1] and `flags` bit 1 agree, and log and drop a frame where they disagree. Replaying the archive through that logic switches the sensors only in the four episodes above, with zero disagreeing frames. The same single-frame weakness probably applies to the `trouble` debounce for a short RF-interference fault during a quiet period, but it hasn't mattered in the two episodes seen, which both lasted hours.
+
+**Follow-up (2026-10-14, same day): battery swap, a second `BATT` sample, first on the new firmware.** The user swapped in a battery suspected to be low, then put the original back. The log shows two battery-fault windows, each one frame of `10.00.01.C3.00.00` followed by a clean `10.00.00.C1.00.00`:
+
+| Fault frame (UTC) | Restore frame (UTC) | Most likely |
+|---|---|---|
+| 22:06:10 (11:06 NZDT) | 22:06:35 | original battery disconnected → test battery connected |
+| 22:07:00 (11:07 NZDT) | 22:07:20 | test battery disconnected → original reconnected |
+
+- The firmware with `mains_fault`/`battery_fault` (commit `2480cbf`) logged both as `supply:battery_fault`. There were no warnings and no frames where the two indicators disagreed.
+- Each fault restored as soon as a battery was connected, so both batteries passed the panel's load test. This was another missing-battery case, not a low one. Whether a draining battery sets the same bit is still unconfirmed.
+- Each fault produced exactly one status frame, with no zone activity to add more. This is the single-frame case the new sensors were designed for; a two-frame debounce would have published neither.
+
+**Next:** check this against a real mains outage once the logger has one, try a longer simulated outage to see whether a long fault ever latches, and watch for `b1=0x01` whenever the keypad shows `BATT` for a genuinely low battery.

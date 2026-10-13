@@ -227,6 +227,27 @@ happening often, check for a new radio source near the panel.
 
 ---
 
+## Mains / battery fault sensors
+
+**What you'll see:** during a power cut, or while the panel's backup battery is low or missing, the optional
+`mains_fault` / `battery_fault` binary sensors turn on, and the status log lines show
+`supply:mains_fault` or `supply:battery_fault` instead of `supply:ok`. The `trouble`
+sensors stay off, because these faults use different bits from the RF interference
+alarm below. If the turn-off arrives a few minutes after the power is back, that's
+normal: the panel only sends its status broadcast when something changes.
+
+**Cause:** the panel reports the fault type in its status broadcast. These are the same conditions the keypad lists under MEM as `AC` and `BATT`. The panel has one battery fault for both low and missing. The decoding has
+been checked against one simulated mains failure and one simulated battery failure
+(2026-10-14, `protocol_investigations.md`, "Mains and battery faults"). A real outage
+hasn't been captured yet.
+
+**What to do:** nothing beyond whatever you'd normally do about a power cut. A rare
+`supply-fault bits disagree ... ignoring` warning means a status frame arrived
+garbled. It's dropped and the next frame corrects it. Please report it if it shows up
+often.
+
+---
+
 ## Cross-references
 
 | Topic | Document |

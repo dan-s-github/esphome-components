@@ -98,7 +98,7 @@ where `N = data.size()` (payload bytes, excluding type and closing boundary).
 | Offset | Size | Name | Description | Confidence |
 |---|---|---|---|---|
 | 0 | 1 | `keypad_addr` | Target keypad address. Bit 7 (`0x80`) is set while a system fault is current — see "Fault bits" below; the parser masks it off before the keypad lookup | High (address); medium (bit 7) |
-| 1 | 1 | `UNKNOWN_01` | Observed: `0x00`, `0x01` | Low |
+| 1 | 1 | `supply_fault` | `0x00` normally; bit 1 (`0x02`) while mains power is lost (manual fault `AC`), bit 0 (`0x01`) while the backup battery is low or missing (manual fault `BATT`) — see "Power-supply fault bits" below | Medium |
 | 2 | 1 | `flags` | System status flags (see below) | High |
 | 3 | 1 | `UNKNOWN_02` | `0x00`, or `0x04` while a fault is latched and not yet acknowledged — see "Fault bits" below | Medium (`0x04`) |
 | 4 | 1 | `UNKNOWN_03` | Always `0x00` | Low |
@@ -109,8 +109,7 @@ where `N = data.size()` (payload bytes, excluding type and closing boundary).
 |---|---|
 | `0x80` | Zone activity — one or more zones active/transitioning |
 | `0xC1` | Zones clear — system idle, all zones secure |
-| `0x82` | Zone activity variant (bit 1 meaning unknown) |
-| `0xC3` | Zones-clear variant (bit 1 meaning unknown) |
+| `0x82` / `0xC3` | `0x80` / `0xC1` with bit 1 (`0x02`) set: a power-supply fault is current (see "Power-supply fault bits" below) |
 | `0x84` / `0xC5` | `0x80` / `0xC1` with bit 2 (`0x04`) set: a system fault is current (see below) |
 
 **Fault bits (2026-10-03, two episodes — `protocol_investigations.md`, "RF-interference fault"):**
@@ -121,7 +120,19 @@ three bits change together when the panel raises a fault, and they clear in two 
 | data[0] bit 7 (`0x80`) + flags bit 2 (`0x04`) | at fault onset | when the fault restores: on the first RF remote frame (`0x7C`) received afterwards, in both episodes | fault **current** |
 | data[3] = `0x04` | at fault onset | when acknowledged: MEMORY + ENTER on a keypad (10-02), or arming (09-25); stays set after the fault restores | fault **latched / not yet viewed** — the keypad's red TROUBLE light |
 
-The one fault seen so far is the panel's RF-interference alarm (`RFIA`/`RFIR` in the manual's event list), identified from what the user saw on the AAP keypad display plus the clear-on-RF-reception behaviour. Whether other fault types (AC fail, keypad missing, …) use the same bits, or other bits in the same bytes, is not known yet. Exposed as the `binary_sensor` types `trouble` (data[0] bit 7 or flags bit 2) and `trouble_latched` (data[3] bit 2); each publishes only after two consecutive status frames agree.
+The one fault seen so far is the panel's RF-interference alarm (`RFIA`/`RFIR` in the manual's event list), identified from what the user saw on the AAP keypad display plus the clear-on-RF-reception behaviour. Mains and battery faults use different bits (see "Power-supply fault bits" below); whether other fault types (keypad missing, …) use these bits is not known yet. Exposed as the `binary_sensor` types `trouble` (data[0] bit 7 or flags bit 2) and `trouble_latched` (data[3] bit 2); each publishes only after two consecutive status frames agree.
+
+**Power-supply fault bits (2026-10-14, one controlled test — `protocol_investigations.md`, "Mains and battery faults"):**
+data[1] says which supply fault is current, and `flags` bit 1 (`0x02`) is set alongside it:
+
+| data[1] | `flags` | Reading | Seen |
+|---|---|---|---|
+| `0x02` | `0xC3` / `0x82` | `AC` — AC Failure: no mains power at the panel | user-simulated power failure, 2026-10-14 10:32:02–10:32:33 NZDT; one single frame 2026-10-06 |
+| `0x01` | `0xC3` / `0x82` | `BATT` — Battery Low: backup battery low or missing | user-simulated battery failure, 2026-10-14 10:33:46–10:34:16 NZDT; battery swap (each battery disconnected in turn), 2026-10-14 11:06:10–11:06:35 and 11:07:00–11:07:20 NZDT; one single frame 2026-09-15 |
+
+The fault names are the manual's current-fault codes (ESL-2 Install & Program Manual, "Current Faults & History", the list shown under MEM on the keypad). That list has a single battery entry covering both a low and a missing battery, with event-log pair `BATA`/`BATR` "Panel Low Battery (Restore)", so a draining battery is expected to set the same bit as the simulated failure. Only the simulated (disconnected) case has been observed. Both clear when the fault restores. Unlike the RF-interference fault, neither sets the latch byte (data[3]) or data[0] bit 7, at least for a ~30s fault, and the physical keypad showed each fault only while it was current, matching the bits. Across 59,343 archived status frames (2026-09-14 → 2026-10-14), flags bit 1 is set in exactly the frames where data[1] is non-zero. Not yet seen: both faults at once (assumed to be `0x03`), a long-lasting fault, and whether a real outage looks the same as the simulated one.
+
+The controller sends `CONTROLLER_STATUS` only on change. A fault with no zone activity during it can therefore arrive as a single frame, followed minutes later by the clearing frame. Exposed as the `binary_sensor` types `mains_fault` and `battery_fault`. Because there may be no second frame, these publish from a single frame when data[1] and flags bit 1 agree, and a frame where they disagree is logged and dropped. They don't use the two-frame debounce of the `trouble` sensors.
 
 **Examples:**
 ```
@@ -130,6 +141,8 @@ The one fault seen so far is the panel's RF-interference alarm (`RFIA`/`RFIR` in
 10 80 00 C5 04 00   → zones_clear, fault current, fault latched (RF interference, 2026-10-02)
 10 80 00 C5 00 00   → zones_clear, fault current, already acknowledged
 10 00 00 80 04 00   → zone activity, fault restored but not yet acknowledged (2026-09-25)
+10 00 02 C3 00 00   → zones_clear, mains fault (2026-10-14 test)
+10 00 01 82 00 00   → zone activity, battery low/missing (2026-10-14 test)
 ```
 
 ---
@@ -659,7 +672,6 @@ A1 00 0D   → [AAP Keypad] ARM
 
 | Field | Location | Observed range | Notes |
 |---|---|---|---|
-| `CONTROLLER_STATUS.UNKNOWN_01` | 0x10 data[1] | `0x00`, `0x01` | Correlated with zone/armed state? |
 | `KEYPAD_COMMAND.UNKNOWN_02` | 0x14 data[5] | `0x80` (usual), `0x40` (rare) | Possible parity or flag byte |
 | `KEYPAD_STATE.UNKNOWN_03` | 0x15 data[4] | Always `0x03` | Possibly keypad model/version; field name may be misleading now direction is confirmed controller→keypad |
 | `KEYPAD_PING` Variant B payload | 0x23 data[1..7] | `03 44 81 00 80 11 07` | Seen with invalid RTC; possible capability flags |

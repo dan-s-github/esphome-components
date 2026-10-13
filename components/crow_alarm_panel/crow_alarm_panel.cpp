@@ -59,7 +59,12 @@ uint8_t day_of_week_from_date(uint16_t year, uint8_t month, uint8_t day) {
   return static_cast<uint8_t>((year + year / 4 - year / 100 + year / 400 + OFFSETS[month - 1] + day) % 7) + 1;
 }
 
+// Bits 1 (0x02, power-supply fault) and 2 (0x04, system fault) ride on top of the zone-activity
+// profile, so they're masked off before classifying (docs/protocol_wire_format.md, "flags").
+constexpr uint8_t CONTROLLER_STATUS_FAULT_FLAGS = 0x06;
+
 const char *controller_status_profile(uint8_t flags) {
+  flags &= ~CONTROLLER_STATUS_FAULT_FLAGS;
   if (flags == 0x80) {
     return "zone_activity";
   }
@@ -76,6 +81,7 @@ const char *controller_status_profile(uint8_t flags) {
 }
 
 const char *controller_status_state(uint8_t flags) {
+  flags &= ~CONTROLLER_STATUS_FAULT_FLAGS;
   if (flags == 0x80) {
     return "zone_active_or_transition";
   }
@@ -360,6 +366,12 @@ void CrowAlarmPanel::loop() {
         const uint8_t keypad_address = data[0] & 0x7F;
         const bool trouble_current = (data[0] & 0x80) != 0 || (data[2] & 0x04) != 0;
         const bool trouble_latched = (data[3] & 0x04) != 0;
+        // Power-supply fault bits (docs/protocol_wire_format.md, "Power-supply fault bits";
+        // observed in one controlled test plus two single-frame blips): data[1] bit 1 while mains
+        // is lost, bit 0 while the battery is faulty, with flags bit 1 (0x02) set alongside.
+        const bool mains_fault = (data[1] & 0x02) != 0;
+        const bool battery_fault = (data[1] & 0x01) != 0;
+        const bool supply_flag = (data[2] & 0x02) != 0;
         CrowAlarmPanelKeypad keypad = this->find_keypad_(keypad_address);
         std::string bits = binary_indices(data[2]);
         if (bits.empty()) {
@@ -367,11 +379,30 @@ void CrowAlarmPanel::loop() {
         }
         ESP_LOGD(TAG,
                  "[%-*s] Controller status: b1=0x%02X flags=0x%02X bits=%s b3=0x%02X b4=0x%02X profile:%s state:%s "
-                 "trouble:%s%s [%02x.%s]",
+                 "trouble:%s%s supply:%s [%02x.%s]",
                  this->keypad_label_width_, keypad_label(keypad, keypad_address).c_str(), data[1], data[2],
                  bits.c_str(), data[3], data[4], controller_status_profile(data[2]),
                  controller_status_state(data[2]), trouble_current ? "current" : "none",
-                 trouble_latched ? ",latched" : "", type, format_hex_pretty(data).c_str());
+                 trouble_latched ? ",latched" : "",
+                 mains_fault ? (battery_fault ? "mains_fault,battery_fault" : "mains_fault")
+                             : (battery_fault ? "battery_fault" : "ok"),
+                 type, format_hex_pretty(data).c_str());
+
+        // The controller only sends status frames on change, so a supply fault during a quiet
+        // period may arrive as a single frame — no second frame to debounce against. Instead,
+        // publish when the two independent indicators agree (a single-bit glitch can't fake
+        // both) and drop frames where they don't.
+        if (supply_flag == (mains_fault || battery_fault)) {
+          if (this->mains_fault_ != nullptr) {
+            this->mains_fault_->publish_state(mains_fault);
+          }
+          if (this->battery_fault_ != nullptr) {
+            this->battery_fault_->publish_state(battery_fault);
+          }
+        } else {
+          ESP_LOGW(TAG, "[%-*s] Controller status: supply-fault bits disagree (b1=0x%02X flags=0x%02X), ignoring",
+                   this->keypad_label_width_, CONTROLLER_LABEL, data[1], data[2]);
+        }
 
         const uint8_t reading = (trouble_current ? 0x01 : 0x00) | (trouble_latched ? 0x02 : 0x00);
         if (reading != this->last_trouble_reading_) {

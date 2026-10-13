@@ -271,6 +271,10 @@ class CrowAlarmPanel : public Component {
   // TROUBLE latch (cleared by viewing the fault on a keypad or arming).
   void register_trouble(binary_sensor::BinarySensor *sensor) { this->trouble_ = sensor; }
   void register_trouble_latched(binary_sensor::BinarySensor *sensor) { this->trouble_latched_ = sensor; }
+  // Power-supply faults decoded from CONTROLLER_STATUS data[1] (see docs/protocol_wire_format.md,
+  // "Power-supply fault bits"): bit 1 = mains (AC) lost, bit 0 = battery fault.
+  void register_mains_fault(binary_sensor::BinarySensor *sensor) { this->mains_fault_ = sensor; }
+  void register_battery_fault(binary_sensor::BinarySensor *sensor) { this->battery_fault_ = sensor; }
   void register_output_switch(switch_::Switch *output_switch, uint8_t output_number) {
     this->outputs_.push_back(std::move(CrowAlarmPanelOutput{
         .the_switch = output_switch,
@@ -433,6 +437,8 @@ class CrowAlarmPanel : public Component {
   text_sensor::TextSensor *armed_state_{nullptr};
   binary_sensor::BinarySensor *trouble_{nullptr};
   binary_sensor::BinarySensor *trouble_latched_{nullptr};
+  binary_sensor::BinarySensor *mains_fault_{nullptr};
+  binary_sensor::BinarySensor *battery_fault_{nullptr};
   // Fault bits from the previous CONTROLLER_STATUS (bit 0 = current, bit 1 = latched;
   // 0xFF = none seen yet). The trouble sensors publish only once two consecutive frames agree,
   // so a single-bit receive glitch can't toggle them.

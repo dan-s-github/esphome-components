@@ -135,11 +135,19 @@ binary_sensor:
   - platform: crow_alarm_panel
     type: trouble_latched
     name: "Alarm Trouble Latched"
+
+  - platform: crow_alarm_panel
+    type: mains_fault
+    name: "Alarm Mains Fault"
+
+  - platform: crow_alarm_panel
+    type: battery_fault
+    name: "Alarm Battery Fault"
 ```
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `type` | yes | `zone` — active state sensor; `trouble` — on while the panel reports a current fault; `trouble_latched` — on while the keypad TROUBLE light is latched |
+| `type` | yes | `zone` — active state sensor; `trouble` — on while the panel reports a current fault; `trouble_latched` — on while the keypad TROUBLE light is latched; `mains_fault` — on while the panel reports mains power lost (keypad fault `AC`); `battery_fault` — on while the panel reports its backup battery low or missing (keypad fault `BATT`) |
 | `zone` | `zone` only | Zone number (1–16) |
 
 The trouble sensors default to `device_class: problem`. They are decoded from the
@@ -150,6 +158,15 @@ interference, the next time an RF remote is received), while
 (MEM key) or arms the system. Each changes only after two consecutive status
 broadcasts agree, so expect a few seconds' delay. See
 `docs/protocol_wire_format.md` ("Fault bits") and `docs/known_quirks.md`.
+
+`mains_fault` defaults to `device_class: problem` and `battery_fault` to
+`device_class: battery` (on = battery problem). Both are decoded from the
+controller's status broadcast, and so far have been checked against one
+simulated mains failure and one simulated battery failure. They turn on with
+the first status broadcast that reports the fault and off when the panel
+reports it restored. The panel only broadcasts status when something changes,
+so if nothing else is happening on the system, the turn-off can lag by a few
+minutes. See `docs/protocol_wire_format.md` ("Power-supply fault bits").
 
 All standard binary sensor options (`name`, `device_class`, `icon`, etc.) are supported.
 
