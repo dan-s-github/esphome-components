@@ -115,9 +115,10 @@ panel's zone-state bitmap, never set optimistically. The bypass sequence is
 
 ### `binary_sensor`
 
-Standalone zone sensor for zones not using `zones:`. For bypass state, use the
-`switch` platform's `type: bypass` (or the `zones:` parent config) instead — the
-bypass switch is both the control and the state indicator.
+Standalone zone sensor for zones not using `zones:`, plus panel trouble
+indicators. For bypass state, use the `switch` platform's `type: bypass` (or the
+`zones:` parent config) instead — the bypass switch is both the control and the
+state indicator.
 
 ```yaml
 binary_sensor:
@@ -126,12 +127,48 @@ binary_sensor:
     zone: 3
     name: "Back Door"
     device_class: door
+
+  - platform: crow_alarm_panel
+    type: trouble
+    name: "Alarm Trouble"
+
+  - platform: crow_alarm_panel
+    type: trouble_latched
+    name: "Alarm Trouble Latched"
+
+  - platform: crow_alarm_panel
+    type: mains_fault
+    name: "Alarm Mains Fault"
+
+  - platform: crow_alarm_panel
+    type: battery_fault
+    name: "Alarm Battery Fault"
 ```
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `type` | yes | `zone` — active state sensor |
-| `zone` | yes | Zone number (1–16) |
+| `type` | yes | `zone` — active state sensor; `trouble` — on while the panel reports a current fault; `trouble_latched` — on while the keypad TROUBLE light is latched; `mains_fault` — on while the panel reports mains power lost (keypad fault `AC`); `battery_fault` — on while the panel reports its backup battery low or missing (keypad fault `BATT`) |
+| `zone` | `zone` only | Zone number (1–16) |
+
+The trouble sensors default to `device_class: problem`. They are decoded from the
+controller's status broadcast and have so far only been observed for the panel's
+RF interference alarm: `trouble` turns off when the fault restores (for RF
+interference, the next time an RF remote is received), while
+`trouble_latched` stays on until someone views the fault on a keypad
+(MEM key) or arms the system. `trouble` changes with the first status broadcast that
+reports the change, as long as the two fault bits in it agree. `trouble_latched` waits for
+two consecutive broadcasts to agree. The panel only broadcasts status when something
+changes, so it can lag until the next zone or state change. See
+`docs/protocol_wire_format.md` ("Fault bits") and `docs/known_quirks.md`.
+
+`mains_fault` defaults to `device_class: problem` and `battery_fault` to
+`device_class: battery` (on = battery problem). Both are decoded from the
+controller's status broadcast, and so far have been checked against one
+simulated mains failure and one simulated battery failure. They turn on with
+the first status broadcast that reports the fault and off when the panel
+reports it restored. The panel only broadcasts status when something changes,
+so if nothing else is happening on the system, the turn-off can lag by a few
+minutes. See `docs/protocol_wire_format.md` ("Power-supply fault bits").
 
 All standard binary sensor options (`name`, `device_class`, `icon`, etc.) are supported.
 
@@ -248,6 +285,12 @@ logger:
   logs:
     crow_alarm_panel: DEBUG
 ```
+
+**Alarm code in logs.** Code digits are masked as `*` / `**`:
+- **Masked:** digits this component types for an arm/disarm (`Code sequence` and `Sending packet` lines), and digits typed on any physical keypad, both in `Key … pressed` and in the `log_raw_frames` output. Digits typed within 10 s after OUTPUT or BYPASS (output and zone numbers) stay visible. After that, or after any other key, digits are masked again, so an abandoned output selection doesn't expose a code typed later.
+- **Not masked:** the `log_raw_bits` diagnostic (it's the literal bitstream, so it can contain the code), and the raw `data` passed to `on_message` automations.
+
+Older log captures from before this masking may still contain the code.
 
 Seeing an occasional `WARN` line or a disarm/arm that takes a few extra seconds? Check
 [`docs/known_quirks.md`](docs/known_quirks.md) before assuming it's a new bug — most

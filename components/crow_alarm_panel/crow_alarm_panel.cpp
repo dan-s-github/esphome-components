@@ -59,7 +59,12 @@ uint8_t day_of_week_from_date(uint16_t year, uint8_t month, uint8_t day) {
   return static_cast<uint8_t>((year + year / 4 - year / 100 + year / 400 + OFFSETS[month - 1] + day) % 7) + 1;
 }
 
+// Bits 1 (0x02, power-supply fault) and 2 (0x04, system fault) ride on top of the zone-activity
+// profile, so they're masked off before classifying (docs/protocol_wire_format.md, "flags").
+constexpr uint8_t CONTROLLER_STATUS_FAULT_FLAGS = 0x06;
+
 const char *controller_status_profile(uint8_t flags) {
+  flags &= ~CONTROLLER_STATUS_FAULT_FLAGS;
   if (flags == 0x80) {
     return "zone_activity";
   }
@@ -76,6 +81,7 @@ const char *controller_status_profile(uint8_t flags) {
 }
 
 const char *controller_status_state(uint8_t flags) {
+  flags &= ~CONTROLLER_STATUS_FAULT_FLAGS;
   if (flags == 0x80) {
     return "zone_active_or_transition";
   }
@@ -341,10 +347,17 @@ void CrowAlarmPanel::loop() {
     std::vector<uint8_t> data;
     data.insert(data.begin(), local_frame + 1, local_frame + frame_len - 1);
 
+    // A keypress that may be a code digit is logged with the key byte masked, here and in
+    // the KEYPRESS handler below — a code typed on a physical keypad would otherwise end up
+    // in every log capture.
+    const std::string raw_hex =
+        (type == KEYPRESS && this->keypress_is_masked_(data))
+            ? format_hex_pretty(std::vector<uint8_t>(data.begin(), data.begin() + 1), '.', false) + ".**"
+            : format_hex_pretty(data);
     if (this->raw_frame_logging_enabled_) {
-      ESP_LOGI(TAG, "Received raw frame [%02x.%s]", type, format_hex_pretty(data).c_str());
+      ESP_LOGI(TAG, "Received raw frame [%02x.%s]", type, raw_hex.c_str());
     } else {
-      ESP_LOGV(TAG, "Received raw frame [%02x.%s]", type, format_hex_pretty(data).c_str());
+      ESP_LOGV(TAG, "Received raw frame [%02x.%s]", type, raw_hex.c_str());
     }
 
     switch (type) {
@@ -353,18 +366,74 @@ void CrowAlarmPanel::loop() {
           ESP_LOGW(TAG, "Controller status too short, discarding");
           break;
         }
-        CrowAlarmPanelKeypad keypad = this->find_keypad_(data[0]);
+        // Fault bits (docs/protocol_wire_format.md, "Fault bits"; observed for the panel's RF
+        // interference alarm only): data[0] bit 7 + flags bit 2 while the fault is current,
+        // data[3] = 0x04 while the keypad TROUBLE latch is set. Bit 7 is not part of the
+        // keypad address, so mask it off before the lookup.
+        const uint8_t keypad_address = data[0] & 0x7F;
+        const bool trouble_current = (data[0] & 0x80) != 0 || (data[2] & 0x04) != 0;
+        const bool trouble_latched = (data[3] & 0x04) != 0;
+        // Power-supply fault bits (docs/protocol_wire_format.md, "Power-supply fault bits";
+        // observed in one controlled test plus two single-frame blips): data[1] bit 1 while mains
+        // is lost, bit 0 while the battery is faulty, with flags bit 1 (0x02) set alongside.
+        const bool mains_fault = (data[1] & 0x02) != 0;
+        const bool battery_fault = (data[1] & 0x01) != 0;
+        const bool supply_flag = (data[2] & 0x02) != 0;
+        CrowAlarmPanelKeypad keypad = this->find_keypad_(keypad_address);
         std::string bits = binary_indices(data[2]);
         if (bits.empty()) {
           bits = "none";
         }
         ESP_LOGD(TAG,
                  "[%-*s] Controller status: b1=0x%02X flags=0x%02X bits=%s b3=0x%02X b4=0x%02X profile:%s state:%s "
-                 "[%02x.%s]",
-                 this->keypad_label_width_, keypad_label(keypad, data[0]).c_str(), data[1], data[2], bits.c_str(),
-                 data[3], data[4],
-                 controller_status_profile(data[2]), controller_status_state(data[2]), type,
-                 format_hex_pretty(data).c_str());
+                 "trouble:%s%s supply:%s [%02x.%s]",
+                 this->keypad_label_width_, keypad_label(keypad, keypad_address).c_str(), data[1], data[2],
+                 bits.c_str(), data[3], data[4], controller_status_profile(data[2]),
+                 controller_status_state(data[2]), trouble_current ? "current" : "none",
+                 trouble_latched ? ",latched" : "",
+                 mains_fault ? (battery_fault ? "mains_fault,battery_fault" : "mains_fault")
+                             : (battery_fault ? "battery_fault" : "ok"),
+                 type, format_hex_pretty(data).c_str());
+
+        // The controller only sends status frames on change, so a supply fault during a quiet
+        // period may arrive as a single frame — no second frame to debounce against. Instead,
+        // publish when the two independent indicators agree (a single-bit glitch can't fake
+        // both) and drop frames where they don't.
+        if (supply_flag == (mains_fault || battery_fault)) {
+          if (this->mains_fault_ != nullptr) {
+            this->mains_fault_->publish_state(mains_fault);
+          }
+          if (this->battery_fault_ != nullptr) {
+            this->battery_fault_->publish_state(battery_fault);
+          }
+        } else {
+          ESP_LOGW(TAG, "[%-*s] Controller status: supply-fault bits disagree (b1=0x%02X flags=0x%02X), ignoring",
+                   this->keypad_label_width_, CONTROLLER_LABEL, data[1], data[2]);
+        }
+
+        // `trouble`: same single-frame rule as the supply faults. A short fault in a quiet
+        // period can arrive as one frame followed by the restore frame, so a two-frame debounce
+        // could never publish it. data[0] bit 7 and flags bit 2 are independent indicators that
+        // agreed in every archived frame (231 set, none mixed), so publish when they agree and
+        // drop a frame where they don't.
+        const bool fault_bit_addr = (data[0] & 0x80) != 0;
+        const bool fault_bit_flags = (data[2] & 0x04) != 0;
+        if (fault_bit_addr == fault_bit_flags) {
+          if (this->trouble_ != nullptr) {
+            this->trouble_->publish_state(trouble_current);
+          }
+        } else {
+          ESP_LOGW(TAG, "[%-*s] Controller status: fault bits disagree (b0=0x%02X flags=0x%02X), ignoring",
+                   this->keypad_label_width_, CONTROLLER_LABEL, data[0], data[2]);
+        }
+        const uint8_t latched_reading = trouble_latched ? 0x01 : 0x00;
+        if (latched_reading != this->last_trouble_latched_reading_) {
+          this->last_trouble_latched_reading_ = latched_reading;
+          break;
+        }
+        if (this->trouble_latched_ != nullptr) {
+          this->trouble_latched_->publish_state(trouble_latched);
+        }
         break;
       }
       case OUTPUT_STATE:
@@ -374,6 +443,12 @@ void CrowAlarmPanel::loop() {
         }
         ESP_LOGD(TAG, "[%-*s] Output state [%s]", this->keypad_label_width_, CONTROLLER_LABEL,
                  format_hex_pretty(data).c_str());
+        this->last_output_bitmap_ = data[0];
+        if (this->output_select_state_ != OutputSelectState::IDLE && this->output_select_number_ >= 1 &&
+            this->output_select_number_ <= 8 &&
+            (((data[0] >> (this->output_select_number_ - 1)) & 0x01) != 0) != this->output_select_initial_bit_) {
+          this->output_select_landed_ = true;
+        }
         for (CrowAlarmPanelOutput output : this->outputs_) {
           bool on = ((data[0] >> (output.number - 1)) & 0x01);
           output.the_switch->publish_state(on);
@@ -465,6 +540,8 @@ void CrowAlarmPanel::loop() {
           }
           ESP_LOGD(TAG, "[%-*s] Arming [%02x.%s]", this->keypad_label_width_, CONTROLLER_LABEL, type,
                    format_hex_pretty(data).c_str());
+          this->panel_arming_ = true;
+          this->panel_arming_since_ms_ = millis();
           this->last_confirmed_acp_state_ = alarm_control_panel::ACP_STATE_ARMING;
           if (this->alarm_control_panel_ != nullptr) {
             this->alarm_control_panel_->publish_state(alarm_control_panel::ACP_STATE_ARMING);
@@ -475,6 +552,7 @@ void CrowAlarmPanel::loop() {
           }
           ESP_LOGD(TAG, "[%-*s] Armed Away [%02x.%s]", this->keypad_label_width_, CONTROLLER_LABEL, type,
                    format_hex_pretty(data).c_str());
+          this->panel_arming_ = false;
           this->last_confirmed_acp_state_ = alarm_control_panel::ACP_STATE_ARMED_AWAY;
           if (this->alarm_control_panel_ != nullptr) {
             this->alarm_control_panel_->publish_state(alarm_control_panel::ACP_STATE_ARMED_AWAY);
@@ -485,6 +563,7 @@ void CrowAlarmPanel::loop() {
           }
           ESP_LOGD(TAG, "[%-*s] Disarmed [%02x.%s]", this->keypad_label_width_, CONTROLLER_LABEL, type,
                    format_hex_pretty(data).c_str());
+          this->panel_arming_ = false;
           this->last_confirmed_acp_state_ = alarm_control_panel::ACP_STATE_DISARMED;
           if (this->alarm_control_panel_ != nullptr) {
             this->alarm_control_panel_->publish_state(alarm_control_panel::ACP_STATE_DISARMED);
@@ -492,6 +571,9 @@ void CrowAlarmPanel::loop() {
         } else {
           ESP_LOGD(TAG, "[%-*s] Armed state unknown [%02x.%s]", this->keypad_label_width_, CONTROLLER_LABEL, type,
                    format_hex_pretty(data).c_str());
+          // Any state other than Arming ends the exit delay (e.g. a never-captured Armed Stay
+          // pattern); leaving the flag set would prefix ENTER on an armed panel.
+          this->panel_arming_ = false;
         }
         // ARMED_STATE is the controller's own authoritative state broadcast, independent of the
         // arm/disarm state machine — this is the only signal treated as proof of success (see the
@@ -513,7 +595,9 @@ void CrowAlarmPanel::loop() {
           const bool is_disarmed = (data[0] == 0x00 && data[1] == 0x00);
           if (is_arming || is_armed_away || is_disarmed) {
             const bool is_disarm_request = (this->arm_disarm_state_ == ArmDisarmState::CODE_DIGIT_PENDING ||
-                                            this->arm_disarm_state_ == ArmDisarmState::CODE_ENTER_PENDING) &&
+                                            this->arm_disarm_state_ == ArmDisarmState::CODE_ENTER_PENDING ||
+                                            this->arm_disarm_state_ == ArmDisarmState::CODE_CLEAR_PENDING ||
+                                            this->arm_disarm_state_ == ArmDisarmState::CODE_CLEAR_DELAY) &&
                                            this->arm_disarm_terminal_key_ == KEY_ENTER;
             const bool matches_intent = is_disarm_request ? is_disarmed : (is_arming || is_armed_away);
             if (matches_intent) {
@@ -558,8 +642,17 @@ void CrowAlarmPanel::loop() {
           break;
         }
         CrowAlarmPanelKeypad keypad = this->find_keypad_(data[0]);
-        ESP_LOGD(TAG, "[%-*s] Key %s (%d) pressed [%02x.%s]", this->keypad_label_width_,
-                 keypad_label(keypad, data[0]).c_str(), KEYS[key], key, type, format_hex_pretty(data).c_str());
+        if (this->keypress_is_masked_(data)) {
+          ESP_LOGD(TAG, "[%-*s] Key * pressed [%02x.%02x.**]", this->keypad_label_width_,
+                   keypad_label(keypad, data[0]).c_str(), type, data[0]);
+        } else {
+          ESP_LOGD(TAG, "[%-*s] Key %s (%d) pressed [%02x.%s]", this->keypad_label_width_,
+                   keypad_label(keypad, data[0]).c_str(), KEYS[key], key, type, format_hex_pretty(data).c_str());
+        }
+        if (key > 9) {
+          this->keypad_last_command_key_[data[0] & 0x7F] = key;
+          this->keypad_last_command_ms_[data[0] & 0x7F] = millis();
+        }
         break;
       }
       case CURRENT_TIME: {
@@ -657,12 +750,49 @@ void CrowAlarmPanel::loop() {
                  type, format_hex_pretty(data).c_str());
         // Drive output-select state machine forward when command is addressed to us.
         if (data[0] == this->keypad_address_) {
+          // data[3] is this keypad's selected-output bitmap: reset to 0 when OUTPUT is
+          // accepted, set once the controller accepts the output digit. Outside output
+          // selection it keeps the last selection, so the bit only counts after a digit went
+          // out AND this attempt has seen it clear (2026-10-14: a stale 0x08 throughout a
+          // sequence the controller never opened was misread as success).
+          const bool selection_bit = data.size() > 3 && this->output_select_number_ >= 1 &&
+                                     this->output_select_number_ <= 8 &&
+                                     ((data[3] >> (this->output_select_number_ - 1)) & 0x01);
+          if (this->output_select_state_ != OutputSelectState::IDLE && data.size() > 3 && !selection_bit) {
+            this->output_select_saw_bit_clear_ = true;
+          }
+          if ((this->output_select_state_ == OutputSelectState::DIGIT_PENDING ||
+               this->output_select_state_ == OutputSelectState::ENTER_DELAY ||
+               this->output_select_state_ == OutputSelectState::ENTER_PENDING) &&
+              this->output_select_key_idx_ > 0 && selection_bit && this->output_select_saw_bit_clear_) {
+            this->output_select_landed_ = true;
+          }
           switch (this->output_select_state_) {
+            case OutputSelectState::CLEAR_PENDING: {
+              const uint8_t cmd_byte = (data.size() > 1) ? data[1] : 0;
+              // 0x89/0xAA are the controller's own exit-delay screen updates (sent to every
+              // keypad at arming and near the end of the delay), not a reply to our ENTER.
+              if (cmd_byte == 0x89 || cmd_byte == 0xAA) {
+                break;
+              }
+              ESP_LOGD(TAG, "Output-select: ENTER confirmed (CMD 0x%02X), sending OUTPUT in %u ms", cmd_byte,
+                       (unsigned) CrowAlarmPanelStore::OUTPUT_SELECT_CLEAR_DELAY_MS);
+              this->output_select_state_ = OutputSelectState::CLEAR_DELAY;
+              this->output_select_state_enter_ms_ = millis();
+              break;
+            }
             case OutputSelectState::OUTPUT_PENDING:
-              // Controller already has us in output-select mode (KEYPAD_COMMAND arrived
-              // instead of the expected 0x1D ACK). This happens when the previous sequence
-              // left the controller with our keypad stuck in output-select mode because
-              // the KEYPAD_COMMAND [15] exit reply was lost. Treat it the same as ACK.
+              // KEYPAD_COMMAND instead of the expected 0x1D ACK. If the selection bitmap is
+              // empty, the controller already has us in output-select mode (a previous
+              // sequence's KEYPAD_COMMAND [15] exit reply was lost): treat it as the ACK.
+              // Otherwise OUTPUT wasn't taken as output selection at all (2026-10-14, exit
+              // delay: still showing the last selection) — sending the digit + ENTER then just
+              // types a one-digit entry, so wait and let the watchdog retry the attempt.
+              if (data.size() > 3 && data[3] != 0) {
+                ESP_LOGW(TAG, "Output-select: OUTPUT not accepted (CMD 0x%02X, selection 0x%02X), waiting",
+                         data.size() > 1 ? data[1] : 0, data[3]);
+                break;
+              }
               ESP_LOGW(TAG, "Output-select: KEYPAD_COMMAND in OUTPUT_PENDING (no 0x1D), recovering");
               this->output_select_state_ = OutputSelectState::AWAIT_COMMAND;
               this->output_select_state_enter_ms_ = millis();
@@ -686,8 +816,7 @@ void CrowAlarmPanel::loop() {
               }
               break;
             case OutputSelectState::ENTER_PENDING:
-              ESP_LOGD(TAG, "Output-select: sequence complete");
-              this->output_select_state_ = OutputSelectState::IDLE;
+              this->finish_output_select_(true);
               break;
             default:
               break;
@@ -702,6 +831,18 @@ void CrowAlarmPanel::loop() {
           // send the next digit out of order.
           if (!this->arm_disarm_retry_pending_ && !this->arm_disarm_key_in_flight_) {
             switch (this->arm_disarm_state_) {
+              case ArmDisarmState::CODE_CLEAR_PENDING: {
+                const uint8_t cmd_byte = (data.size() > 1) ? data[1] : 0;
+                // 0x89/0xAA are the controller's own exit-delay screen updates, not a reply.
+                if (cmd_byte == 0x89 || cmd_byte == 0xAA) {
+                  break;
+                }
+                ESP_LOGD(TAG, "Code sequence: ENTER confirmed (CMD 0x%02X), first digit in %u ms", cmd_byte,
+                         (unsigned) CrowAlarmPanelStore::OUTPUT_SELECT_CLEAR_DELAY_MS);
+                this->arm_disarm_state_ = ArmDisarmState::CODE_CLEAR_DELAY;
+                this->arm_disarm_state_enter_ms_ = millis();
+                break;
+              }
               case ArmDisarmState::ARM_AWAY_PENDING:
               case ArmDisarmState::ARM_STAY_PENDING:
                 ESP_LOGD(TAG, "Arm/stay: CMD received, sequence complete");
@@ -731,8 +872,7 @@ void CrowAlarmPanel::loop() {
                 }
                 if (this->arm_disarm_code_idx_ < this->arm_disarm_code_digits_.size()) {
                   uint8_t digit = this->arm_disarm_code_digits_[this->arm_disarm_code_idx_++];
-                  ESP_LOGD(TAG, "Code sequence: sending digit %u (index %u)", digit,
-                           this->arm_disarm_code_idx_ - 1);
+                  ESP_LOGD(TAG, "Code sequence: sending digit (index %u)", this->arm_disarm_code_idx_ - 1);
                   // No timestamp update here: arm_disarm_keypress_() already refreshes
                   // arm_disarm_state_enter_ms_ when the key actually transmits, and assigning
                   // after the call would be stale if the operation resolved (and a newer one
@@ -933,6 +1073,18 @@ void CrowAlarmPanel::loop() {
     this->on_message_trigger_->trigger(type, data);
   }
 
+  // Output-select CLEAR_DELAY: send OUTPUT a moment after the leading ENTER's confirmation.
+  if (this->output_select_state_ == OutputSelectState::CLEAR_DELAY) {
+    const uint32_t now_ms = millis();
+    if (now_ms - this->output_select_state_enter_ms_ >= CrowAlarmPanelStore::OUTPUT_SELECT_CLEAR_DELAY_MS) {
+      ESP_LOGD(TAG, "Output-select: sending OUTPUT (after %u ms delay)",
+               (unsigned)(now_ms - this->output_select_state_enter_ms_));
+      this->output_select_state_ = OutputSelectState::OUTPUT_PENDING;
+      this->output_select_state_enter_ms_ = millis();
+      this->keypress(KEY_OUTPUT);
+    }
+  }
+
   // Output-select ENTER_DELAY: send ENTER after a short pause so the controller's
   // output-fire broadcast clears the bus before our ENTER TX starts.
   if (this->output_select_state_ == OutputSelectState::ENTER_DELAY) {
@@ -953,24 +1105,51 @@ void CrowAlarmPanel::loop() {
   if (this->output_select_state_ != OutputSelectState::IDLE) {
     const uint32_t now_ms = millis();
     if (now_ms - this->output_select_state_enter_ms_ > 1000) {
-      const bool pre_fire = (this->output_select_state_ == OutputSelectState::OUTPUT_PENDING ||
+      const bool pre_fire = (this->output_select_state_ == OutputSelectState::CLEAR_PENDING ||
+                             this->output_select_state_ == OutputSelectState::CLEAR_DELAY ||
+                             this->output_select_state_ == OutputSelectState::OUTPUT_PENDING ||
                              this->output_select_state_ == OutputSelectState::AWAIT_COMMAND ||
                              this->output_select_state_ == OutputSelectState::DIGIT_PENDING);
       if (pre_fire && this->output_select_retry_count_ == 0) {
         ESP_LOGW(TAG, "Output-select: timeout in state %u, retrying (output select)",
                  static_cast<uint8_t>(this->output_select_state_));
         this->output_select_retry_count_++;
-        this->output_select_key_idx_ = 0;
-        this->output_select_state_ = OutputSelectState::OUTPUT_PENDING;
-        this->output_select_state_enter_ms_ = millis();
-        this->keypress(KEY_OUTPUT);
+        this->begin_output_select_attempt_();
       } else {
         ESP_LOGW(TAG, "Output-select: timeout in state %u, aborting",
                  static_cast<uint8_t>(this->output_select_state_));
-        this->output_select_state_ = OutputSelectState::IDLE;
-        this->output_select_keys_.clear();
-        this->output_select_key_idx_ = 0;
-        this->output_select_retry_count_ = 0;
+        this->finish_output_select_(false);
+      }
+    }
+  }
+
+  // Start a set_output() request queued behind another keypress sequence once all three state
+  // machines are idle, or drop it if it waited too long.
+  if (this->output_queue_pending_) {
+    if (millis() - this->output_queue_ms_ > CrowAlarmPanelStore::OUTPUT_SELECT_QUEUE_TIMEOUT_MS) {
+      ESP_LOGW(TAG, "set_output(%u, %s): still blocked by another keypress sequence after %u ms, dropping",
+               this->output_queue_number_, ONOFF(this->output_queue_state_),
+               (unsigned) CrowAlarmPanelStore::OUTPUT_SELECT_QUEUE_TIMEOUT_MS);
+      this->output_queue_pending_ = false;
+      this->output_queue_wait_settle_ = false;
+      this->publish_output_actual_(this->output_queue_number_);
+    } else if (this->arm_disarm_state_ != ArmDisarmState::IDLE ||
+               this->zone_bypass_state_ != ZoneBypassState::IDLE) {
+      this->output_queue_wait_settle_ = true;
+      this->output_queue_idle_seen_ = false;
+    } else if (this->output_select_state_ != OutputSelectState::IDLE) {
+      this->output_queue_idle_seen_ = false;
+    } else {
+      if (!this->output_queue_idle_seen_) {
+        this->output_queue_idle_seen_ = true;
+        this->output_queue_idle_ms_ = millis();
+      }
+      if (!this->output_queue_wait_settle_ ||
+          millis() - this->output_queue_idle_ms_ >= CrowAlarmPanelStore::OUTPUT_SELECT_QUEUE_SETTLE_MS) {
+        this->output_queue_pending_ = false;
+        this->output_queue_wait_settle_ = false;
+        ESP_LOGD(TAG, "Output-select: starting queued request for output %u", this->output_queue_number_);
+        this->start_output_select_(this->output_queue_number_, this->output_queue_state_);
       }
     }
   }
@@ -989,6 +1168,18 @@ void CrowAlarmPanel::loop() {
       this->zone_bypass_keys_.clear();
       this->zone_bypass_key_idx_ = 0;
     }
+  }
+
+  // Arm/disarm CODE_CLEAR_DELAY: type the first code digit a moment after the leading ENTER's
+  // confirmation. Same gating as the KEYPAD_COMMAND-driven transitions.
+  if (this->arm_disarm_state_ == ArmDisarmState::CODE_CLEAR_DELAY && !this->arm_disarm_retry_pending_ &&
+      !this->arm_disarm_key_in_flight_ &&
+      millis() - this->arm_disarm_state_enter_ms_ >= CrowAlarmPanelStore::OUTPUT_SELECT_CLEAR_DELAY_MS) {
+    // State and index set BEFORE the keypress — it can yield and re-enter loop().
+    this->arm_disarm_code_idx_ = 1;
+    this->arm_disarm_state_ = ArmDisarmState::CODE_DIGIT_PENDING;
+    this->arm_disarm_state_enter_ms_ = millis();
+    this->arm_disarm_keypress_(this->arm_disarm_code_digits_[0]);
   }
 
   // Arm/disarm watchdog: abort if any non-IDLE state exceeds 1s without progress. See
@@ -1024,12 +1215,12 @@ void CrowAlarmPanel::loop() {
             break;
           case ArmDisarmState::CODE_DIGIT_PENDING:
           case ArmDisarmState::CODE_ENTER_PENDING:
+          case ArmDisarmState::CODE_CLEAR_PENDING:
+          case ArmDisarmState::CODE_CLEAR_DELAY:
             // Restart the whole code+terminal-key sequence from scratch, exactly like a fresh
             // manual retry (proven reliable across every session in arm_disarm_state_machine.md).
-            this->arm_disarm_code_idx_ = 1;
-            this->arm_disarm_state_ = ArmDisarmState::CODE_DIGIT_PENDING;
-            this->arm_disarm_digit_ack_byte_set_ = false;
-            this->arm_disarm_keypress_(this->arm_disarm_code_digits_[0]);
+            // Re-checks the exit delay, so the leading ENTER is added or dropped as it changes.
+            this->begin_code_attempt_();
             break;
           default:
             break;
@@ -1076,11 +1267,17 @@ void CrowAlarmPanel::loop() {
     // so without this a still-stale ping would re-trip the watchdog on the very next loop()
     // pass and fire a second, usually unnecessary, announce ~1 s later (before the controller
     // has had a chance to respond to the first one) instead of waiting the full 60 s.
-    if (this->registration_sent_ && this->last_ping_ms_ != 0 &&
-        (now_ms - this->last_ping_ms_) >= 60000 &&
-        (now_ms - this->last_registration_announce_ms_) >= 60000) {
-      ESP_LOGW(TAG, "No ping for 60 s, re-sending registration announce");
-      this->registration_sent_ = false;
+    // Never pinged since boot counts as stale too: when the panel and this device power up
+    // together, the first announce can land while the panel is still booting and be lost,
+    // leaving us unpolled indefinitely (observed 2026-10-06, see known_quirks.md).
+    if (this->registration_sent_ && (now_ms - this->last_registration_announce_ms_) >= 60000) {
+      if (this->last_ping_ms_ == 0) {
+        ESP_LOGW(TAG, "Never pinged since announce, re-sending registration announce");
+        this->registration_sent_ = false;
+      } else if ((now_ms - this->last_ping_ms_) >= 60000) {
+        ESP_LOGW(TAG, "No ping for 60 s, re-sending registration announce");
+        this->registration_sent_ = false;
+      }
     }
     if (!this->registration_sent_ && now_ms >= this->registration_after_ms_ && this->is_bus_idle_() &&
         (now_ms - this->last_registration_announce_ms_) >= REGISTRATION_ANNOUNCE_MIN_INTERVAL_MS) {
@@ -1108,15 +1305,30 @@ bool CrowAlarmPanel::start_code_sequence_(const std::string &code, uint8_t termi
   ESP_LOGD(TAG, "Code sequence: %u digits, terminal key 0x%02X",
            this->arm_disarm_code_digits_.size(), terminal_key);
   this->arm_disarm_terminal_key_ = terminal_key;
-  // idx=1 and state set BEFORE keypress — same race-condition prevention as set_output().
+  this->arm_disarm_retry_count_ = 0;
+  this->arm_disarm_retry_pending_ = false;
+  this->begin_code_attempt_();
+  return true;
+}
+
+void CrowAlarmPanel::begin_code_attempt_() {
+  this->arm_disarm_digit_ack_byte_set_ = false;
+  // State (and idx) set BEFORE keypress — same race-condition prevention as set_output().
+  if (this->in_exit_delay_() && this->arm_disarm_terminal_key_ == KEY_ENTER) {
+    // Disarm during the exit delay: leave the arming screen with ENTER ("Back") first, as the
+    // physical keypad does. ENTER here can at worst submit leftover digits of this same
+    // disarm, which is the intended outcome anyway.
+    ESP_LOGD(TAG, "Code sequence: panel in exit delay, sending ENTER first");
+    this->arm_disarm_code_idx_ = 0;
+    this->arm_disarm_state_ = ArmDisarmState::CODE_CLEAR_PENDING;
+    this->arm_disarm_state_enter_ms_ = millis();
+    this->arm_disarm_keypress_(KEY_ENTER);
+    return;
+  }
   this->arm_disarm_code_idx_ = 1;
   this->arm_disarm_state_ = ArmDisarmState::CODE_DIGIT_PENDING;
   this->arm_disarm_state_enter_ms_ = millis();
-  this->arm_disarm_retry_count_ = 0;
-  this->arm_disarm_retry_pending_ = false;
-  this->arm_disarm_digit_ack_byte_set_ = false;
   this->arm_disarm_keypress_(this->arm_disarm_code_digits_[0]);
-  return true;
 }
 
 bool CrowAlarmPanel::arm_away(const std::string &code) {
@@ -1220,11 +1432,16 @@ void CrowAlarmPanel::arm_disarm_keypress_(uint8_t key) {
     return;
   }
   if (gen != this->arm_disarm_generation_) {
-    ESP_LOGD(TAG, "Arm/disarm: sequence resolved during bus-idle wait, suppressing key 0x%02X", key);
+    if (key <= 9) {
+      ESP_LOGD(TAG, "Arm/disarm: sequence resolved during bus-idle wait, suppressing code digit");
+    } else {
+      ESP_LOGD(TAG, "Arm/disarm: sequence resolved during bus-idle wait, suppressing key 0x%02X", key);
+    }
     this->arm_disarm_key_in_flight_ = false;
     return;
   }
-  this->transmit_packet_(KEYPRESS, {key});
+  // Digits sent by this state machine are always code digits; keep them out of the log.
+  this->transmit_packet_(KEYPRESS, {key}, key <= 9);
   // Restart the no-progress window from the actual transmit — the bus-idle wait above may
   // have consumed most (or more) of the 1 s budget before the key even went out, and the
   // watchdog was gated during it.
@@ -1237,36 +1454,107 @@ bool CrowAlarmPanel::set_output(uint8_t output, bool state) {
     ESP_LOGW(TAG, "set_output(%u, %s): passive monitor mode, ignoring", output, state ? "on" : "off");
     return false;
   }
-  if (this->output_select_state_ != OutputSelectState::IDLE) {
-    ESP_LOGW(TAG, "set_output(%u, %s): output-select sequence already in progress", output, state ? "on" : "off");
-    return false;
-  }
   // All three keypress state machines advance on the same KEYPAD_COMMAND frames; running
-  // two at once would double-consume confirmations. arm_disarm_state_ stays non-IDLE for the
-  // whole multi-second retry-backoff envelope, so this window is long enough to matter.
-  if (this->arm_disarm_state_ != ArmDisarmState::IDLE ||
-      this->zone_bypass_state_ != ZoneBypassState::IDLE) {
-    ESP_LOGW(TAG, "set_output(%u, %s): another keypress sequence in progress, ignoring", output,
-             state ? "on" : "off");
-    return false;
+  // two at once would double-consume confirmations. Instead of dropping the request (a gate
+  // pressed during a disarm used to be lost), hold it until they're idle — loop() starts it.
+  // arm_disarm_state_ stays non-IDLE for the whole multi-second retry-backoff envelope.
+  // A request already queued (e.g. still in its settle pause) counts as busy too, so a new
+  // press replaces it instead of starting alongside it and firing the output twice.
+  if (this->output_select_state_ != OutputSelectState::IDLE ||
+      this->arm_disarm_state_ != ArmDisarmState::IDLE ||
+      this->zone_bypass_state_ != ZoneBypassState::IDLE || this->output_queue_pending_) {
+    if (this->output_queue_pending_) {
+      ESP_LOGW(TAG, "set_output(%u, %s): replaces queued set_output(%u, %s)", output, ONOFF(state),
+               this->output_queue_number_, ONOFF(this->output_queue_state_));
+      // The replaced request's switch was published optimistically when it was queued.
+      if (this->output_queue_number_ != output) {
+        this->publish_output_actual_(this->output_queue_number_);
+      }
+    } else {
+      ESP_LOGI(TAG, "set_output(%u, %s): another keypress sequence in progress, queued", output, ONOFF(state));
+      this->output_queue_idle_seen_ = false;
+    }
+    this->output_queue_pending_ = true;
+    this->output_queue_number_ = output;
+    this->output_queue_state_ = state;
+    this->output_queue_ms_ = millis();
+    // Keep a settle pause already owed by the request being replaced.
+    this->output_queue_wait_settle_ = this->output_queue_wait_settle_ ||
+                                      this->arm_disarm_state_ != ArmDisarmState::IDLE ||
+                                      this->zone_bypass_state_ != ZoneBypassState::IDLE;
+    return true;
   }
+  this->start_output_select_(output, state);
+  return true;
+}
+
+void CrowAlarmPanel::start_output_select_(uint8_t output, bool state) {
   // Build digit queue consumed one per KEYPAD_COMMAND received after the ACK.
   this->output_select_keys_.clear();
   if (output >= 10) {
     this->output_select_keys_.push_back(output / 10);
   }
   this->output_select_keys_.push_back(output % 10);
-  this->output_select_key_idx_ = 0;
-
-  ESP_LOGD(TAG, "Output-select: starting sequence for output %u (%s)", output, state ? "on" : "off");
+  this->output_select_number_ = output;
+  this->output_select_initial_bit_ =
+      output >= 1 && output <= 8 && ((this->last_output_bitmap_ >> (output - 1)) & 0x01);
+  this->output_select_landed_ = false;
   this->output_select_retry_count_ = 0;
+  ESP_LOGD(TAG, "Output-select: starting sequence for output %u (%s)", output, state ? "on" : "off");
+  this->begin_output_select_attempt_();
+}
+
+void CrowAlarmPanel::begin_output_select_attempt_() {
+  this->output_select_key_idx_ = 0;
+  this->output_select_saw_bit_clear_ = false;
   // Set state BEFORE the keypress call. send_packet() uses delay()/yield() internally
-  // which re-enters loop(). If the ACK (0x1D) arrives during that yield, loop() must
-  // see OUTPUT_PENDING to correctly transition to AWAIT_COMMAND.
-  this->output_select_state_ = OutputSelectState::OUTPUT_PENDING;
-  this->output_select_state_enter_ms_ = millis();
-  this->keypress(KEY_OUTPUT);
-  return true;
+  // which re-enters loop(). If the reply arrives during that yield, loop() must already
+  // see the state that expects it.
+  if (this->in_exit_delay_()) {
+    // During the exit delay the controller has every keypad on its arming screen and acks
+    // OUTPUT/digit/ENTER without selecting the output. A physical keypad leaves that screen
+    // with ENTER ("Back") first. Only sent in the exit delay: elsewhere ENTER would submit
+    // whatever the controller still has buffered for us (e.g. code digits of an aborted
+    // disarm), which can arm or disarm the panel.
+    ESP_LOGD(TAG, "Output-select: panel in exit delay, sending ENTER first");
+    this->output_select_state_ = OutputSelectState::CLEAR_PENDING;
+    this->output_select_state_enter_ms_ = millis();
+    this->keypress(KEY_ENTER);
+  } else {
+    this->output_select_state_ = OutputSelectState::OUTPUT_PENDING;
+    this->output_select_state_enter_ms_ = millis();
+    this->keypress(KEY_OUTPUT);
+  }
+}
+
+void CrowAlarmPanel::finish_output_select_(bool completed) {
+  const uint8_t output = this->output_select_number_;
+  this->output_select_state_ = OutputSelectState::IDLE;
+  this->output_select_keys_.clear();
+  this->output_select_key_idx_ = 0;
+  this->output_select_retry_count_ = 0;
+  if (output < 1 || output > 8) {
+    // OUTPUT_STATE only covers outputs 1-8, so there's nothing to verify against.
+    ESP_LOGD(TAG, "Output-select: sequence %s for output %u (not verifiable)", completed ? "complete" : "aborted",
+             output);
+    return;
+  }
+  if (this->output_select_landed_) {
+    ESP_LOGD(TAG, "Output-select: sequence %s, output %u switched", completed ? "complete" : "aborted", output);
+    return;
+  }
+  ESP_LOGW(TAG, "Output-select: output %u did not switch (sequence %s, panel never reported the output)", output,
+           completed ? "completed" : "aborted");
+  this->publish_output_actual_(output);
+}
+
+void CrowAlarmPanel::publish_output_actual_(uint8_t output) {
+  const bool on = output >= 1 && output <= 8 && ((this->last_output_bitmap_ >> (output - 1)) & 0x01);
+  for (CrowAlarmPanelOutput &o : this->outputs_) {
+    if (o.number == output) {
+      o.the_switch->publish_state(on);
+    }
+  }
 }
 
 void CrowAlarmPanel::set_zone_bypass(uint8_t zone, bool state) {
@@ -1356,7 +1644,7 @@ bool CrowAlarmPanel::wait_for_bus_idle_() {
   return true;
 }
 
-void CrowAlarmPanel::transmit_packet_(uint8_t type, const std::vector<uint8_t> &data) {
+void CrowAlarmPanel::transmit_packet_(uint8_t type, const std::vector<uint8_t> &data, bool mask_payload) {
   std::vector<uint8_t> packet;
   packet.push_back(BOUNDARY);
   packet.push_back(type);
@@ -1364,9 +1652,32 @@ void CrowAlarmPanel::transmit_packet_(uint8_t type, const std::vector<uint8_t> &
   packet.insert(packet.end(), data.begin(), data.end());
   packet.push_back(BOUNDARY);
 
-  ESP_LOGD(TAG, "Sending packet: [%s]", format_hex_pretty(packet).c_str());
+  if (mask_payload) {
+    std::string masked = format_hex_pretty(std::vector<uint8_t>(packet.begin(), packet.begin() + 3), '.', false);
+    for (size_t i = 0; i < data.size(); i++) {
+      masked += ".**";
+    }
+    ESP_LOGD(TAG, "Sending packet: [%s.%02X (%u)]", masked.c_str(), BOUNDARY, (unsigned) packet.size());
+  } else {
+    ESP_LOGD(TAG, "Sending packet: [%s]", format_hex_pretty(packet).c_str());
+  }
   this->send_packet_blocking_(packet);
   ESP_LOGD(TAG, "Packet sent");
+}
+
+bool CrowAlarmPanel::keypress_is_masked_(const std::vector<uint8_t> &data) const {
+  if (data.size() < 2 || data[1] > 9) {
+    return false;
+  }
+  const uint8_t context = this->keypad_last_command_key_[data[0] & 0x7F];
+  if (context != KEY_OUTPUT && context != KEY_BYPASS) {
+    return true;
+  }
+  return millis() - this->keypad_last_command_ms_[data[0] & 0x7F] > KEYPAD_SELECTION_WINDOW_MS;
+}
+
+bool CrowAlarmPanel::in_exit_delay_() const {
+  return this->panel_arming_ && millis() - this->panel_arming_since_ms_ < PANEL_ARMING_MAX_MS;
 }
 
 bool CrowAlarmPanel::is_bus_idle_() {

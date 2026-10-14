@@ -74,8 +74,19 @@ IDLE
 │  └─> ARM_AWAY_PENDING / ARM_STAY_PENDING (single keypress sent)
 ├─ on arm_away(code) / arm_stay(code) with non-empty code
 │  └─> CODE_DIGIT_PENDING (first digit sent immediately)
-├─ on disarm(code)
+├─ on disarm(code), panel in exit delay (last ARMED_STATE = Arming, under 5 min ago)
+│  └─> CODE_CLEAR_PENDING (KEY_ENTER sent — "Back" from the arming screen)
+├─ on disarm(code), otherwise
 │  └─> CODE_DIGIT_PENDING (first digit sent immediately)
+
+CODE_CLEAR_PENDING (disarm in exit delay; leading ENTER sent, waiting for Command)
+├─ on Command(0x14) addressed to us, byte[1] not 0x89/0xAA (exit-delay screen updates)
+│  └─> CODE_CLEAR_DELAY
+├─ on timeout (>1s)
+│  └─> retry with growing backoff (whole attempt restarts, leading ENTER re-decided)
+
+CODE_CLEAR_DELAY (OUTPUT_SELECT_CLEAR_DELAY_MS = 100 ms)
+└─> first code digit sent → CODE_DIGIT_PENDING
 
 ARM_AWAY_PENDING / ARM_STAY_PENDING (KEY_ARM or KEY_STAY sent, waiting for Command)
 ├─ on Command(0x14) addressed to us
@@ -119,7 +130,9 @@ entity state is always published from them regardless of the state machine.]
 |---|---|---|
 | `arm_away()` | KEY_ARM → ARM_AWAY_PENDING | CODE_DIGIT_PENDING → … → CODE_ENTER_PENDING (terminal: KEY_ARM) |
 | `arm_stay()` | KEY_STAY → ARM_STAY_PENDING | CODE_DIGIT_PENDING → … → CODE_ENTER_PENDING (terminal: KEY_STAY) |
-| `disarm(code)` | not supported — code always required | CODE_DIGIT_PENDING → … → CODE_ENTER_PENDING (terminal: KEY_ENTER) |
+| `disarm(code)` | not supported — code always required | [exit delay only: CODE_CLEAR_PENDING → CODE_CLEAR_DELAY →] CODE_DIGIT_PENDING → … → CODE_ENTER_PENDING (terminal: KEY_ENTER) |
+
+**Disarm during the exit delay (2026-10-14):** typed straight onto the arming screen, the code digits were each confirmed (CMD 0x01), but the terminal ENTER got CMD 0x07 and no disarm. That happened in the first attempt and 3 retries, until the delay ran out. It is the same arming-screen behaviour that blocks output selection (`protocol_investigations.md`, "Outputs during the exit delay"). The leading ENTER + 100 ms pause mirrors the fix that made output selection work there. A codeless cancel (the physical keypad's ENTER + ARM) was not used: if that ARM lands after the exit delay ended or after another disarm, it arms the panel, whereas a code sequence is resolved only by an intent-matched Disarmed broadcast. The CLEAR states count as a disarm request for that intent matching, so an "Arming" re-broadcast can't complete them. State numbers in log lines: `CODE_CLEAR_PENDING`=5, `CODE_CLEAR_DELAY`=6 (appended after `CODE_ENTER_PENDING`=4).
 
 ### Code validation
 

@@ -71,8 +71,16 @@ Frames use HDLC-like `0x7E` boundary markers:
   The closing boundary byte is included in the saved buffer (last byte of `buffer2`)
   but stripped before dispatch: `data = buffer2[1 .. data_length-2]`.
 - Frames shorter than 2 bytes are discarded as noise.
-- `0x7E` is never legitimately present inside a frame payload. No byte-stuffing
-  mechanism has been observed.
+- `0x7E` never appears on the wire inside a frame because the transmitter **bit-stuffs**
+  (HDLC-style zero insertion): after five consecutive `1` bits in the LSB-first stream,
+  counted across byte boundaries, one extra `0` bit is sent. Confirmed 2026-10-01 for
+  `0x54` and `0x7C` frames (see `protocol_investigations.md`, "Bit-stuffing on the wire").
+  There is no *byte*-stuffing (`0x7D` escapes).
+- **The receiver does not currently remove stuffed bits.** Any frame whose true content
+  contains a five-`1` run is mis-sliced from that point on: the byte containing the end of
+  the run and every later byte are shifted up by one bit per stuffing event (later bytes
+  read as `×2`, `×4`, … with the previous byte's top bits carried in). Raw hex in log lines
+  and in the tables below is *as received*, i.e. still stuffed, unless stated otherwise.
 
 **Parser output convention** used in log messages: `[type.data[0].data[1]... (N)]`
 where `N = data.size()` (payload bytes, excluding type and closing boundary).
@@ -89,10 +97,10 @@ where `N = data.size()` (payload bytes, excluding type and closing boundary).
 
 | Offset | Size | Name | Description | Confidence |
 |---|---|---|---|---|
-| 0 | 1 | `keypad_addr` | Target keypad address | High |
-| 1 | 1 | `UNKNOWN_01` | Observed: `0x00`, `0x01` | Low |
+| 0 | 1 | `keypad_addr` | Target keypad address. Bit 7 (`0x80`) is set while a system fault is current — see "Fault bits" below; the parser masks it off before the keypad lookup | High (address); medium (bit 7) |
+| 1 | 1 | `supply_fault` | `0x00` normally; bit 1 (`0x02`) while mains power is lost (manual fault `AC`), bit 0 (`0x01`) while the backup battery is low or missing (manual fault `BATT`) — see "Power-supply fault bits" below | Medium |
 | 2 | 1 | `flags` | System status flags (see below) | High |
-| 3 | 1 | `UNKNOWN_02` | Always `0x00` | Low |
+| 3 | 1 | `UNKNOWN_02` | `0x00`, or `0x04` while a fault is latched and not yet acknowledged — see "Fault bits" below | Medium (`0x04`) |
 | 4 | 1 | `UNKNOWN_03` | Always `0x00` | Low |
 
 **`flags` byte values:**
@@ -101,13 +109,40 @@ where `N = data.size()` (payload bytes, excluding type and closing boundary).
 |---|---|
 | `0x80` | Zone activity — one or more zones active/transitioning |
 | `0xC1` | Zones clear — system idle, all zones secure |
-| `0x82` | Zone activity variant (bit 1 meaning unknown) |
-| `0xC3` | Zones-clear variant (bit 1 meaning unknown) |
+| `0x82` / `0xC3` | `0x80` / `0xC1` with bit 1 (`0x02`) set: a power-supply fault is current (see "Power-supply fault bits" below) |
+| `0x84` / `0xC5` | `0x80` / `0xC1` with bit 2 (`0x04`) set: a system fault is current (see below) |
+
+**Fault bits (2026-10-03, two episodes — `protocol_investigations.md`, "RF-interference fault"):**
+three bits change together when the panel raises a fault, and they clear in two separate steps:
+
+| Bit | Set | Cleared | Reading |
+|---|---|---|---|
+| data[0] bit 7 (`0x80`) + flags bit 2 (`0x04`) | at fault onset | when the fault restores: on the first RF remote frame (`0x7C`) received afterwards, in both episodes | fault **current** |
+| data[3] = `0x04` | at fault onset | when acknowledged: MEMORY + ENTER on a keypad (10-02), or arming (09-25); stays set after the fault restores | fault **latched / not yet viewed** — the keypad's red TROUBLE light |
+
+The one fault seen so far is the panel's RF-interference alarm (`RFIA`/`RFIR` in the manual's event list), identified from what the user saw on the AAP keypad display plus the clear-on-RF-reception behaviour. Mains and battery faults use different bits (see "Power-supply fault bits" below); whether other fault types (keypad missing, …) use these bits is not known yet. Exposed as the `binary_sensor` types `trouble` (data[0] bit 7 or flags bit 2) and `trouble_latched` (data[3] bit 2); `trouble` publishes from a single frame when data[0] bit 7 and flags bit 2 agree (they agreed in every archived frame: 231 both set, none mixed), and a frame where they disagree is logged and dropped. `trouble_latched` publishes only after two consecutive status frames agree on data[3] bit 2 (a single bit, and data[3] has glitched to `0x10` twice). Until 2026-10-14 both used the two-frame rule, which could miss a short fault entirely because status frames are sent only on change.
+
+**Power-supply fault bits (2026-10-14, one controlled test — `protocol_investigations.md`, "Mains and battery faults"):**
+data[1] says which supply fault is current, and `flags` bit 1 (`0x02`) is set alongside it:
+
+| data[1] | `flags` | Reading | Seen |
+|---|---|---|---|
+| `0x02` | `0xC3` / `0x82` | `AC` — AC Failure: no mains power at the panel | user-simulated power failure, 2026-10-14 10:32:02–10:32:33 NZDT; one single frame 2026-10-06 |
+| `0x01` | `0xC3` / `0x82` | `BATT` — Battery Low: backup battery low or missing | user-simulated battery failure, 2026-10-14 10:33:46–10:34:16 NZDT; battery swap (each battery disconnected in turn), 2026-10-14 11:06:10–11:06:35 and 11:07:00–11:07:20 NZDT; one single frame 2026-09-15 |
+
+The fault names are the manual's current-fault codes (ESL-2 Install & Program Manual, "Current Faults & History", the list shown under MEM on the keypad). That list has a single battery entry covering both a low and a missing battery, with event-log pair `BATA`/`BATR` "Panel Low Battery (Restore)", so a draining battery is expected to set the same bit as the simulated failure. Only the simulated (disconnected) case has been observed. Both clear when the fault restores. Unlike the RF-interference fault, neither sets the latch byte (data[3]) or data[0] bit 7, at least for a ~30s fault, and the physical keypad showed each fault only while it was current, matching the bits. Across 59,343 archived status frames (2026-09-14 → 2026-10-14), flags bit 1 is set in exactly the frames where data[1] is non-zero. Not yet seen: both faults at once (assumed to be `0x03`), a long-lasting fault, and whether a real outage looks the same as the simulated one.
+
+The controller sends `CONTROLLER_STATUS` only on change. A fault with no zone activity during it can therefore arrive as a single frame, followed minutes later by the clearing frame. Exposed as the `binary_sensor` types `mains_fault` and `battery_fault`. Because there may be no second frame, these publish from a single frame when data[1] and flags bit 1 agree, and a frame where they disagree is logged and dropped. They don't use the two-frame debounce of the `trouble` sensors.
 
 **Examples:**
 ```
 10 00 00 C1 00 00   → [AAP Keypad] zones_clear
 10 00 00 80 00 00   → [AAP Keypad] zone_active_or_transition
+10 80 00 C5 04 00   → zones_clear, fault current, fault latched (RF interference, 2026-10-02)
+10 80 00 C5 00 00   → zones_clear, fault current, already acknowledged
+10 00 00 80 04 00   → zone activity, fault restored but not yet acknowledged (2026-09-25)
+10 00 02 C3 00 00   → zones_clear, mains fault (2026-10-14 test)
+10 00 01 82 00 00   → zone activity, battery low/missing (2026-10-14 test)
 ```
 
 ---
@@ -418,8 +453,12 @@ minute = minutes_since_midnight % 60
 ```
 
 **Garbage time values** (seconds ≥ 60, day = 0 or > 31, month = 0 or > 12)
-occur regularly and are not (only) an unset-RTC symptom. One confirmed cause,
-reproduced across multiple sessions: a single spurious bit gets clocked into
+occur regularly and are not (only) an unset-RTC symptom. **Root cause (2026-10-01):
+un-removed bit-stuffing — see "Frame Format" above; a time whose fields contain five
+consecutive `1` bits is transmitted with an inserted `0` that the receiver keeps.** The
+description below predates that finding and describes the most common case (the run
+completing inside `seconds = 0x0F` when `minutes_lo` has bit 7 set). The pattern as
+originally characterized: a single spurious bit gets clocked into
 the bitstream right after the `seconds` byte, shifting every following byte's
 alignment by one position for the rest of the frame — for `day`/`month`/`year`
 (none of which ever set bit 7) this is bit-for-bit indistinguishable from each
@@ -433,8 +472,12 @@ recovered date's weekday against the frame's own untouched weekday byte before t
 it) and discards the frame outright if that cross-check fails. Any other corruption not
 matching this exact recovered-and-verified pattern is discarded, not guessed at.
 
-A related but distinct variant exists: `day`/`month` corrupted by a `×4` (not `×2`)
-multiplier. Confirmed (2026-09-10) as `real_value × 4`, not arbitrary garbage — see
+A related variant exists: `day`/`month` corrupted by a `×4` (not `×2`) multiplier —
+two stuffing events in one frame (e.g. `minutes_lo = 0xBE` followed by `seconds = 0x0F`),
+recurring every 256 minutes. Other members of the same family: `minutes_lo = 0x7E`/`0x7F`
+is received as `0xBE`/`0xDF` (the daily `invalid minutes-since-midnight` at local
+23:26–23:27, where `0x57E` reads as 1470), and `day = 31` (`0x1F`) doubles `month`/`year`
+in every broadcast that day. Confirmed (2026-09-10) as `real_value × 4`, not arbitrary garbage — see
 `protocol_investigations.md`'s 2026-09-10 update for the live midnight-crossing capture
 that pins this down. Every occurrence observed so far has had `real_month ≥ 7`
 (September in the confirming capture), where the single-halving recovery above computes
@@ -454,12 +497,26 @@ recovery logic's guarantees, not a confirmed live bug.
 
 ---
 
+### 0x70 — unlabeled, seen only at RF-interference fault onset
+
+*Direction:* unknown (no ACK seen)  
+*Trigger:* observed exactly twice in 30+ days of capture, both times ~3s after the `CONTROLLER_STATUS` fault bits went up for an RF-interference fault (2026-09-25 16:22:23 UTC and 2026-10-02 14:42:23 UTC)  
+*Confidence:* low — two samples, meaning inferred from timing only
+
+```
+70 6E 5A 02   (identical both times; no run of five 1-bits, so no bit-stuffing to undo)
+```
+
+**Inference (low confidence):** the type sits next to `0x7C` (the RF receiver's button report), and it appears only when the panel decides the radio receiver is being interfered with, so it may be the RF receiver reporting jamming/interference to the controller. Two identical payloads argue against it being a random corruption of another frame. Not decoded; the parser logs it as `Unknown [70.6E.5A.02]`.
+
+---
+
 ### 0x7C — RF remote button-press event
 
 *Direction:* RF receiver card → Controller (confirmed by the causality analysis below; not a keypad address — see the manual cross-reference below for why `data[0..2]` never matches the keypad-address convention)  
 *Trigger:* A button press on one of the official RF remotes — never observed for any physical-keypad or integration-initiated command  
 *Min length:* 5 payload bytes (`data[0..2]` identity + `data[3..4]` button code — all the parser decodes; 8 bytes seen in practice in every capture)  
-*Confidence:* Confirmed on the RF-remote attribution and on which button was pressed (vendor manual, cross-checked below against four independent trace-derived signals per button); low on the exact byte-level encoding mechanism
+*Confidence:* Confirmed on the RF-remote attribution and on which button was pressed (vendor manual, cross-checked below against four independent trace-derived signals per button); medium-high on the byte layout once bit-stuffing is removed (see "Un-stuffed layout" below)
 
 **Manual cross-reference (`ESL-2 Install & Program Manual (E.V).pdf`, pages 17–19, 48–54):** the panel's RF path is a separate plug-in receiver card, the RX-16 MF349, connected via the "ARRI4" cable — the manual notes explicitly that if this cable is unavailable, "you can wire the receiver the same as a keypad," i.e. the receiver rides the same physical clock/data bus as keypads and presumably reuses the same frame format, which is why `0x7C` shows up as a normal-looking frame despite not coming from a keypad. Remotes are enrolled as **Radio Users** in User slots 21–100 — a completely different addressing space from keypad bus addresses — which is *why* `data[0..2]` never matches the keypad-address convention: it isn't a malformed/omitted keypad address, radio users are categorically not keypads. Each physical 4-button pendant is manual-documented as up to **five separate learned radio-user identities**, one per function class, each with its own program-address block and independent "press the button you wish to learn in" enrollment step: Arm-only (`P18E40E`–`P18E49E` for pendants 0–9), Disarm-only (`P18E50E`–`P18E59E`), **Door 2 Control, linked to Output 3** (`P18E60E`–`P18E69E`), **Door 1 Control, linked to Output 4** (`P18E70E`–`P18E79E`), and Panic (`P18E80E`–`P18E89E`). This structurally explains why `data[3..4]` differs per button even on the *same* physical remote (observed below): each button isn't a sub-code of one remote identity, it's independently enrolled as its own radio user. It also independently confirms the output mapping found by trace: "Door 1" (garage, Output 4) and "Door 2" (Output 3 — wired to the user's gate in this installation, but generically named "Door 2" by the panel) match our button 4/button 3 findings exactly. The manual doesn't document `0x7C`'s on-wire byte layout (it's user/installer-facing, not a protocol reference) — the retransmit-pattern and checksum-byte details below remain trace-only.
 
@@ -490,7 +547,38 @@ recovery logic's guarantees, not a confirmed live bug.
 04:18:53  7c 42 00 C4 C4 3E 47 BC EE   remote B, garage, press 1
 ```
 
-**Byte-level pattern (observed, semantics not established):**
+**Un-stuffed layout (2026-10-01 — supersedes the as-received byte analysis below):** the
+type byte `0x7C` itself contains a five-`1` run, so every `0x7C` payload ever logged is
+shifted by one bit from its first byte, and by one or two more further along. Removing the
+stuffed bits from the 12 sample frames above gives:
+
+```
+7C 48 00 1B 5E FB 11 B7   remote A, arm            7C 21 00 62 7E FB 11 77   remote B, arm
+7C 48 00 1B 5E FB 12 B6   remote A, arm, retx
+7C 48 00 1B 60 FD 11 B3   remote A, disarm         7C 21 00 62 80 FD 11 73   remote B, disarm
+7C 48 00 1B 60 FD 12 B2   remote A, disarm, retx
+7C 48 00 1B 5A F7 11 BF   remote A, gate           7C 21 00 62 7A F7 11 7F   remote B, gate
+7C 48 00 1B 5A F7 12 BE   remote A, gate, retx
+7C 48 00 1B 42 DF 11 EF   remote A, garage         7C 21 00 62 62 DF 11 AF   remote B, garage
+7C 48 00 1B 42 DF 12 EE   remote A, garage, retx
+```
+
+| Offset (un-stuffed) | Observed | Reading | Confidence |
+|---|---|---|---|
+| 0–2 | `48 00 1B` (A), `21 00 62` (B) | Per-remote identity | High (constant per remote) |
+| 3 | `(data[0] + data[1] + data[2] + data[4]) mod 256` in 12/12 | Derived byte; purpose unknown | Observed relation, meaning not established |
+| 4 | arm `FB`, disarm `FD`, gate `F7`, garage `DF` — **same on both remotes** | Button code, one bit cleared per button (`~0x04`, `~0x02`, `~0x08`, `~0x20`) | High |
+| 5 | `11` on first send, `12` on retransmit, for all four buttons | Transmission counter | Medium (2 values seen) |
+| 6 | makes type + data[0..6] sum to `0x00` mod 256 in 12/12 | Checksum | High |
+| 7 | only 5–6 bits survive in the as-received log | Unknown | — |
+
+So the as-received quirks described below — per-remote button codes, `+4`/`-4` retransmit
+steps, gate's "different" retransmit encoding — are all artifacts of where stuffed bits
+happened to fall, not properties of the remotes. A decoder working on un-stuffed bytes
+would identify the button from data[4] alone for any enrolled remote, without a per-remote
+code table.
+
+**Byte-level pattern as received (historical; see the un-stuffed layout above):**
 
 - data[0..2] — fixed per-remote identity, see above.
 - data[3..4] — per-remote-per-button code (see table above). Not a shared code across remotes and not obviously derived from the remote's identity tuple by any simple transform (XOR, bit-reverse, or addition tried, none match) — consistent with a hardware encoder chip whose per-button output happens to differ between physical units, not a documented protocol field.
@@ -584,7 +672,6 @@ A1 00 0D   → [AAP Keypad] ARM
 
 | Field | Location | Observed range | Notes |
 |---|---|---|---|
-| `CONTROLLER_STATUS.UNKNOWN_01` | 0x10 data[1] | `0x00`, `0x01` | Correlated with zone/armed state? |
 | `KEYPAD_COMMAND.UNKNOWN_02` | 0x14 data[5] | `0x80` (usual), `0x40` (rare) | Possible parity or flag byte |
 | `KEYPAD_STATE.UNKNOWN_03` | 0x15 data[4] | Always `0x03` | Possibly keypad model/version; field name may be misleading now direction is confirmed controller→keypad |
 | `KEYPAD_PING` Variant B payload | 0x23 data[1..7] | `03 44 81 00 80 11 07` | Seen with invalid RTC; possible capability flags |

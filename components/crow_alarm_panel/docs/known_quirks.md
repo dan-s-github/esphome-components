@@ -62,8 +62,13 @@ above look similar but corruption proximity was specifically tested as a cause t
 ruled out by counter-examples — this output-select mechanism is confirmed, arm/disarm's
 isn't.)
 
-**What to do:** nothing — the output still ends up in the correct state. Only worth
-reporting if an output-select sequence ever fails outright rather than retrying through.
+**What to do:** usually nothing. One case on 2026-10-14 did fail outright: the panel
+missed a digit confirmation, the retry went through the "recovering" path, and the garage
+door never switched although the log said `sequence complete`. Newer firmware checks that
+the panel actually reported the output switching. If it didn't, you'll see
+`Output-select: output N did not switch …` and the switch returns to its real state; press it
+again. The component doesn't re-send by itself, because a re-send that crosses a lost
+confirmation could pulse the output twice.
 
 ---
 
@@ -94,15 +99,48 @@ capture windows — roughly 0.05–0.9/h in most windows, with some full 21–27
 zero — followed immediately by the integration re-registering itself on the bus. No
 functional interruption — entities keep working normally.
 
-**Cause:** established with no exceptions across many observed instances — this fires
-exactly when an `Unknown [ff.]`/`[fe.]` corruption burst (see above) happens to land in
-this integration's own poll slot, so the controller's periodic "ping" is missed for one
-cycle. The component's watchdog notices and re-announces, recovering automatically.
+**Cause:** in almost every observed instance, this fires exactly when an
+`Unknown [ff.]`/`[fe.]` corruption burst (see above) happens to land in this integration's
+own poll slot, so the controller's periodic "ping" is missed for one cycle. The
+component's watchdog notices and re-announces, recovering automatically. The panel also
+pauses polling for ~15–20s when it raises a fault, which trips the watchdog in the same
+way — see "Keypad TROUBLE light / RF interference warning" below. (The 2026-09-25
+instance once listed here as unexplained turned out to be one of these.)
+
+Since mid-September 2026 most of these bursts line up with another device on the bus —
+the keypad at address `0x07` re-announcing itself every 5 minutes — rather than random
+noise; about 1 in 20 of its announces disturbs the bus enough to trigger this. See
+`protocol_investigations.md`, "Keypad registration-announce patterns" (2026-10-01).
 
 **What to do:** nothing — this is the existing watchdog recovering exactly as designed.
 The observed baseline has varied between capture windows, including at least one full
 ~21-27h window with zero trips, so treat "roughly hourly" as a loose upper bound rather
 than a stable rate; a sustained rate well above that would still be worth a fresh look.
+
+---
+
+## "Never pinged since announce, re-sending registration announce" warning after a power cut
+
+**What you'll see:** right after the alarm panel and this device power up together (power
+cut, or the panel being powered down for maintenance), one or more of these `WARN` lines
+about a minute apart, then normal polling resumes.
+
+**Cause:** the integration announces itself 15 s after boot. If the panel is still starting up
+at that point, it can miss the announce and never poll this device. Observed 2026-10-06, when
+the panel was powered down to remove the `0x07` IP module. Before this fix the watchdog only
+re-announced after it had been polled at least once, so the device sat unpolled until it was
+rebooted by hand. During that time arm/disarm from Home Assistant would not work.
+
+Separately, after both observed panel power-ups (2026-09-15 and 2026-10-06), the controller
+also polled an unconfigured address `0x02` for about 5 minutes. Something hardware-ACKed it
+during that time. Then 10 rapid unanswered pings ran and `0x02` was dropped. The device behind
+`0x02` is not identified. It can't be this integration, which only ACKs its own `address:`.
+On 2026-09-15 `0x02` was polled alongside `0x05`. Also on 2026-09-15, the Control4 keypad at
+`0x06` went missing from polling until the 2026-10-06 power-up.
+
+**What to do:** nothing — the watchdog now re-announces every 60 s until the controller
+starts polling. If it keeps repeating for minutes on end, check that the configured `address:`
+is free and that the panel has fully started up.
 
 ---
 
@@ -114,12 +152,14 @@ than a stable rate; a sustained rate well above that would still be worth a fres
 just one field). Not visible anywhere in Home Assistant — the panel's `CURRENT_TIME`
 broadcast isn't exposed as an entity.
 
-**Cause:** a well-characterized bus-level bit glitch on the `CURRENT_TIME` (`0x54`)
-broadcast (a spurious extra bit shifts later fields by one position, indistinguishable
-from those fields being doubled). Several specific corrupted values recur consistently
-rather than varying randomly, and the minutes-since-midnight variant has recurred at the
-same ~2-minute wall-clock window on multiple consecutive days — see the dated
-`CURRENT_TIME` sections of `protocol_investigations.md` for the full byte-level analysis.
+**Cause:** the bus bit-stuffs (the panel inserts a `0` after five consecutive `1` bits so
+the `0x7E` frame marker stays unique) and this component does not yet remove the inserted
+bit. Whenever the current time happens to contain such a run, the fields after it are
+shifted and read as doubled (or quadrupled). That is why the same values recur on a fixed
+schedule rather than randomly: once a minute during half of every ~4¼-hour cycle, at
+23:26–23:27 panel-local time every night (the `invalid minutes-since-midnight` WARN, values
+1470 and 1503), and all day on the 31st of a month. See `protocol_investigations.md`,
+"Bit-stuffing on the wire" (2026-10-01).
 
 **What to do:** nothing — for day/month/year the component tries to recover the known
 doubled-bit glitch first (cross-checked against the frame's own weekday field before
@@ -143,6 +183,101 @@ characterize further.
 
 **What to do:** nothing — the component correctly discards the malformed frame rather
 than acting on partial data.
+
+---
+
+## Occasional `crow_alarm_panel took a long time for an operation` warning
+
+**What you'll see:** rarely, a `WARN` line like `crow_alarm_panel took a long time for an
+operation (91 ms), max is 50 ms`. This is ESPHome core's own loop-timing watchdog (not
+specific to this integration in general — it names whichever component's `loop()` call ran
+over the scheduler's threshold), so it will show up under this component's name whenever
+`crow_alarm_panel`'s `loop()` happens to be the one running long.
+
+**Cause:** first observed 2026-09-17 (2 instances so far). Both coincided with several
+separate message-processing paths landing in the same `loop()` tick — once right after a
+post-OTA boot (setup, registration announce, and a disarm-state broadcast all at once), once
+mid an `Output-select` sequence (an ACK, a `KEYPAD_COMMAND`, and a digit-send all at once).
+Neither instance coincided with `ff.`/`fe.` bus corruption or a watchdog re-announce. Too
+rare so far to characterize further — see the 2026-09-20 entry in `protocol_investigations.md`.
+
+**What to do:** nothing observed so far — both instances were followed by the in-flight
+operation completing normally a moment later. Worth a fresh look if this becomes frequent,
+or is ever seen alongside an operation that actually fails rather than just running long.
+
+---
+
+## Keypad TROUBLE light / RF interference warning
+
+**What you'll see:** the physical keypad's TROUBLE indicator comes on, and the fault list
+(MEM key) shows the panel's RF interference alarm. In the ESPHome log, around the moment it
+starts: status lines ending `trouble:current,latched [10.80.00.C5.04.00]` instead of
+the usual `trouble:none [10.00.00.C1.00.00]`, one
+`Unknown [70.6E.5A.02]` line, all keypads re-registering, and usually a
+"No ping for 60 s" warning about a minute later. Seen twice so far (2026-09-25 and
+2026-10-02), both in the early hours.
+
+**Cause:** the panel's own radio-receiver supervision decided its receiver was being
+interfered with (manual event `RFIA`). While the fault is current the controller sets
+extra bits in its status broadcast, which the optional `trouble` /
+`trouble_latched` binary sensors expose (older firmware logged these frames as a
+phantom "Keypad 0x80"). The fault restores by itself the next time the
+receiver hears an RF remote; the TROUBLE light stays on until someone views the fault on a
+keypad or arms the system. What causes the interference isn't known (see
+`protocol_investigations.md`, "RF-interference fault (2026-10-03)").
+
+**What to do:** nothing required — press an RF remote button (or wait for the next use) and
+view/clear the fault on the keypad. Alarm state and entities are unaffected. If it starts
+happening often, check for a new radio source near the panel.
+
+---
+
+## Gate / garage pressed during an arm or disarm
+
+**What you'll see (older firmware):**
+- **During an arm:** pressing an output switch (gate, garage) during the exit delay
+  appeared to work. The switch flicked on and back off, but nothing happened.
+- **During a disarm:** a press while the disarm code was still being entered was rejected
+  with `set_output(N, on): another keypress sequence in progress, ignoring`.
+
+**Cause:**
+- **Exit delay:** the panel puts every keypad on its arming screen. From there it accepts
+  the output keys but doesn't act on them until the keypad presses "Back" (ENTER), which is
+  what you do on the touch keypad before pressing the gate button. RF remotes aren't
+  affected.
+- **Disarm:** only one key sequence can be typed at a time.
+
+See `protocol_investigations.md`, "Outputs during the exit delay (2026-10-14)".
+
+**What to do:** nothing with newer firmware.
+- **Exit delay:** the component presses "Back" first.
+- **Disarm:** a press during an arm/disarm is queued and runs 1.5 s after that finishes
+  (dropped if it's still waiting after 10 s).
+
+Disarming from Home Assistant during the exit delay hit the same arming screen. The code
+was accepted key by key, but the disarm only went through after the delay ended, ~28 s and 5
+retries later (2026-10-14). Newer firmware presses "Back" before typing the code there too.
+
+---
+
+## Mains / battery fault sensors
+
+**What you'll see:** during a power cut, or while the panel's backup battery is low or missing, the optional
+`mains_fault` / `battery_fault` binary sensors turn on, and the status log lines show
+`supply:mains_fault` or `supply:battery_fault` instead of `supply:ok`. The `trouble`
+sensors stay off, because these faults use different bits from the RF interference
+alarm below. If the turn-off arrives a few minutes after the power is back, that's
+normal: the panel only sends its status broadcast when something changes.
+
+**Cause:** the panel reports the fault type in its status broadcast. These are the same conditions the keypad lists under MEM as `AC` and `BATT`. The panel has one battery fault for both low and missing. The decoding has
+been checked against one simulated mains failure and one simulated battery failure
+(2026-10-14, `protocol_investigations.md`, "Mains and battery faults"). A real outage
+hasn't been captured yet.
+
+**What to do:** nothing beyond whatever you'd normally do about a power cut. A rare
+`supply-fault bits disagree ... ignoring` warning means a status frame arrived
+garbled. It's dropped and the next frame corrects it. Please report it if it shows up
+often.
 
 ---
 

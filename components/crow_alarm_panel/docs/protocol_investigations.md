@@ -208,6 +208,8 @@ Notes:
 
 ## `CURRENT_TIME` (0x54) periodic bit-corruption glitch
 
+> **Root-caused 2026-10-01:** the "spurious bit" is HDLC-style bit-stuffing that the receiver does not remove — see "Bit-stuffing on the wire" at the end of this file. The panel-side-defect / bus-contention inferences in the dated entries below are superseded; the observations themselves stand.
+
 Source trace: `../../../traces/esphome-aap-alarm-interface-logs-8.txt` (`ESP_LOGV` enabled, so raw frame bytes are visible).
 
 This resolves open question 5 in `protocol_trace_2026-04-12_time_setting.md` ("Are the malformed `0x54` time frames emitted by the panel itself, or are they a decoding artifact...").
@@ -506,6 +508,8 @@ This does not currently appear to cause the `CODE_ENTER_PENDING` arm/disarm fail
 **Practical takeaway:** no code change. Next log-mining check should start from **2026-09-14 07:26 UTC**. Standing checklist: poll-slot/watchdog exceptions (still 15+/15+, zero exceptions on record), the October month-value flip (due on/after 2026-10-01, see the `×4`-multiplier entry below), any new arm/disarm retry (see `arm_disarm_state_machine.md`'s 2026-09-14 update — this window's retry had zero corruption/watchdog activity anywhere in the surrounding 27h, a clean data point against the corruption-proximity lead), and whether the `ff.`/`fe.` rate returns to baseline or this dip persists.
 
 ## `Unknown [91.]` — new unlabeled packet type
+
+> **Resolved 2026-10-01:** not a packet type — a `KEYPAD_PING` received one bit short. See "Single dropped bit at frame start" at the end of this file. The entries below are kept as the investigation record.
 
 **Source:** `traces/esphome-aap-alarm-interface-logs-34.txt`, a ~1h47m standard-debug-level session with four keypads live (`AAP`, `ESPHome`, `Control 4`, `IP`), otherwise unremarkable (normal disarmed-state zone activity, the already-documented `CURRENT_TIME` glitch, one controller reset with the usual re-registration signature).
 
@@ -907,3 +911,371 @@ Checked the same field across the integration-initiated cycle (`arm_away()` 03:4
 **Practical takeaway:** no code change — this doesn't change how the fault is handled (already correctly discarded, not user-facing). Worth checking directly if the user has installer access to the panel: read `P175E4E` (Test Call Start Time) and see whether it's set anywhere near `23:25`–`23:28` local. If confirmed, this closes the "why does it happen at this specific time" thread outright; if the configured time doesn't match, this hypothesis is disproven and the trigger remains genuinely unknown. Either outcome is useful — record it next time the panel's installer-mode settings are checked for any reason.
 
 **Follow-up (2026-09-10, same day): hypothesis disproven, and doubly so.** User checked `P175E4E` directly on the physical LCD keypad — the panel's configured Test Call Start Time is `02:00` (NZST), not anywhere near `23:25`–`23:28`. On top of that, the user believes the dialler itself (`P175E1E` Option 1, "Dialler is Enabled") is not active at all — no monitoring service/phone line in use on this installation — so even the `02:00` value is a vestigial default that never actually fires a call. This rules out the Automatic Test Call as the trigger for the daily `invalid minutes-since-midnight` episode on two independent grounds (wrong time, *and* the feature isn't even running). `02:00` NZST = `14:00` UTC doesn't line up with any other currently-documented daily-timed signature either (checked against this file and `arm_disarm_state_machine.md` — no match). The "what happens near `11:26` UTC daily" question reverts to fully unidentified, with the dialler-contention mechanism ruled out specifically — worth remembering not to re-propose that particular explanation, including any dialler-related mechanism generally (test calls, DTMF, modem tones), since the dialler isn't believed to be active on this panel at all. If a future session wants another candidate, look elsewhere in the panel's periodic/scheduled behaviors (e.g. the radio-detector supervised-timer check-in cycle, `P25E4E`, default 240 min — divides evenly into a once-daily period at the default (240 × 6 = 1440 min), so phase/configuration is the open question, not periodicity — worth a look if it's been reconfigured).
+
+### Update (2026-09-17): the daily window breaks for the first time in 13 days — root-caused to the panel's own real-time clock running ~28 minutes slow for about a day, not a shift in the fault's trigger
+
+**Source:** routine log-mining check of the frigate long-term capture, 2026-09-15 07:23 → 2026-09-17 07:27 UTC (~48h, no reboot/OTA in-window). User then suggested the outlier might trace back to the panel itself having been briefly offline with its clock not corrected until the following evening — checked by comparing every decoded `CURRENT_TIME` broadcast's controller-local value against real wall-clock time (NZST, UTC+12) across the window, rather than just eyeballing the fault's own timestamp.
+
+**Findings (observed facts):** the fault recurred on both days, but not at the fixed `11:25:55`–`11:27:40` UTC window established across every prior day since 2026-09-05 (13 consecutive days through 2026-09-14). On 2026-09-15 it ran `11:53:53`–`11:55:38` UTC instead — with no occurrence at the usual time that day. On 2026-09-16 it reverted to `11:26:33`–`11:28:17` UTC (within ~1min of normal).
+
+Comparing every `Controller time update` line's decoded value against real NZST time shows why: the panel's own clock was synced (offset ~0) through **2026-09-15 04:39:10 UTC**, then went stably **~27.9 minutes slow** from **04:45:08 UTC** onward — a clean, sustained offset (not the usual transient doubled-bit-glitch noise, which reverts within one sample) that held for every non-glitched reading until it snapped back to ~0 starting **2026-09-16 09:56:33 UTC** (`21:56:33` NZST — Wednesday evening). The transition lines up exactly with a real event in the log: at `04:41:16` UTC the ESPHome device logged `Processing unexpected disconnect from ESPHome API`, followed by a ~3.5min reconnect gap and `[I][safe_mode:154]: Boot seems successful; resetting boot loop counter` at `04:45:03` UTC — i.e. the interface device itself was rebooting out of a boot-loop right as the panel's broadcast clock jumped backward by ~22 minutes (`16:39:27`→`16:17:23` NZST across that gap). The `11:25:55`–`11:27:40` UTC fault trigger is therefore keyed to the panel's *own* internal clock reaching a fixed time-of-day, not real UTC: while the panel was running 27.9min slow, that internal-clock moment landed 27.9min later in real UTC (`11:53:53` on 09-15); once the panel's clock was corrected mid-morning on 09-16 (well before that day's ~11:26 UTC firing), the fault fired at the normal real-UTC time again.
+
+**Inference (high confidence on mechanism, unconfirmed on root cause of the clock loss):** this both explains the 09-15 outlier and *strengthens* the still-open "what triggers the daily fault" question in the opposite direction from every prior entry in this section — the trigger is confirmed to be pinned to the panel's own clock (as the `11:25:55` UTC = `23:25:55` NZST framing already assumed), not a real-UTC-referenced or otherwise external event, since it rode along with the panel's clock error rather than staying fixed to real time. What actually knocked ~28 minutes off the panel's RTC is not established from the bus trace alone — the ESP32 interface's own reboot is tightly time-coincident but wouldn't itself explain the *panel's* (not the ESP's) clock changing; a brief mains power interruption affecting both the panel and the ESP's supply is a plausible shared cause but unconfirmed. The user's recollection that "the panel was offline a while and the time wasn't corrected until yesterday evening" matches the correction timestamp precisely (`2026-09-16 09:56:33 UTC` = `21:56:33` NZST) but the trace only directly shows a ~3.5min ESP32 API disconnect, not an extended panel-side outage — worth asking the user whether they recall manually resetting the panel's clock on the physical keypad that evening, which would confirm the correction was a manual fix rather than the panel somehow self-correcting.
+
+**Practical takeaway:** no code change — not user-facing (the fault is already handled as a discarded/logged corruption case). Useful going forward: when the daily fault's wall-clock timing looks "wrong," check the panel's own `CURRENT_TIME` broadcasts for a clock-offset explanation before treating it as a change in the underlying trigger — this is now a known, reproducible failure mode (panel clock loses sync around a device reboot/power event, self-persists until manually corrected) rather than a one-off curiosity.
+
+**Status as of 2026-09-17 (general log-mining check, 2026-09-15 07:23 → 2026-09-17 07:27 UTC, ~48h):** everything else matched established baselines with zero exceptions:
+
+- Poll-slot/watchdog burst→trip mechanism: 13 more clean matches (cumulative tally now well past 35/35), zero exceptions — including two cases of back-to-back double trips (`09:03:38`/`09:04:38` and `00:19:48`/`00:21:03` on 2026-09-16/17), consistent with the "worse burst → two consecutive trips" wrinkle first seen 2026-09-07.
+- `ff.`/`fe.` corruption: ~14 distinct burst events over 48h (~0.3/h), in line with the established baseline range — the raw line count (155) looks elevated but is just burst size (6–11 lines/burst), not event frequency.
+- `invalid day/month value */36` ×4-multiplier theory held exactly: day×4 read `60/36` on 09-15 and `68/36` on 09-17 (15×4=60, 17×4=68), month×4 flat at September's `36`. Still on track for the October flip to `40` — not due until 2026-10-01.
+- No `31/16`-style `CURRENT_TIME` stuck state.
+- One integration disarm retry (1/6, instant resolve) on 2026-09-15 at 19:23 — zero corruption/watchdog activity anywhere nearby, another clean instance of the already-deprioritized corruption-proximity non-correlation (see `arm_disarm_state_machine.md`), not written up separately there since it doesn't change the existing conclusion.
+- No RF remote (`0x7C`) activity — an initial grep for the substring `7C.` returned many false-positive hits (coincidental bytes inside unrelated `CURRENT_TIME`/glitch-recovery payloads); the properly-anchored `[7C.` frame-start pattern matched zero. Worth remembering this substring pitfall for future `0x7C` searches — anchor on the frame-start bracket, don't grep the bare byte pair.
+- One truncated-frame WARN, `Current time too short, discarding` — second-ever instance of this variant (first was 2026-09-07).
+- No output-select/zone-bypass activity, zero ERROR-level lines.
+
+**How to apply going forward:** next log-mining check should start from **2026-09-17 07:27 UTC**. Standing checklist: poll-slot/watchdog exceptions (still zero ever), the October month-value flip (due on/after 2026-10-01), the corruption-hits-keypress-machine mechanism (still 1 confirmed instance, from 2026-09-13), and whether the `invalid minutes-since-midnight` window shifts again (1 outlier so far — a 2nd would be genuinely notable).
+
+**Status as of 2026-09-20 (general log-mining check, 2026-09-17 07:27 → 2026-09-20 01:39 UTC, ~66h12m):**
+
+- **`invalid minutes-since-midnight` window: confirmed stable at its post-resync time, not reverting to the pre-09-15 time.** Recurred all 3 days in-window (09-17/18/19) at `11:26:32`–`11:28:18` UTC each time — ~38–40s later than the `11:25:55`–`11:27:40` baseline that held for 13 straight days before the 2026-09-15 clock-slip outlier. Since the panel's clock resync landed 2026-09-16 09:56:33 UTC (see entry above) and the window has now held at this slightly-later time for 4 consecutive days (09-16 through 09-19) with zero further drift, treat `~11:26:33`–`11:28:18` UTC as the new steady-state daily window, not a residual symptom of the resync event. Still fully consistent with the "pinned to the panel's own internal clock reaching a fixed time-of-day" mechanism — a `~38s` correction is plausible slop in exactly when the resync landed relative to the panel's own clock tick, not evidence against that mechanism.
+- **New WARN signature, first-ever observed:** ESPHome core's own loop-timing watchdog, `[W][component:419]: crow_alarm_panel took a long time for an operation (N ms), max is 50 ms` — distinct from the `crow_alarm_panel`-specific "No ping for 60 s" watchdog tracked throughout this project. 2 instances, both on 2026-09-17: `54 ms` at `07:34:00.067` (immediately after a post-OTA boot, coinciding with setup/registration-announce/disarm-state-broadcast processing all landing in the same `loop()` tick) and `91 ms` at `19:17:22.959` (mid an `Output-select` garage-door sequence, coinciding with an ACK + `KEYPAD_COMMAND` + digit-send all landing in the same tick). Both are plausibly explained by several message-processing paths coinciding in one `loop()` iteration rather than any backlog/corruption mechanism — frame-FIFO backlog/overflow counters were not separately re-checked this session but no `ff.`/`fe.` burst or watchdog trip coincides with either instance. Too few instances (2) to characterize further; flagging per the same "too rare yet to characterize" treatment given to the truncated-frame WARN variants when first seen. Added a matching `known_quirks.md` entry (2026-09-20, mirroring the truncated-frame entry's precedent of documenting on first observation rather than waiting for a pattern) — revisit if it recurs.
+- Two OTAs landed back-to-back at the very start of this window (`07:33:49` UTC boot, ESPHome core bumped to 2026.9.0; then a second OTA completing `07:41:45` UTC with its own reboot at `07:42:46` UTC) — one of these two carried the native RF-remote decoder (`ec852e1`, see above), so this reboot boundary is functionally significant, not a no-op infra bump as first assumed.
+- Poll-slot/watchdog burst→trip mechanism: spot-checked 4 of the window's 14 trips (one per day plus one extra), all 4 cleanly preceded by an `ff.`/`fe.` burst in the expected poll slot — mechanism continues to hold, no exception found in the sampled subset.
+- `invalid day/month value */36` ×4-multiplier theory held exactly: `68/36` (09-17) → `72/36` (09-18) → `76/36` (09-19) → `80/36` (09-20 so far) = day×4 incrementing daily, month×4 flat at September's `36`. Still on track for the October flip to `40`, due on/after 2026-10-01.
+- No `31/16`-style `CURRENT_TIME` stuck state. Zero ERROR-level lines.
+- **Correction to an initial pass over this same window:** the first check of this window reported "no RF remote activity," which was wrong — caused by grepping the uppercase-anchored `[7C.` pattern (correct for the old raw/manually-decoded `Unknown [...]` frames) against a log that, as of this window, decodes `0x7C` natively and prints it lowercase (`[7c.`, from `%02x` in `ESP_LOGD`, `crow_alarm_panel.cpp:925`). Case-insensitive re-check found real activity — see below. Worth remembering: any future `0x7C`/RF-remote grep must be case-insensitive now that a native decoder exists, not just frame-start-anchored.
+- **RF remote decoder (`ec852e1`, merged 2026-09-10, Copilot-review fixes through 2026-09-15) went live on the real device in this window** — it's the functional change carried by the back-to-back OTA at the very start of the window (`07:33:49`/`07:41:45` UTC, 09-17; see below), which the first pass had described as carrying no functional change. First real decoded line logged same day at `17:52:55` UTC (`[D][crow_alarm_panel:925]: [RF Remote 90:00:36] Button event, code 84:3e ...]`).
+- **First field confirmation of the new decoder: 50 button events (25 press+retransmit pairs) across 4 clusters, all from Remote A (`90:00:36`), all 4 codes matching the already-catalogued `protocol_wire_format.md` table exactly** — `84:3e`×16 (garage), `b4:ee`×24 (gate), `bc:f6`×4 (arm), `c0:fa`×6 (disarm). No unseen codes, no Remote B (`42:00:c4`) activity. Clusters at 09-17 17:52–19:16 UTC (2 short bursts) and 09-18 20:00/20:44/21:16 UTC + 09-19 00:33 UTC (4 bursts, each hitting garage/gate/arm-or-disarm in sequence) — the pattern (all-buttons-in-sequence, repeated several times same evening) reads as the user deliberately exercising every button post-deployment to confirm the new decoder works in the field, not incidental use. Each `bc:f6`/`c0:fa` (arm/disarm) event lines up with a real `Controller`-broadcast arm/disarm transition in the same log second, consistent with the already-established 2026-09-10 causality finding (RF frame precedes the resulting broadcast). Treat the native decoder as confirmed working correctly against real traffic, not just the original scripted test.
+- Only 5 `Output-select` (garage door, integration-triggered) sequences this window, all completed successfully with no retries — separate from the RF-remote-triggered garage/gate activity above. No zone-bypass activity.
+- Truncated-frame WARNs: 3× `Controller status too short` (already catalogued), 5× `Current time too short, discarding` (already-catalogued category; all 5 landed in one cluster, more instances at once than any prior single occurrence but same variant).
+- `ff.`/`fe.` corruption: 228 raw lines across ~66h, consistent with established burst-size/baseline-rate norms (not separately counted into discrete burst events this session).
+
+**How to apply going forward:** next log-mining check should start from **2026-09-20 01:39 UTC**. Standing checklist: poll-slot/watchdog exceptions (still zero ever, though only spot-checked this window — worth checking all trips rather than a sample next time if anything looks off), the October month-value flip (due on/after 2026-10-01 — check explicitly), the corruption-hits-keypress-machine mechanism (still 1 confirmed instance, from 2026-09-13), and whether the new `component:419` "took a long time for an operation" WARN recurs (2 instances so far, not yet characterized). **Grep gotcha to carry forward:** now that the native RF-remote decoder is live, search for `0x7C`/RF-remote activity case-insensitively (`[7[Cc]\.` or just grep `"RF Remote"` directly) — the old uppercase-only `[7C.` anchor from the 2026-09-17 entry above will silently miss everything post-decoder.
+
+**Status as of 2026-09-22 (general log-mining check, 2026-09-20 01:39 → 2026-09-22 06:15 UTC, ~52h36m, no reboot/OTA in-window): quiet window, everything matched established baselines — no doc revision needed.**
+
+- **Poll-slot/watchdog burst→trip mechanism: 13/13 trips exhaustively checked this time (not spot-checked, per the standing note to do so if anything looked off — nothing did, checked exhaustively anyway since the prior window only sampled 4/14)** — every trip cleanly preceded by an 8–11 line `ff.`/`fe.` burst landing 45–60s earlier, zero exceptions. Cumulative tally now well past 48/48 with zero exceptions ever recorded across the whole project.
+- `ff.`/`fe.` corruption: 22 distinct burst events / ~52.5h (~0.42/h), 189 raw lines — within the established baseline range.
+- `invalid minutes-since-midnight`: recurred both days (09-20, 09-21) at `11:26:33`–`11:28:18` UTC — the post-resync steady-state window (established 2026-09-16) now holds for a 6th/7th consecutive day with zero further drift.
+- `invalid day/month value */36` ×4-multiplier theory held exactly: `80/36` (09-20) → `84/36` (09-21) → `88/36` (09-22 so far) = day×4 incrementing daily, month×4 flat at September's `36`. Still on track for the October flip to `40`, due on/after 2026-10-01 — not yet due.
+  - One anomalous one-off value, `42/18` at 2026-09-21 07:21:48 UTC, doesn't fit the daily ×4 pattern (day/month don't correspond to any real calendar value) — but it landed as the very first line of an `ff.`/`fe.` corruption burst (the same burst that preceded that day's 07:22:33 watchdog trip), matching the already-documented shape of "severe corruption clusters inside burst windows produce non-standard glitch values" (the precedent set by the `CURRENT_TIME` minutes-low-byte bit-32/64 glitch, 2026-09-03 entry above). Filed as expected burst noise, not a revision to the ×4 theory or a new signature.
+- No `31/16`-style `CURRENT_TIME` stuck state (one false-positive grep hit from a coincidental `...:16` time-of-day suffix in an unrelated `Controller time update` line, ruled out on inspection).
+- New `component:419` "took a long time for an operation" WARN: did not recur — still 2 total instances, both 2026-09-17.
+- 2 arm/disarm cycles this window (2026-09-20 18:50–2026-09-21 04:20, ~9h30m armed; 2026-09-21 18:06–19:49, ~1h43m armed), both clean single-shot transitions (Arming→Armed Away within ~30s, single Disarmed transition) — no retry evidence for either. No new data point for the deprioritized disarm-retry investigation.
+- No RF remote (`0x7C`/`0x7c`) activity, no Output-select/zone-bypass activity this window.
+- 3 truncated-frame WARNs, all the already-catalogued `Controller status too short, discarding` variant.
+- Zero ERROR-level lines.
+
+**How to apply going forward:** next log-mining check should start from **2026-09-22 06:15 UTC**. Standing checklist unchanged: poll-slot/watchdog exceptions (now exhaustively checked twice running, still zero ever), the October month-value flip (due on/after 2026-10-01 — the first session landing on/after that date should check explicitly), the corruption-hits-keypress-machine mechanism (still 1 confirmed instance, from 2026-09-13), and whether the `component:419` timing WARN recurs (still only 2, both 09-17).
+
+**Status as of 2026-09-23 (general log-mining check, 2026-09-22 06:15 → 2026-09-23 09:29 UTC, ~27h14m, no reboot/OTA in-window): quiet window, everything matched established baselines — no doc revision needed.**
+
+- **Poll-slot/watchdog burst→trip mechanism: 4/4 trips exhaustively checked, every one cleanly preceded by an `ff.`/`fe.` burst landing ~45s earlier in the `ESPHome Keypad` poll slot** — zero exceptions. Cumulative tally now well past 52/52 with zero exceptions ever recorded across the whole project.
+- `ff.`/`fe.` corruption: 17 distinct burst events / ~27.25h (~0.62/h) — within the established baseline range.
+- `invalid minutes-since-midnight`: recurred once at `11:26:33`–`11:28:18` UTC (09-22) — the post-resync steady-state window now holds for an 8th consecutive day with zero further drift.
+- `invalid day/month value */36` ×4-multiplier theory held exactly: `88/36` (09-22) → `92/36` (09-23, so far) = day×4 incrementing daily, month×4 flat at September's `36`. Still on track for the October flip to `40`, due on/after 2026-10-01 — not yet due (this session lands before the rollover).
+- No `31/16`-style `CURRENT_TIME` stuck state.
+- New `component:419` "took a long time for an operation" WARN: did not recur — still 2 total instances, both 2026-09-17.
+- **No arm/disarm activity at all this window** — the panel stayed continuously disarmed the entire ~27h (1368/1368 `Alarm Status` samples read `disarmed`, zero `Armed` transitions). No new data point for the deprioritized disarm-retry investigation.
+- No RF remote (`0x7C`/`0x7c`) activity, no Output-select/zone-bypass activity this window.
+- 1 truncated-frame WARN, the already-catalogued `Current time too short, discarding` variant.
+- Zero ERROR-level lines.
+
+**How to apply going forward:** next log-mining check should start from **2026-09-23 09:29 UTC**. Standing checklist unchanged: poll-slot/watchdog exceptions (now exhaustively checked three windows running, still zero ever), the October month-value flip (due on/after 2026-10-01 — the first session landing on/after that date should check explicitly), the corruption-hits-keypress-machine mechanism (still 1 confirmed instance, from 2026-09-13), and whether the `component:419` timing WARN recurs (still only 2, both 09-17).
+
+**Status as of 2026-09-28 (general log-mining check, 2026-09-23 09:29 → 2026-09-28 06:59 UTC, ~117h30m, no reboot/OTA in-window):**
+
+- **Headline finding: NZ daylight-saving transition gives direct field confirmation of the "`invalid minutes-since-midnight` fault is pinned to the panel's own internal local clock" theory (2026-09-17 entry above).** NZDT began 2026-09-27 (last Sunday in September, confirmed via `Controller time update` broadcasts jumping cleanly from `Sunday 2026-09-27 01:59:45` to `03:00:00` at `2026-09-26 14:00:33` UTC — the panel itself applies the DST rule, not just a fixed offset). The very next occurrence of the daily fault shifted its UTC firing time by exactly **-1h00m00s**: `10:26:33`–`10:28:18` UTC on 09-27, vs. the `11:26:33`–`11:28:18` UTC steady-state that had held for the prior 11 consecutive days (since the 09-16 resync). A local-time-pinned trigger crossing a real DST boundary is about as clean a confirmation as this theory could get without instrumenting the panel directly — upgrade this from "established mechanism" to "confirmed via independent real-world event." **New expected window going forward while NZDT is in effect: `~10:26:33`–`10:28:18` UTC** (until NZDT ends, first Sunday in April 2027, when it should jump back to `~11:26:33`).
+- **Poll-slot/watchdog burst→trip mechanism: first-ever confirmed exception.** 26 trips this window, exhaustively checked with a corrected (time-based, not line-based) lookback: 25/26 matched the established mechanism, including one back-to-back double-trip pair (`22:17:33`/`22:18:33` on 09-24 — burst at `22:16:47`–`49` UTC, consistent with the "worse burst → two consecutive trips" wrinkle first seen 2026-09-07). The one exception, `2026-09-25 16:23:18` UTC, has **zero** `ff.`/`fe.` corruption anywhere in the 8+ minutes before it — `ESPHome Keypad`'s ping simply stopped being answered for over 60s while `AAP Keypad` and `Keypad 0x07` kept polling normally, with no visible bus-level cause. Cumulative tally is now 77/78 (not 78/78) — per the standing note, a single counter-example here is genuinely notable. No functional impact (the watchdog's re-announce recovered it identically to every corruption-caused trip), but the cause of this one instance is an open question, not yet folded into the established mechanism. Worth flagging directly to the user.
+  - **Resolved 2026-10-03:** this trip is the onset of an RF-interference fault. The panel set its fault bits in `CONTROLLER_STATUS` at `16:22:20`, stopped polling for ~15–20s (all three keypads re-registered afterwards; "kept polling normally" above is wrong), and sent the one-off `Unknown [70.6E.5A.02]`. The same signature recurred on 2026-10-02 — see "RF-interference fault (2026-10-03)" at the end of this file.
+- **Two new `Output-select: timeout in state 1, retrying` events** (garage door, 2026-09-26 17:06:04 and 2026-09-27 00:01:54 UTC), both resolved on the first retry. Unlike the 2026-09-13 confirmed instance, **neither was preceded by `ff.`/`fe.` corruption** — plain ordinary-noise ACK timeouts, a reminder this WARN isn't unique to the corruption mechanism (corruption-hits-keypress-machine tally stays at 1 confirmed instance). The second one is time-coincident (same second) with a new WARN signature: `[W][component:419]: api took a long time for an operation (64 ms), max is 60 ms` — note this names the **`api`** component, not `crow_alarm_panel`, and a `60 ms` threshold rather than the `50 ms` one on the existing 2026-09-17 `crow_alarm_panel`-named instances (see `known_quirks.md`'s loop-timing entry, which already anticipated other components could trigger the same generic ESPHome-core mechanism). Plausible-but-unconfirmed connection to the retry; first instance of this exact (`api`, 60ms) variant, tracked separately from the still-dormant `crow_alarm_panel`-named one (still 2 total, both 09-17).
+- `invalid day/month value */36` ×4-multiplier theory held exactly through the whole window: `92/36` (09-23) → `96/36` → `100/36` → `104/36` → `108/36` → `112/36` (09-28) = day×4 for the 23rd–28th, month flat at September's `36`. One anomalous one-off, `50/18` at 2026-09-25 11:49:48 UTC, landed at the very start of an `ff.`/`fe.` burst — filed as expected burst noise per the established precedent (2026-09-22's `42/18`), not a theory revision. **Still not due for the October flip to `40`** — this window ends 2026-09-28, before the rollover; the first session landing on/after 2026-10-01 should check explicitly.
+- `ff.`/`fe.` corruption: 45 distinct burst events / ~117.5h (~0.38/h) — within the established baseline range.
+- RF remote (`0x7C`/`0x7c`): all activity from Remote A (`90:00:36`) only, all 4 codes matching the catalogued table exactly (`84:3e` garage, `b4:ee` gate, `bc:f6` arm, `c0:fa` disarm), no unseen codes, no Remote B activity.
+- 6 clean arm/disarm cycles (evenings of 09-23 through 09-27, plus one associated disarm each on 09-24 and 09-28 with a brief `pending` step before `disarmed` — not retries, just the normal exit-delay/pending transition), zero integration-initiated retries. No new data point for the deprioritized disarm-retry investigation.
+- 8 truncated-frame WARNs, split evenly between the two already-catalogued variants (`Current time too short, discarding` ×4, `Controller status too short, discarding` ×4) — no new variant.
+- No `31/16`-style `CURRENT_TIME` stuck state, no zone-bypass activity, zero ERROR-level lines.
+
+**How to apply going forward:** next log-mining check should start from **2026-09-28 06:59 UTC**. Standing checklist: the October month-value flip (due on/after 2026-10-01 — check explicitly), whether the poll-slot/watchdog mechanism's new exception (09-25 16:23:18) recurs or stays a one-off, whether the `invalid minutes-since-midnight` window holds at its new NZDT-adjusted `~10:26:33` UTC time, whether the `api`-named `component:419` variant recurs, and the corruption-hits-keypress-machine mechanism (still 1 confirmed instance, from 2026-09-13).
+
+**Status as of 2026-10-01 (general log-mining check, 2026-09-28 06:59 → 2026-10-01 04:11 UTC, ~69h12m, no reboot/OTA or logging gap in-window):**
+
+- **October month-value flip: confirmed exactly as predicted on 2026-09-10.** `invalid day/month value` read `112/36` → `116/36` → `120/36` for the 28th–30th, last `120/36` at `2026-09-30 10:59:47` UTC, and the next occurrence (`13:39:48` UTC, after the panel's local midnight at `11:00` UTC under NZDT) read **`4/40`** = day 1 × 4, month 10 × 4. The mechanism behind the `×4` is now identified — see the bit-stuffing section below.
+- Poll-slot/watchdog burst→trip mechanism: 10 trips, 10/10 preceded ~45s earlier by an `ff.`/`fe.` burst. Cumulative tally 87/88; the 2026-09-25 no-corruption exception did not recur.
+- `ff.`/`fe.` corruption: 20 burst events / ~69h (~0.29/h) — within baseline. All 3 `Current time too short, discarding` WARNs this window are the first line of such a burst (`22:22:02`, `08:33:03`, `16:51:18` UTC).
+- `invalid minutes-since-midnight`: 09-28, 09-29, 09-30 all at `10:26:32`–`10:28:17` UTC — the NZDT-adjusted window holds (4 consecutive days including 09-27). Also explained below.
+- Neither `component:419` timing-WARN variant recurred (`crow_alarm_panel`-named: still 2, both 09-17; `api`-named: still 1, 09-27).
+- Arm/disarm: 3 physical-keypad arms, 3 disarms — one at the physical keypad during entry delay (`Alarm pending from zone 1` → `PENDING` → `DISARMED`, 09-29 03:58 UTC) and two integration disarms (09-30 04:18, 10-01 03:05 UTC), both single-attempt and confirmed in under 1s. Zero retries.
+- No RF remote (`0x7c`, searched case-insensitively), no Output-select (every `Output state` sample `[00]`), no zone-bypass, no `31/16`-style stuck state, zero ERROR-level lines. 3 `Controller status too short` WARNs (catalogued variant).
+- 4 lines of the `…01.46.81.00.80.11` family (`03.80`, `93.82` ×2, `11.80`) and 3 of a never-catalogued `Unknown [08.00.80.60.00]` / `[00.00.80.60.00]` shape — both explained in the dropped-bit section below.
+
+**How to apply going forward:** next log-mining check should start from **2026-10-01 04:11 UTC**. Standing checklist: whether the 09-25 watchdog exception recurs (still 1), whether either `component:419` variant recurs, the corruption-hits-keypress-machine mechanism (still 1, 2026-09-13), and the two dated predictions made in the bit-stuffing section below (every `CURRENT_TIME` broadcast on panel-local 2026-10-31 should read `31/20`; `invalid day/month` should read `8/40` on 10-02, i.e. keep tracking `4×day / 40`).
+
+## Bit-stuffing on the wire (2026-10-01) — one mechanism behind the whole `CURRENT_TIME` glitch family
+
+**Source:** the 2026-09-28 → 2026-10-01 frigate window above (16,549 decoded `CURRENT_TIME` broadcasts, 4,128 glitch lines with raw payloads), plus the 12 `0x7C` sample frames already recorded in `protocol_wire_format.md`.
+
+**Observed facts:**
+
+- Every glitched `CURRENT_TIME` payload in the window is reproduced **byte-for-byte** by taking the true time fields and inserting one `0` bit after every run of five consecutive `1` bits in the LSB-first bitstream (run counted across byte boundaries), then re-slicing into bytes without removing the inserted bit — which is what our receiver does. Using only the logger's wall-clock timestamp (plus the median panel-clock offset) to derive the true fields: 4,084 / 4,128 match with the seconds snapped to the 15s grid, and all 4,128 match once off-grid rebroadcasts are allowed their real seconds value. Per log shape: `recovered doubled-bit glitch` 3,197, `invalid seconds` 776 and `invalid minutes-since-midnight` 25 (one inserted bit each, bar a handful of off-grid frames), `invalid day/month` 130 (two inserted bits).
+- Conversely, none of the 14,129 broadcasts that decoded cleanly contain a five-`1` run anywhere in type + payload.
+- Worked examples (true bytes → received bytes):
+  - `seconds = 0x0F` preceded by a `minutes_lo` with bit 7 set (`…1 | 1,1,1,1,0…`): the run completes inside `seconds`, the inserted `0` lands where a `0` already was, so `seconds` reads correctly and `day`/`month`/`year` shift one bit → `×2`. This is the original "once per minute at `seconds = 15`" glitch — and why it only happens during the half of each 256-minute cycle where `minutes_lo ≥ 0x80`.
+  - `minutes_lo = 0xBE`, `seconds = 0x0F` (20:14:15 local): `0xBE` has its own five-`1` run → reads `0x3E`; the leftover `1` plus `0x0F` makes a second run → `seconds` reads `0x1F`; everything after is shifted two bits → `day`/`month`/`year` `×4`. Hence `54.02.04.3E.1F.70.24.68` for 28 September. The `×4` "variant" is simply two stuffing events in one frame, and it recurs every 256 minutes at the same handful of `minutes_lo` values (`3E`, `5F`, `7C`, `7D`, `9F`, `BE`, `DF`, `1F` as received).
+  - `minutes_lo = 0x7E` / `0x7F` → received as `0xBE` / `0xDF`. At panel-local **23:26** and **23:27** minutes-since-midnight is `0x57E` / `0x57F`, which therefore reads `0x5BE` / `0x5DF` = **1470 / 1503** — over 1439, so the WARN fires. That is the entire "daily `invalid minutes-since-midnight` episode": it tracks the panel's local clock (2026-09-17, 2026-09-28 findings) because it *is* the panel's local clock reaching the two minutes whose low byte is `0x7E`/`0x7F`. The same substitution happens at every other `x7E`/`x7F` minute value (02:06, 06:22, 10:38, 14:54, 19:10 local) but stays under 1440 there, producing the "wrong minutes, off by a multiple of 32" defect root-caused only as far as bit-weights on 2026-09-03.
+  - `day = 31 = 0x1F` is itself a five-`1` run, so on the 31st *every* broadcast has `month`/`year` doubled and the single-halving recovery fails (`day` is odd). This matches the 2026-08-31 "`31/16` stuck" episode's onset to the second (`2026-08-30 11:59:55` UTC = panel-local midnight into 31 August; `16` = 8 × 2). Not re-verified against raw payloads — those logs have rotated out — and the 2026-09-01 entry's "recurred, then self-cleared ~1h24m later" timing was not re-examined.
+- Applying the reverse operation to the 12 recorded `0x7C` frames (the type byte `0x7C` itself contains a five-`1` run, so every `0x7C` payload we have ever logged is shifted by at least one bit) yields a far more regular layout — see the rewritten byte table in `protocol_wire_format.md`'s `0x7C` entry. In particular all 12 un-stuffed frames sum to exactly `0x00` mod 256 over type + payload, the button byte becomes identical across both remotes, the retransmit byte is `0x11` → `0x12` for every button, and the "gate retransmits differently" anomaly disappears.
+
+**Inference (high confidence):** the bus uses HDLC-style **bit**-stuffing (zero-insertion after five consecutive ones), which is what keeps `0x7E` unique as a frame delimiter — the earlier notes looked for *byte*-stuffing (`0x7D` escapes) and correctly found none. The `CURRENT_TIME` "glitch" is therefore not a panel-side transmit defect, bus contention, or a triggered condition (as inferred 2026-08-05 / 2026-08-19): it is a normal protocol feature that `CrowAlarmPanelStore::interrupt()` does not undo. A deterministic model predicting 4,128 payloads exactly, and a 12/12 checksum falling out of an unrelated frame type, leave little room for an alternative.
+
+**Assumption (unverified):** that stuffing applies uniformly to every frame type and direction. Only controller→bus `0x54` and RF-receiver→bus `0x7C` are verified. Whether the controller expects *us* to stuff outbound frames is untested — no packet this component currently transmits (`0xA0`/`0xA1` with small address/key values) contains a five-`1` run, so the question has never been exercised.
+
+**Practical takeaway:** no code change made in this session. The correct fix is to drop the stuffed bit in the ISR's receive path (a `0` following five `1`s while inside a frame), after which the `CURRENT_TIME` halving-recovery, the `×4` gap flagged in `protocol_wire_format.md`, and the per-remote `0x7C` code table all become unnecessary. Until then, any frame whose true content has five consecutive `1` bits is silently mis-sliced from that point on. For currently-parsed types this is believed harmless in practice (it would take e.g. five adjacent zones active/bypassed in one `ZONE_STATE` bitmap byte), but it is a latent correctness bug, not just log noise.
+
+**Predictions on record:** (1) panel-local 2026-10-31 (`2026-10-30 11:00` → `2026-10-31 11:00` UTC): every `CURRENT_TIME` broadcast logs `invalid day/month value 31/20` (or a further-shifted value in the minutes where an earlier field also stuffs). (2) `invalid minutes-since-midnight` keeps values 1470 and 1503 only, at local 23:26/23:27 only.
+
+## Single dropped bit at frame start (2026-10-01) — resolves the `Unknown [91.]` family
+
+**Source:** all `…01.46.81.00.80.11` lines and all `Unknown [xx.00.80.60.00]` lines in the 30 days of rotated frigate logs plus the window above (~150 lines).
+
+**Observed facts:** removing exactly one bit from the first three bytes of an ordinary `KEYPAD_PING` (`23.AA.03.8C.02.01.00.23.0E`, LSB-first) and re-slicing reproduces every member of the family, with the second byte encoding which keypad was being pinged:
+
+| Ping address | Bit dropped in type byte → received type | Received 2nd byte |
+|---|---|---|
+| `00` (AAP Keypad) | b0–1 → `11`, b2–4 → `13`, b5 → `03`, b6–7 → `23` | `80` |
+| `05` (ESPHome Keypad) | b0–1 → `91`, b2–4 → `93`, b5 → `83`, b6–7 → `A3` | `82` |
+| `06` (Control 4 Keypad) | b0–1 → `11`, b2–4 → `13`, b6–7 → `23` | `83` |
+| `07` (Keypad 0x07) | b0–1 → `91`, b2–4 → `93`, b5 → `83`, b6–7 → `A3` | `83` |
+
+Every predicted combination above has been logged, and no logged variant falls outside the model. Type `0x11` results are the "malformed 7-byte `Armed state unknown`" lines (2026-08-05, 2026-09-13, 2026-09-14 entries); type `0x23` results show up as pings from non-existent keypads (`[Keypad 0x80]`, `[Keypad 0x83]`); a bit dropped in the address or third byte instead gives the rarer `23.81`/`23.82`/`23.85`/`23.87`/`23.06.01.46…`/`23.00.01.46…` shapes, also all observed. The same operation on `CONTROLLER_STATUS` `10.00.00.C1.00.00` gives `08.00.80.60.00` (bit 0–3 dropped) and `00.00.80.60.00` (bit 4) — 13 occurrences over the month; the 3 in this window each sit directly after a `ZONE_STATE` "All zones clear", exactly where the usual `zones_clear` status line is missing (earlier ones not individually checked).
+
+**Inference (high confidence on what these frames are; medium on where the bit is lost):** `0x91`/`0x93`/`0x83`/`0xA3`/`0x13`/`0x03` are not packet types. They are pings (and occasionally status frames) received one bit short. The 2026-08-31 finding that "address byte and poll-slot position move together" is the address surviving the shift. The loss is probably receiver-side — the 2026-08-05 trace had a passive monitor decode the same moment cleanly while the interface logged `11.83.01.46…` — e.g. a real clock edge rejected by the `MIN_FALLING_EDGE_INTERVAL_US` glitch filter or missed under interrupt latency. Not verified which.
+
+**Assumption (unverified):** that the rare truncated-frame WARNs (`… too short, discarding`) are the same one-bit loss on other frame types (a frame one bit short loses its last byte). Plausible, not tested.
+
+**Practical takeaway:** the `Unknown [91.]` thread that motivated the long-term capture is closed — no new packet type to label. Roughly 5 frames/day are affected, all harmless (a lost ping is re-sent next poll cycle).
+
+## Keypad registration-announce patterns (2026-10-01) — announces are not random; they cluster around controller ping-retry storms tied to keypad `0x07`'s 5-minute cycle
+
+**Source:** every `Registration [a0.…]` / `Sending registration announce` line in the 2026-09-28 06:59 → 2026-10-01 04:11 UTC window (826 from `Keypad 0x07`, 43 from `AAP Keypad`, 10 from `ESPHome Keypad`), cross-checked per day against the 30 days of rotated frigate logs.
+
+**Observed facts:**
+
+- **Keypad `0x07` announces on a fixed 300s timer.** 519 of 825 gaps are exactly 300s and the rest are 301–315s; the timer restarts from its most recent announce. This cadence **began at `2026-09-15 04:54:23` UTC** — minutes after the 04:41–04:45 UTC event already documented in the 2026-09-17 entry (interface offline ~3.5 min, panel clock ~28 min slow afterwards). Before that, `0x07` announced only 1–5 times a day (0–13/day excluding the 09-02 raw-trace day); since then, 285–290 times a day, every day.
+- **`AAP Keypad` (`0x00`) never announces on its own.** All 43 announces in the window come 21–22s after a *storm*: ~6–11 frames at ~82ms spacing, logged either as `Unknown [ff.]`/`[fe.]` (19 storms) or as the same clean ping to `0x07` repeated ~10 times (24 storms). Over the month, 304 of 314 `AAP Keypad` announces fit the same +22s rule (the remainder fall in periods where DEBUG lines, and so ping-decoded storms, were not being logged).
+- **`ESPHome Keypad` (`0x05`) announces are all the 60s watchdog**, 10 of 10 landing 45s after an `ff.`-decoded storm (its last ping was 15s before the storm).
+- **39 of the 43 storms start 300s (±2s) after the previous `0x07` announce** — i.e. at the moment `0x07`'s timer expires. Gaps between storms are accordingly `k × 300 + 15`s (1215, 1515, 1815, 3030, …). About 5% of `0x07`'s 5-minute cycles end in a storm instead of a clean announce.
+- Two storm shapes, with different consequences:
+
+| | Starts | `0x07` announces | `AAP Keypad` announces | `ESPHome Keypad` | Count (window) |
+|---|---|---|---|---|---|
+| A | at the top of a poll cycle, over the `CURRENT_TIME` frame (logged truncated in 3 cases); always `ff.`-decoded | +5s | +22s | not pinged for 45s → watchdog trip and announce | 10 |
+| B | directly after `0x07`'s ping in the normal poll slot; `ff.`- or ping-decoded | +15s | +22s | unaffected | 33 |
+
+- Storm rate by day: 1–5/day through 09-14 (all `ff.`-decoded), 12–21/day from 09-16 onward (roughly half `ff.`-decoded, half ping-decoded). The earlier per-window "`ff.`/`fe.` burst" counts only ever saw the `ff.`-decoded half.
+- In the examples inspected, the controller answers every announce the same way: an `ARMED_STATE` broadcast, a `CURRENT_TIME` with off-grid seconds, a ping round, and the announcing keypad's `KEYPAD_STATE` ("In normal state").
+
+**Inference (medium-high confidence):** the "corruption bursts" tracked since 2026-08 are controller ping-retry storms — the controller re-sending a ping that was not ACKed — and since 09-15 most of them are caused by keypad `0x07`'s 5-minute re-announce going wrong, not by random bus noise. That makes `0x07`'s cycle the upstream trigger for most watchdog trips (shape A), and it accounts for three earlier observations: the unchanged `ARMED_STATE` being rebroadcast 2–3× around each trip (one per re-announcing keypad, 2026-09-09), the off-grid `CURRENT_TIME` frames, and the step up in burst/trip rate from mid-September.
+
+**Assumption (unverified):** *why* `0x07` re-announces every 5 minutes since 09-15 (a mode it entered after that event — e.g. a module that lost power or its network link and now periodically resets its bus registration), why a storm makes `AAP Keypad` re-announce exactly 22s later, and why shape A drops `0x05` from polling while shape B does not. None of these is visible on the bus.
+
+**Context from the user (2026-10-01):** the keypad at `0x07` is no longer in use. The hardware is still installed and wired to the bus, running custom IP firmware. So the device generating the 5-minute announces is an unused, non-vendor-firmware node — consistent with the inference above, and it makes a firmware-side retry/reconnect loop (rather than anything in the panel) the most likely source of the 300s timer. Not confirmed: nothing on the bus shows what that firmware is doing.
+
+**Manual cross-reference (`ESL-2 Install & Program Manual (E.V).pdf`, pages 35, 57, 61) — relevant before removing `0x07` from the bus:** the panel supervises keypads. It lists a `KPSA` "Keypad Missing" fault ("keypad missing or has been removed from the KP-BUS" / "has not communicated within expected time frame") with a `KPSR` "Keypad Re-Instated" restore. Installer Options `P25E 11E` option 5 is "Cannot Arm if there is a keypad Fault" (a missing-keypad alarm blocks arming until the keypad is re-instated), and option 6 does the same for a telephone-line/comms fault; Output Options "B" `P35E` option 4 maps a "Telephone Line or IP Module Failure" alarm to an output. Not found in the pages read: how long the "expected time frame" is, or any explicit step for un-enrolling a keypad address. Trace-side observation for comparison: `ESPHome Keypad` (`0x05`) was never enrolled at the panel, is polled once it announces, and has been off the bus for 45s (every shape-A storm) up to ~3.5 min (2026-09-15) — whether any of those raised `KPSA` at the physical keypad is not visible in the log.
+
+**Manual cross-reference (ESL-2 APP POD manual, <https://www.aap.co.nz/site/aap/files/ESL-2/ESL-2%20APP%20POD%20Manual.pdf>, 7 pages, image-only PDF):** the device at `0x07` is an ESL-2 APP POD (identifies itself as "AAP IP Module", host name `PSTN-ETH`). Facts from the manual that bear on removing it: (1) it is a plug-in board on the control panel, and the manual requires the **ESL-2 to be powered down** before fitting it or moving its jumpers; (2) it also sits on the panel's dialler path — an LED state is described as "the alarm panel connected to the Line-in terminals has looped the line and is attempting to dial out", and push notifications require the panel's dialler to be enabled (`P175E 1E` option 1), a phone number at `P181E 1E` and CID format at `P182E 1E`; (3) stock firmware has its own periodic timers (IP poll 90s, router-on delay 120s, router reset 10 min, an internet-presence check that can power-cycle the router via its relay) and a status home page showing "Last Restart" / "Last Message", plus four status LEDs (slow blue = no network, steady red = app-server fail, LEDs 3 & 4 alternating = neither CID nor mobile-app reporting enabled). The manual says nothing about the pod's keypad-bus address, about bus registration, or about how to decommission it. Whether any of this applies unchanged to the custom firmware installed here is unknown.
+
+**Context from the user (2026-10-01, cont.):** the APP POD's network is not connected. **Inference (medium confidence, untested):** a pod with no network sits in a link/server retry loop (the stock firmware documents exactly this kind of supervision — internet-presence check, router-reset timer) and re-registers on the keypad bus each time round, which would be the 300s cycle. Open: whether the network was already disconnected before 2026-09-15 — if so, the cycle starting that day needs the 04:41 UTC power/clock event as the extra ingredient (e.g. the pod rebooted into the no-network state). Least invasive test: reconnect the network cable and see whether the 300s announces stop.
+
+**Practical takeaway:** no code change. A cheap test of the inference: power-cycle or unplug the module at address `0x07` and see whether the 300s announces, the storms and the watchdog trips all drop back to the pre-09-15 level (a few a day). `known_quirks.md`'s watchdog entry now points here.
+
+## RF-interference fault (2026-10-03) — what a panel fault looks like on the bus, and the cause of the 2026-09-25 watchdog exception
+
+**Source:** frigate capture 2026-10-01 04:11 → 2026-10-03 03:16 UTC, the 30-day rotated archive (searched for the same signature), and the user's report that the AAP keypad (`0x00`) showed an interference warning on the morning of 2026-10-03 (~08:00 NZDT = 2026-10-02 ~19:00 UTC). Vendor manual (`ESL-2 Install & Program Manual (E.V).pdf`, "Current Faults/History" event list) for the fault names.
+
+**Observed facts — two episodes, identical shape:**
+
+| | Episode 1 | Episode 2 |
+|---|---|---|
+| Onset (UTC) | 2026-09-25 16:22:20 (04:22 NZST) | 2026-10-02 14:42:20 (03:42 NZDT) |
+| Previous `0x07` announce | 16:17:18 (+302s) | 14:37:18 (+302s) |
+| `Unknown [70.6E.5A.02]` | 16:22:23 | 14:42:23 |
+| Fault-current bits cleared | 20:34:11, first RF remote frame (garage button) | 19:25:03, first status after the RF remote frame at 19:24:59 (garage button) |
+| Latched bit (`data[3]=0x04`) cleared | 20:34:32, arming by RF remote | 18:56:27, MEMORY + ENTER on AAP keypad (user viewing the fault) |
+| RF remote frames during the fault | none | none |
+
+- At onset the controller's `CONTROLLER_STATUS` changes from `10.00.00.{C1,80}.00.00` to `10.80.00.{C5,84}.04.00`: bit 7 of data[0] (logged as `Keypad 0x80`), bit 2 of `flags`, and data[3]=`0x04` all set together. Across the 30-day archive these values occur **only** inside these two episodes.
+- Clearing happens in two steps. The data[0]/`flags` bits drop on the first RF remote reception after onset — matching the manual's `RFIR` "RF Interference Alarm Restore — there is no more radio interference and has continued to receive". data[3]=`0x04` is independent of that: on 10-02 it cleared while the fault was still current (user viewed it), on 09-25 it stayed set after the restore until the system was armed.
+- Each onset comes with a polling pause of ~15–20s — no keypad pings after `:18`–`:19` — after which `0x07` (+15s), `AAP Keypad` (+20–22s) and, via the 60s watchdog, `ESPHome Keypad` all re-announce. This is the same aftermath as a storm, but no `ff.`/`fe.` frames or repeated pings are logged.
+- The MEMORY keypress on 10-02 returned `Memory event #99`.
+- In this window keypad `0x07` was still on the bus (300s announces continued through 03:14 UTC on 10-03); no `KPSA` "keypad missing" condition was visible.
+
+**Inference (medium-high confidence):** the user saw the panel's RF Interference Alarm (`RFIA`) — the fault list on the KP-ICON/LCD keypads is opened with the MEM key, exactly what the log shows. On the bus, data[0] bit 7 + `flags` bit 2 mean "fault current" and data[3]=`0x04` means "fault latched, not yet acknowledged" (the red TROUBLE light). Only one fault type has been seen, so whether other faults use the same bits is open.
+
+**Inference (medium confidence):** the 2026-09-25 16:23:18 watchdog trip, recorded as the only exception to the burst→trip mechanism (2026-09-28 entry), is explained: it is this fault's polling pause, not an unexplained loss of our ping. That brings the mechanism back to "every trip has a visible bus-level cause".
+
+**Assumption (unverified):** that `0x70` is the RF receiver reporting interference (see `protocol_wire_format.md`), and that the `0x07` timer coincidence (both onsets exactly 302s after its announce) means the APP POD's re-announce is involved — e.g. a storm on the bus being judged as radio interference, or the pod itself emitting RF noise when it cycles. Only two faults against ~2,000 `0x07` cycles in the week between them, so this could equally be coincidence: storms land on that timer anyway, and the fault may simply be detected during the resulting pause. Nothing on the bus says what the radio receiver actually heard.
+
+**Practical takeaway:** the fault bits are now exposed as `binary_sensor` types `trouble` (current) and `trouble_latched` (latched), debounced over two consecutive status frames, and data[0] bit 7 is masked off before the keypad lookup so it no longer logs as `Keypad 0x80`. Replaying every status frame from 2026-09-25 → 2026-10-03 through that logic switches the sensors only during these two episodes. Removing keypad `0x07` remains the planned test; when it happens, check whether RF-interference faults stop too, and what bits a `KPSA` keypad-missing fault sets (expected to differ from or add to the ones above).
+
+## Mains and battery faults (2026-10-14) — a controlled test decodes `CONTROLLER_STATUS` data[1] and `flags` bit 1
+
+The user simulated a mains power failure and then a backup-battery failure at the panel, each restored after about 30s, and asked whether either was visible on the bus. Capture: the frigate long-term logger, `crow-alarm.log` for 2026-10-13 (UTC).
+
+**Observed facts:**
+
+| | Mains failure | Battery failure |
+|---|---|---|
+| Onset (first status frame) | 21:32:02.995 UTC (10:32 NZDT) | 21:33:46.488 UTC (10:33 NZDT) |
+| Status frames during the fault | `10.00.02.C3.00.00`, `10.00.02.82.00.00` | `10.00.01.C3.00.00`, `10.00.01.82.00.00` |
+| Restore (first clean frame) | 21:32:33.003 UTC, `10.00.00.C1.00.00` | 21:34:16.174 UTC, `10.00.00.C1.00.00` |
+
+- Only data[1] and `flags` bit 1 (`0x02`) changed. The flags' zone-activity part (`0x80`/`0xC1`) kept following zone changes as usual, and data[0] bit 7, `flags` bit 2 and data[3] (the RF-interference fault bits) stayed clear throughout, so the existing `trouble` sensors reported `trouble:none`.
+- Keypad polling continued without a pause (33 pings between 21:31:50 and 21:34:30), and there were no announces, `Unknown` frames or watchdog warnings. This differs from the RF-interference onset (2026-10-03 entry).
+- Across the full archive (2026-09-14 → 2026-10-14, 59,343 status frames), non-zero data[1] occurs in only two other frames: `10.00.01.C3.00.00` at 2026-09-15 04:39:14 UTC (16:39 NZST; the next status frame, at 04:46:59, is clean) and `10.00.02.C3.00.00` at 2026-10-06 04:06:03 UTC (17:06 NZDT; next frame, clean, at 04:17:50). `flags` bit 1 is set in exactly the frames where data[1] is non-zero, with no exceptions.
+- The user reports that the physical keypad showed the fault only while it was current, and cleared it on restore with no lingering indication. This matches the bus: the fault bits clear in the restore frame, and data[3] (the TROUBLE latch for the RF-interference fault) stays `0x00` throughout.
+- The real outage at about 2026-10-14 03:58 NZDT (all Frigate cameras dropped at 03:58:02) was not captured: the logger had been stuck since 2026-10-11.
+
+**Inference (medium confidence — one controlled test, matched order and timing):** data[1] bit 1 = the manual's current fault `AC` ("AC Failure — no mains power detected at alarm panel") and data[1] bit 0 = `BATT` ("Battery Low — alarm backup battery is low or missing"). The manual's fault list has no separate "battery failed" code: low and missing are one condition, and the panel load-tests the battery every 15s. The simulated failure most likely raised `BATT`, the same fault a draining battery would, but a genuinely low battery hasn't been observed on the bus. `flags` bit 1 is a summary "supply fault current" bit, which answers the long-open "bit 1 meaning unknown" for `0x82`/`0xC3`. Neither fault latches, on the bus or on the keypad (confirmed by the user for these ~30s faults), unlike the RF-interference fault.
+
+**Assumption (unverified):** that the two earlier single frames were real short supply events. If so, the 2026-09-15 battery fault may be the panel's periodic battery test. Also unverified: what a long outage looks like (whether a latch eventually sets, and whether a mains fault drags the battery bit along as the battery drains), that both faults together would give data[1] = `0x03`, and that a draining (rather than disconnected) battery sets bit 0 and not some other bit. To confirm the last one, look for `b1=0x01` whenever the keypad's MEM list shows `BATT`.
+
+**Status frames are only sent on change:** the 09-15 and 10-06 blips each produced one fault frame, with the next status frame 7–11 minutes later. A two-consecutive-frames debounce like the `trouble` sensors' would never publish such a fault. The new `mains_fault` / `battery_fault` binary sensors instead publish from a single frame when data[1] and `flags` bit 1 agree, and log and drop a frame where they disagree. Replaying the archive through that logic switches the sensors only in the four episodes above, with zero disagreeing frames. The same single-frame weakness probably applies to the `trouble` debounce for a short RF-interference fault during a quiet period, but it hasn't mattered in the two episodes seen, which both lasted hours.
+
+**Follow-up (2026-10-14, same day): battery swap, a second `BATT` sample, first on the new firmware.** The user swapped in a battery suspected to be low, then put the original back. The log shows two battery-fault windows, each one frame of `10.00.01.C3.00.00` followed by a clean `10.00.00.C1.00.00`:
+
+| Fault frame (UTC) | Restore frame (UTC) | Most likely |
+|---|---|---|
+| 22:06:10 (11:06 NZDT) | 22:06:35 | original battery disconnected → test battery connected |
+| 22:07:00 (11:07 NZDT) | 22:07:20 | test battery disconnected → original reconnected |
+
+- The firmware with `mains_fault`/`battery_fault` (commit `2480cbf`) logged both as `supply:battery_fault`. There were no warnings and no frames where the two indicators disagreed.
+- Each fault restored as soon as a battery was connected, so both batteries passed the panel's load test. This was another missing-battery case, not a low one. Whether a draining battery sets the same bit is still unconfirmed.
+- Each fault produced exactly one status frame, with no zone activity to add more. This is the single-frame case the new sensors were designed for; a two-frame debounce would have published neither.
+
+**Next:** check this against a real mains outage once the logger has one, try a longer simulated outage to see whether a long fault ever latches, and watch for `b1=0x01` whenever the keypad shows `BATT` for a genuinely low battery.
+
+## Outputs during the exit delay (2026-10-14) — the arming screen swallows output selection unless ENTER ("Back") comes first
+
+The user reported that the gate didn't open when pressed from Home Assistant during an arm, and that the garage door failed around a disarm. Capture: frigate long-term logger, 2026-10-13 UTC (2026-10-14 NZDT).
+
+**Observed facts:**
+
+ESPHome keypad (`0x05`), arm at 20:03:22 UTC, exit delay "Arming" 20:03:23 → "Armed Away" 20:03:51:
+
+| Gate (output 3) request | Keys acked? | `KEYPAD_COMMAND` after the digit | `OUTPUT_STATE` | Fired |
+|---|---|---|---|---|
+| 20:03:35 (exit delay) | OUTPUT → ACK, `3`, ENTER all acked | `14.05.01.00.00.01.80` | stays `00` | no |
+| 20:03:44 (exit delay) | same | `14.05.01.00.00.01.80` | stays `00` | no |
+| 20:03:57 (armed) | same | `14.05.01.00.04.01.80` | `[04]` | yes |
+
+The component logged `Output-select: sequence complete` for all three.
+
+- **RF remotes work during the exit delay:** over the 30-day archive (2026-09-14 → 2026-10-14), the gate fired during an exit delay 11 times, each ~100 ms after an `[RF Remote 90:00:36]` gate-button `0x7C` frame. That's 11 of 11.
+- **The physical AAP keypad works during the exit delay too.** The user tested arm → return → garage → disarm at 22:20 UTC:
+  - Arming 22:20:11.800.
+  - Garage: `ENTER`, then `OUTPUT` → ACK `1d.00…` → `4` → `14.00.01.00.08…` and `OUTPUT_STATE [08]` at 22:20:16.439.
+  - Then `ENTER` + `ARM` → Disarmed at 22:20:18.108; the ARM key cancels the exit delay without a code.
+  - The only difference from the failed ESPHome attempts is the `ENTER` before `OUTPUT`. The user explained that this is the touch keypad's screen tap: when idle it wakes the screen, and during the exit delay it is "Back" from the arming screen to the home screen with the gate/garage buttons. Every `ARM`/`OUTPUT` from the AAP keypad in the archive is preceded by `ENTER` (24/24). The gaps between keys on the bus (0–360 ms) are presumably set by the keypad's polling, not by tapping speed.
+- **At "Arming" the controller sends every keypad `KEYPAD_COMMAND` 0x89** (`14.00.89…`, `14.05.89…`, `14.06.89…`), and near the end of the delay 0xAA (20:03:47).
+- **The controller answers `ENTER` with a `KEYPAD_COMMAND` to that keypad** in 59 of 60 archived AAP presses (median 101 ms, max 396 ms). The command byte depends on the previous one:
+  - 0x89 → 0x01 (1 sample, the test above)
+  - 0x04 → 0x01 (11)
+  - 0x15 → 0x01 (11) or 0x15 (1)
+  - 0x01 → 0x15 (26) or 0x01 (8); from mid-entry, ENTER mostly *submits*
+- **`KEYPAD_COMMAND` data[3] is the keypad's selected-output bitmap, not live output state.** It reads `00` right after OUTPUT is accepted and gets the output's bit when the digit is accepted. Outside a sequence it keeps the last selection: `14.05.89.00.08…` and `…04…` at arming, with nothing firing.
+- **During the disarm at 21:26 UTC, the component itself dropped two gate requests** (`set_output(3, on): another keypress sequence in progress, ignoring`) while the arm/disarm machine was retrying. They never reached the panel.
+- **The garage failure at 21:26:55 UTC came ~46 s after that disarm had completed.** OUTPUT was acked, but digit `4` got no confirmation. The retry's OUTPUT got `14.05.07…` instead of an ACK, and the "recovering" path re-sent `4` and ENTER. Data[3] stayed `00`, `OUTPUT_STATE` stayed `00`, and the log said `sequence complete`.
+
+**Inference (medium confidence — 2 failures and 1 success during the exit delay, consistent with 11/11 RF and the user's description of the keypad UI):** the controller tracks each keypad's screen. During the exit delay it holds keypads on the arming screen (0x89). Key presses there are acknowledged, but OUTPUT does not open output selection until the keypad leaves that screen with ENTER. RF remotes bypass keypad screens entirely.
+
+**Change (branch `fix/output-select-reliability`):**
+- During the exit delay (tracked from `ARMED_STATE`), output selection starts with ENTER and waits for its `KEYPAD_COMMAND` before OUTPUT. It is not prefixed elsewhere, because ENTER from mid-entry submits the buffer, and leftover code digits plus ENTER is the arm/disarm-with-code gesture.
+- A sequence must now show the output switching, either in `OUTPUT_STATE` or in data[3] after the digit, or it logs a WARN and republishes the real switch state.
+- `set_output()` requests made during another keypress sequence are queued (one slot, 10 s) instead of dropped.
+
+See `output_select_state_machine.md`.
+
+**To confirm after flashing:** arm from HA, then press Gate during the exit delay. The log should show `panel in exit delay, sending ENTER first`, `ENTER confirmed (CMD 0x01)`, `OUTPUT_STATE [04]`, and `output 3 switched`. If the reply to that ENTER is not 0x01, or the output still doesn't fire, the inference above is wrong.
+
+**Follow-up (2026-10-14, after flashing):** the first exit-delay test answered part of the question and found two bugs in the change.
+
+- **Garage pressed at 23:27:13 UTC, 2 s into the exit delay:**
+  - The leading ENTER was answered `14.05.01.00.08.01.80` (CMD 0x01), as predicted.
+  - OUTPUT was sent **7 ms** later. It got no `0x1D` ACK, just another `14.05.01.00.08…`, so output selection never opened. The physical keypad leaves ~50 ms here.
+  - The "recovering" path then typed `4` + ENTER anyway, and `OUTPUT_STATE` stayed `00`. The user confirmed the garage door did not open.
+- **Verification bug:** data[3] showed the stale `08` (last selection, garage) throughout, and it was trusted because a digit had gone out. The log said `output 4 switched`.
+- **Fixes:**
+  - Wait `OUTPUT_SELECT_CLEAR_DELAY_MS` (100 ms) between the ENTER's confirmation and OUTPUT.
+  - In `OUTPUT_PENDING`, only treat a KEYPAD_COMMAND as an implicit ACK when data[3] is empty; otherwise wait for the watchdog retry.
+  - Only count data[3] after it has been seen without the output's bit in the same attempt.
+
+  Whether the 100 ms gap is enough, or whether ENTER → OUTPUT needs something else, is still open.
+- **Disarm from HA during the exit delay doesn't work either (same session):**
+  - Disarm at 23:27:24 UTC: the code digits were each confirmed, but the terminal ENTER got `14.05.07…`, with no disarm.
+  - Retries 1–3 failed the same way until the exit delay ran out (Armed Away 23:27:39).
+  - Retry 4 also failed. Retry 5 disarmed at 23:27:52, 28 s after the request.
+  - Same arming-screen mechanism as outputs, by inference. The physical keypad cancels the exit delay with ENTER + ARM and no code (22:20:17 UTC).
+- **Re-arm at 23:27:54 UTC:** a fresh `arm_away()` arrived from HA 0.3 s after that disarm. The user likely pressed twice; it was not a stale retry.
+
+**Follow-up (2026-10-14, with the 100 ms gap, commit `e2e6ed3`):** gate pressed three times from HA during one exit delay ("Arming" 23:34:11 UTC, "Armed Away" 23:34:39):
+
+| Press (UTC) | ENTER reply | OUTPUT → `0x1D` ACK | `OUTPUT_STATE` | Logged |
+|---|---|---|---|---|
+| 23:34:13 | CMD 0x01 | yes (106 ms after OUTPUT) | `[04]` | `output 3 switched` |
+| 23:34:17 | CMD 0x01 | yes | `[04]` | `output 3 switched` |
+| 23:34:21 | CMD 0x01 | yes | `[04]` | `output 3 switched` |
+
+The user confirmed the gate physically responded to all three pulses (open, stop, close — the gate controller steps through its cycle per pulse). 3 of 3, against 0 of 3 before the change (2 with no ENTER, 1 with the ENTER but only a 7 ms gap). This confirms the inference above: during the exit delay output selection needs ENTER ("Back") first, plus a short pause before OUTPUT. 100 ms works; the minimum gap was not measured.
+
+**Separate observation:** the device has now been OTA-rebooted three times today (10:56, 12:21 and 12:33 NZDT). The user heard the external siren for a few seconds only around 12:21. It is not in the log, because that window falls in the device's own reboot gap (`OUTPUT_STATE` reports missing 23:20:59 → 23:21:21 UTC). The bus traffic before and after all three reboots looks alike, so the cause is open. The panel's event history (MEM) for ~12:21 has not been checked yet.
+
+**Change, disarm during the exit delay:** a disarm requested while the panel is arming now sends ENTER ("Back") first, waits for its `KEYPAD_COMMAND` plus 100 ms, then types the code and ENTER. This is the same pattern that made output selection work. Retries re-decide whether the prefix is needed. See `arm_disarm_state_machine.md`.
+
+**Follow-up (2026-10-14, commit `c13b555`):** two disarms from HA during the exit delay:
+
+| Arming (UTC) | Disarm requested | Leading ENTER reply | Result |
+|---|---|---|---|
+| 23:45:43 | +1.3 s | CMD 0x01 | Code + ENTER sent; ENTER's "reply" came only 21 ms after our transmit ended (normal: 70–120 ms), so it is likely a frame that overlapped our ENTER. No disarm. The watchdog retry's leading ENTER (23:45:47.286) was followed 158 ms later by **Disarmed**; 3.0 s in total. |
+| 23:46:02 | +3.5 s | CMD 0x01 | Code + ENTER; **Disarmed** 153 ms after ENTER, first try, 0.9 s in total. ENTER went out 4 ms after the last digit's reply. |
+
+Before the change: 28 s and 5 retries (23:27:24). A pause before the terminal ENTER was considered and not added. The second run's 4 ms gap worked, so the first run's miss looks like a one-off bus overlap of the kind the retry exists for, not a timing requirement.
+
+**Follow-up (2026-10-14): queued output after a disarm.** Two tests, each a gate press while an HA disarm was in progress:
+
+| Disarmed (UTC) | Queued start | Panel reply to OUTPUT | Result |
+|---|---|---|---|
+| 23:48:06.470 | +4 ms | the disarm's own `14.05.15…`; the retry got no reply | **failed**, warning + switch reset |
+| 23:48:57.511 | +31 ms | two `14.05.15…`, then a late `0x1D` ACK; the digit went unconfirmed | **fired** at 23:48:59.265, via the watchdog retry |
+
+Gate presses 6+ s after a disarm (23:49:03, 23:49:07) and a press 5 ms after another *output* sequence (23:49:05.665) were ACKed immediately. The queued start now waits `OUTPUT_SELECT_QUEUE_SETTLE_MS` (1.5 s) after an arm/disarm or zone-bypass sequence resolves, but not after an output sequence.
+
+Side note: the 23:49:05.665 press was HA toggling the Gate switch to "off". The switch still showed ON during the previous ~1.5 s pulse, so a quick second tap sent "off": output selection opened, but nothing fired, which is correct for "off". For repeated taps, use an HA tap action of `switch.turn_on`. ESPHome passes every turn-on through, even while the switch shows ON.
+
+**Follow-up (2026-10-14, with the 1.5 s settle pause, commit `f7988cc`):** three rounds of arm → disarm from HA during the exit delay → gate pressed during the disarm:
+
+| Disarmed (UTC) | Disarm attempts | Queued gate started | OUTPUT ACK | `OUTPUT_STATE [04]` |
+|---|---|---|---|---|
+| 23:58:01.182 | 1 | +1.52 s | first try | 23:58:03.138 |
+| 23:58:22.715 | 1 | +1.55 s | first try | 23:58:24.589 |
+| 23:58:40.897 | 2 (first got CMD 0x07 after ENTER) | +1.52 s | first try | 23:58:42.770 |
+
+- **Queued gate:** 3 of 3 first try, against 0 of 2 before the pause.
+- **Exit-delay disarm since `c13b555`:** 5 of 5, three first try and two after one retry (3.0 s and 3.7 s).
+- **The two retried attempts:** the code's terminal ENTER got CMD 0x07 or nothing. In both, the confirmation for one key came only ~20 ms after our transmit, so a lost key is possible, but the cause is not established.
+- **Transmit timing is not a usable signal:** 78 of 484 archived transmits log `Packet sent` within 5 ms of `Sending packet`, including many in sequences that worked, so the same-millisecond timestamps are a logging artefact rather than a failed send.
+
+**Follow-up (2026-10-14, after the review fixes, commit `cbfade9`):** three more rounds of arm → exit-delay disarm from HA → gate queued during the disarm (UTC):
+
+| Disarmed | Disarm attempts | Queued gate (+~1.5 s) | Panel | User saw |
+|---|---|---|---|---|
+| 00:23:50.402 | 1 | ACK, digit confirmed `14.05.01.00.00…` (selection stayed `00`), ENTER → `14.05.15.00.00…`; `OUTPUT_STATE` stayed `[00]` | did not switch | gate stayed shut |
+| 00:24:04.236 | 1 | ACK → `OUTPUT_STATE [04]` | switched | gate opened |
+| 00:24:18.854 | 2 | ACK → `OUTPUT_STATE [04]` | switched | gate opened |
+
+- **The verification matched the hardware all three times.** The failure logged `output 3 did not switch` and reset the switch. Before verification it would have been reported as `sequence complete`.
+- **Queued gate with the 1.5 s pause:** 5 of 6 first try so far. The miss was the first round after a reboot, and the controller acked every key without selecting the output. Cause unknown. If it recurs, try a longer pause or a leading ENTER after a disarm (the physical keypad wakes with ENTER from the post-entry `0x15` state).
+- **Exit-delay disarm:** 8 of 8 overall, 2 of them needing one retry.
+- **Masking:** all 12 code digits from these disarms logged as `**`. Only the output digit `3` was logged in clear, as intended.
