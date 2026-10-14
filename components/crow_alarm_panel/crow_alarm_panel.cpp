@@ -572,7 +572,9 @@ void CrowAlarmPanel::loop() {
           const bool is_disarmed = (data[0] == 0x00 && data[1] == 0x00);
           if (is_arming || is_armed_away || is_disarmed) {
             const bool is_disarm_request = (this->arm_disarm_state_ == ArmDisarmState::CODE_DIGIT_PENDING ||
-                                            this->arm_disarm_state_ == ArmDisarmState::CODE_ENTER_PENDING) &&
+                                            this->arm_disarm_state_ == ArmDisarmState::CODE_ENTER_PENDING ||
+                                            this->arm_disarm_state_ == ArmDisarmState::CODE_CLEAR_PENDING ||
+                                            this->arm_disarm_state_ == ArmDisarmState::CODE_CLEAR_DELAY) &&
                                            this->arm_disarm_terminal_key_ == KEY_ENTER;
             const bool matches_intent = is_disarm_request ? is_disarmed : (is_arming || is_armed_away);
             if (matches_intent) {
@@ -797,6 +799,18 @@ void CrowAlarmPanel::loop() {
           // send the next digit out of order.
           if (!this->arm_disarm_retry_pending_ && !this->arm_disarm_key_in_flight_) {
             switch (this->arm_disarm_state_) {
+              case ArmDisarmState::CODE_CLEAR_PENDING: {
+                const uint8_t cmd_byte = (data.size() > 1) ? data[1] : 0;
+                // 0x89/0xAA are the controller's own exit-delay screen updates, not a reply.
+                if (cmd_byte == 0x89 || cmd_byte == 0xAA) {
+                  break;
+                }
+                ESP_LOGD(TAG, "Code sequence: ENTER confirmed (CMD 0x%02X), first digit in %u ms", cmd_byte,
+                         (unsigned) CrowAlarmPanelStore::OUTPUT_SELECT_CLEAR_DELAY_MS);
+                this->arm_disarm_state_ = ArmDisarmState::CODE_CLEAR_DELAY;
+                this->arm_disarm_state_enter_ms_ = millis();
+                break;
+              }
               case ArmDisarmState::ARM_AWAY_PENDING:
               case ArmDisarmState::ARM_STAY_PENDING:
                 ESP_LOGD(TAG, "Arm/stay: CMD received, sequence complete");
@@ -1112,6 +1126,18 @@ void CrowAlarmPanel::loop() {
     }
   }
 
+  // Arm/disarm CODE_CLEAR_DELAY: type the first code digit a moment after the leading ENTER's
+  // confirmation. Same gating as the KEYPAD_COMMAND-driven transitions.
+  if (this->arm_disarm_state_ == ArmDisarmState::CODE_CLEAR_DELAY && !this->arm_disarm_retry_pending_ &&
+      !this->arm_disarm_key_in_flight_ &&
+      millis() - this->arm_disarm_state_enter_ms_ >= CrowAlarmPanelStore::OUTPUT_SELECT_CLEAR_DELAY_MS) {
+    // State and index set BEFORE the keypress — it can yield and re-enter loop().
+    this->arm_disarm_code_idx_ = 1;
+    this->arm_disarm_state_ = ArmDisarmState::CODE_DIGIT_PENDING;
+    this->arm_disarm_state_enter_ms_ = millis();
+    this->arm_disarm_keypress_(this->arm_disarm_code_digits_[0]);
+  }
+
   // Arm/disarm watchdog: abort if any non-IDLE state exceeds 1s without progress. See
   // ARM_DISARM_MAX_RETRIES in crow_alarm_panel.h for why retrying here (unlike output-select/
   // zone-bypass above) is safe: intent-matched ARMED_STATE resolution plus generation-token
@@ -1145,12 +1171,12 @@ void CrowAlarmPanel::loop() {
             break;
           case ArmDisarmState::CODE_DIGIT_PENDING:
           case ArmDisarmState::CODE_ENTER_PENDING:
+          case ArmDisarmState::CODE_CLEAR_PENDING:
+          case ArmDisarmState::CODE_CLEAR_DELAY:
             // Restart the whole code+terminal-key sequence from scratch, exactly like a fresh
             // manual retry (proven reliable across every session in arm_disarm_state_machine.md).
-            this->arm_disarm_code_idx_ = 1;
-            this->arm_disarm_state_ = ArmDisarmState::CODE_DIGIT_PENDING;
-            this->arm_disarm_digit_ack_byte_set_ = false;
-            this->arm_disarm_keypress_(this->arm_disarm_code_digits_[0]);
+            // Re-checks the exit delay, so the leading ENTER is added or dropped as it changes.
+            this->begin_code_attempt_();
             break;
           default:
             break;
@@ -1235,15 +1261,30 @@ bool CrowAlarmPanel::start_code_sequence_(const std::string &code, uint8_t termi
   ESP_LOGD(TAG, "Code sequence: %u digits, terminal key 0x%02X",
            this->arm_disarm_code_digits_.size(), terminal_key);
   this->arm_disarm_terminal_key_ = terminal_key;
-  // idx=1 and state set BEFORE keypress — same race-condition prevention as set_output().
+  this->arm_disarm_retry_count_ = 0;
+  this->arm_disarm_retry_pending_ = false;
+  this->begin_code_attempt_();
+  return true;
+}
+
+void CrowAlarmPanel::begin_code_attempt_() {
+  this->arm_disarm_digit_ack_byte_set_ = false;
+  // State (and idx) set BEFORE keypress — same race-condition prevention as set_output().
+  if (this->panel_arming_ && this->arm_disarm_terminal_key_ == KEY_ENTER) {
+    // Disarm during the exit delay: leave the arming screen with ENTER ("Back") first, as the
+    // physical keypad does. ENTER here can at worst submit leftover digits of this same
+    // disarm, which is the intended outcome anyway.
+    ESP_LOGD(TAG, "Code sequence: panel in exit delay, sending ENTER first");
+    this->arm_disarm_code_idx_ = 0;
+    this->arm_disarm_state_ = ArmDisarmState::CODE_CLEAR_PENDING;
+    this->arm_disarm_state_enter_ms_ = millis();
+    this->arm_disarm_keypress_(KEY_ENTER);
+    return;
+  }
   this->arm_disarm_code_idx_ = 1;
   this->arm_disarm_state_ = ArmDisarmState::CODE_DIGIT_PENDING;
   this->arm_disarm_state_enter_ms_ = millis();
-  this->arm_disarm_retry_count_ = 0;
-  this->arm_disarm_retry_pending_ = false;
-  this->arm_disarm_digit_ack_byte_set_ = false;
   this->arm_disarm_keypress_(this->arm_disarm_code_digits_[0]);
-  return true;
 }
 
 bool CrowAlarmPanel::arm_away(const std::string &code) {

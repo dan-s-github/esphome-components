@@ -94,6 +94,14 @@ enum class ArmDisarmState : uint8_t {
   // to IDLE via the independent ARMED_STATE broadcast (ground truth) or the shared 1s watchdog
   // timing out (treated as failure). See arm_disarm_state_machine.md.
   CODE_ENTER_PENDING,
+  // Disarm during the exit delay only: sent a leading ENTER ("Back" from the arming screen),
+  // waiting for its KEYPAD_COMMAND. Typed straight onto the arming screen, the code's terminal
+  // ENTER got CMD 0x07 and no disarm, 5 times in a row (2026-10-14). Appended last so the
+  // state numbers in existing "timeout in state N" log lines keep their meaning.
+  CODE_CLEAR_PENDING,
+  // Leading ENTER confirmed; waiting OUTPUT_SELECT_CLEAR_DELAY_MS before the first code digit
+  // (same pause the output-select path needs before OUTPUT).
+  CODE_CLEAR_DELAY,
 };
 
 // BYPASS → zone digit(s) → ENTER. TRACE-VERIFIED (see docs/zone_bypass_state_machine.md):
@@ -350,6 +358,9 @@ class CrowAlarmPanel : public Component {
   bool wait_for_bus_idle_();
   void transmit_packet_(uint8_t type, const std::vector<uint8_t> &data);
   bool start_code_sequence_(const std::string &code, uint8_t terminal_key);
+  // Starts (or restarts, on retry) the code+terminal-key attempt: with a leading ENTER for a
+  // disarm during the exit delay, else straight from the first digit.
+  void begin_code_attempt_();
   // keypress() variant for the arm/disarm state machine only: suppresses the transmit if the
   // sequence resolved while waiting for bus idle (see arm_disarm_generation_).
   void arm_disarm_keypress_(uint8_t key);

@@ -254,6 +254,10 @@ See `protocol_investigations.md`, "Outputs during the exit delay (2026-10-14)".
 - **Disarm:** a press during an arm/disarm is queued and runs as soon as that finishes
   (dropped if it's still waiting after 10 s).
 
+Disarming from Home Assistant during the exit delay hit the same arming screen. The code
+was accepted key by key, but the disarm only went through after the delay ended, ~28 s and 5
+retries later (2026-10-14). Newer firmware presses "Back" before typing the code there too.
+
 ---
 
 ## Mains / battery fault sensors

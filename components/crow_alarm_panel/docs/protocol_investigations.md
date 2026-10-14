@@ -1231,3 +1231,14 @@ See `output_select_state_machine.md`.
 The user confirmed the gate physically responded to all three pulses (open, stop, close — the gate controller steps through its cycle per pulse). 3 of 3, against 0 of 3 before the change (2 with no ENTER, 1 with the ENTER but only a 7 ms gap). This confirms the inference above: during the exit delay output selection needs ENTER ("Back") first, plus a short pause before OUTPUT. 100 ms works; the minimum gap was not measured.
 
 **Separate observation:** the device has now been OTA-rebooted three times today (10:56, 12:21 and 12:33 NZDT). The user heard the external siren for a few seconds only around 12:21. It is not in the log, because that window falls in the device's own reboot gap (`OUTPUT_STATE` reports missing 23:20:59 → 23:21:21 UTC). The bus traffic before and after all three reboots looks alike, so the cause is open. The panel's event history (MEM) for ~12:21 has not been checked yet.
+
+**Change, disarm during the exit delay:** a disarm requested while the panel is arming now sends ENTER ("Back") first, waits for its `KEYPAD_COMMAND` plus 100 ms, then types the code and ENTER. This is the same pattern that made output selection work. Retries re-decide whether the prefix is needed. See `arm_disarm_state_machine.md`.
+
+**Follow-up (2026-10-14, commit `c13b555`):** two disarms from HA during the exit delay:
+
+| Arming (UTC) | Disarm requested | Leading ENTER reply | Result |
+|---|---|---|---|
+| 23:45:43 | +1.3 s | CMD 0x01 | Code + ENTER sent; ENTER's "reply" came only 21 ms after our transmit ended (normal: 70–120 ms), so it is likely a frame that overlapped our ENTER. No disarm. The watchdog retry's leading ENTER (23:45:47.286) was followed 158 ms later by **Disarmed**; 3.0 s in total. |
+| 23:46:02 | +3.5 s | CMD 0x01 | Code + ENTER; **Disarmed** 153 ms after ENTER, first try, 0.9 s in total. ENTER went out 4 ms after the last digit's reply. |
+
+Before the change: 28 s and 5 retries (23:27:24). A pause before the terminal ENTER was considered and not added. The second run's 4 ms gap worked, so the first run's miss looks like a one-off bus overlap of the kind the retry exists for, not a timing requirement.
