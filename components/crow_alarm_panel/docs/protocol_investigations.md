@@ -1242,3 +1242,27 @@ The user confirmed the gate physically responded to all three pulses (open, stop
 | 23:46:02 | +3.5 s | CMD 0x01 | Code + ENTER; **Disarmed** 153 ms after ENTER, first try, 0.9 s in total. ENTER went out 4 ms after the last digit's reply. |
 
 Before the change: 28 s and 5 retries (23:27:24). A pause before the terminal ENTER was considered and not added. The second run's 4 ms gap worked, so the first run's miss looks like a one-off bus overlap of the kind the retry exists for, not a timing requirement.
+
+**Follow-up (2026-10-14): queued output after a disarm.** Two tests, each a gate press while an HA disarm was in progress:
+
+| Disarmed (UTC) | Queued start | Panel reply to OUTPUT | Result |
+|---|---|---|---|
+| 23:48:06.470 | +4 ms | the disarm's own `14.05.15…`; the retry got no reply | **failed**, warning + switch reset |
+| 23:48:57.511 | +31 ms | two `14.05.15…`, then a late `0x1D` ACK; the digit went unconfirmed | **fired** at 23:48:59.265, via the watchdog retry |
+
+Gate presses 6+ s after a disarm (23:49:03, 23:49:07) and a press 5 ms after another *output* sequence (23:49:05.665) were ACKed immediately. The queued start now waits `OUTPUT_SELECT_QUEUE_SETTLE_MS` (1.5 s) after an arm/disarm or zone-bypass sequence resolves, but not after an output sequence.
+
+Side note: the 23:49:05.665 press was HA toggling the Gate switch to "off". The switch still showed ON during the previous ~1.5 s pulse, so a quick second tap sent "off": output selection opened, but nothing fired, which is correct for "off". For repeated taps, use an HA tap action of `switch.turn_on`. ESPHome passes every turn-on through, even while the switch shows ON.
+
+**Follow-up (2026-10-14, with the 1.5 s settle pause, commit `f7988cc`):** three rounds of arm → disarm from HA during the exit delay → gate pressed during the disarm:
+
+| Disarmed (UTC) | Disarm attempts | Queued gate started | OUTPUT ACK | `OUTPUT_STATE [04]` |
+|---|---|---|---|---|
+| 23:58:01.182 | 1 | +1.52 s | first try | 23:58:03.138 |
+| 23:58:22.715 | 1 | +1.55 s | first try | 23:58:24.589 |
+| 23:58:40.897 | 2 (first got CMD 0x07 after ENTER) | +1.52 s | first try | 23:58:42.770 |
+
+- **Queued gate:** 3 of 3 first try, against 0 of 2 before the pause.
+- **Exit-delay disarm since `c13b555`:** 5 of 5, three first try and two after one retry (3.0 s and 3.7 s).
+- **The two retried attempts:** the code's terminal ENTER got CMD 0x07 or nothing. In both, the confirmation for one key came only ~20 ms after our transmit, so a lost key is possible, but the cause is not established.
+- **Transmit timing is not a usable signal:** 78 of 484 archived transmits log `Packet sent` within 5 ms of `Sending packet`, including many in sequences that worked, so the same-millisecond timestamps are a logging artefact rather than a failed send.

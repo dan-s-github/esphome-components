@@ -13,8 +13,10 @@ Enum: `OutputSelectState` (`crow_alarm_panel.h`). Numbers in `timeout in state N
 ```
 IDLE
 ├─ on set_output(n) while another keypress sequence runs (arm/disarm, zone bypass, output)
-│  └─> stays IDLE; request queued (one slot, newest wins), started once all machines are
-│      idle, dropped after OUTPUT_SELECT_QUEUE_TIMEOUT_MS (10 s)
+│  └─> stays IDLE; request queued (one slot, newest wins; a press while one is queued
+│      replaces it). Started once all machines are idle — after a further
+│      OUTPUT_SELECT_QUEUE_SETTLE_MS (1.5 s) if it waited behind an arm/disarm or zone
+│      bypass — and dropped after OUTPUT_SELECT_QUEUE_TIMEOUT_MS (10 s)
 ├─ on set_output(n), panel in exit delay (last ARMED_STATE = Arming)
 │  └─> CLEAR_PENDING (digit(s) pre-stored; KEY_ENTER sent)
 ├─ on set_output(n), otherwise

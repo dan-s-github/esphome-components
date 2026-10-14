@@ -210,6 +210,13 @@ class CrowAlarmPanelStore {
   // disarm with retries; short enough that a gate/garage doesn't fire unexpectedly late.
   static const uint32_t OUTPUT_SELECT_QUEUE_TIMEOUT_MS = 10000;
 
+  // Pause between an arm/disarm (or zone-bypass) sequence resolving and starting an output
+  // request queued behind it. Started within ~1 s of a disarm, OUTPUT got the disarm's own
+  // KEYPAD_COMMAND [15] replies and a late or missing 0x1D ACK (2026-10-14: one failure, one
+  // success only via the watchdog retry); presses 6+ s after a disarm worked first try.
+  // Not applied after another output sequence, which needed no pause.
+  static const uint32_t OUTPUT_SELECT_QUEUE_SETTLE_MS = 1500;
+
   // Raw bit trace (diagnostic): batches every clock-sampled DAT bit that reaches the
   // frame boundary-search logic (i.e. after glitch filtering, same bits that feed
   // boundary_buffer_) into a fixed-size string and hands it to loop() once full.
@@ -421,6 +428,11 @@ class CrowAlarmPanel : public Component {
   uint8_t output_queue_number_{0};
   bool output_queue_state_{false};
   uint32_t output_queue_ms_{0};
+  // Set while the queued request waits behind an arm/disarm or zone-bypass sequence, so its
+  // start is delayed by OUTPUT_SELECT_QUEUE_SETTLE_MS after the machines go idle.
+  bool output_queue_wait_settle_{false};
+  bool output_queue_idle_seen_{false};
+  uint32_t output_queue_idle_ms_{0};
 
   // Zone-bypass state machine. The panel toggles bypass per BYPASS/digits/ENTER sequence,
   // so the switch state is only published from ZONE_STATE bypass-bitmap broadcasts, never

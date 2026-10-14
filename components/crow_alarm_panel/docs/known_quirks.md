@@ -251,7 +251,7 @@ See `protocol_investigations.md`, "Outputs during the exit delay (2026-10-14)".
 
 **What to do:** nothing with newer firmware.
 - **Exit delay:** the component presses "Back" first.
-- **Disarm:** a press during an arm/disarm is queued and runs as soon as that finishes
+- **Disarm:** a press during an arm/disarm is queued and runs 1.5 s after that finishes
   (dropped if it's still waiting after 10 s).
 
 Disarming from Home Assistant during the exit delay hit the same arming screen. The code

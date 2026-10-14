@@ -1100,13 +1100,26 @@ void CrowAlarmPanel::loop() {
                this->output_queue_number_, ONOFF(this->output_queue_state_),
                (unsigned) CrowAlarmPanelStore::OUTPUT_SELECT_QUEUE_TIMEOUT_MS);
       this->output_queue_pending_ = false;
+      this->output_queue_wait_settle_ = false;
       this->publish_output_actual_(this->output_queue_number_);
-    } else if (this->output_select_state_ == OutputSelectState::IDLE &&
-               this->arm_disarm_state_ == ArmDisarmState::IDLE &&
-               this->zone_bypass_state_ == ZoneBypassState::IDLE) {
-      this->output_queue_pending_ = false;
-      ESP_LOGD(TAG, "Output-select: starting queued request for output %u", this->output_queue_number_);
-      this->start_output_select_(this->output_queue_number_, this->output_queue_state_);
+    } else if (this->arm_disarm_state_ != ArmDisarmState::IDLE ||
+               this->zone_bypass_state_ != ZoneBypassState::IDLE) {
+      this->output_queue_wait_settle_ = true;
+      this->output_queue_idle_seen_ = false;
+    } else if (this->output_select_state_ != OutputSelectState::IDLE) {
+      this->output_queue_idle_seen_ = false;
+    } else {
+      if (!this->output_queue_idle_seen_) {
+        this->output_queue_idle_seen_ = true;
+        this->output_queue_idle_ms_ = millis();
+      }
+      if (!this->output_queue_wait_settle_ ||
+          millis() - this->output_queue_idle_ms_ >= CrowAlarmPanelStore::OUTPUT_SELECT_QUEUE_SETTLE_MS) {
+        this->output_queue_pending_ = false;
+        this->output_queue_wait_settle_ = false;
+        ESP_LOGD(TAG, "Output-select: starting queued request for output %u", this->output_queue_number_);
+        this->start_output_select_(this->output_queue_number_, this->output_queue_state_);
+      }
     }
   }
 
@@ -1409,9 +1422,11 @@ bool CrowAlarmPanel::set_output(uint8_t output, bool state) {
   // two at once would double-consume confirmations. Instead of dropping the request (a gate
   // pressed during a disarm used to be lost), hold it until they're idle — loop() starts it.
   // arm_disarm_state_ stays non-IDLE for the whole multi-second retry-backoff envelope.
+  // A request already queued (e.g. still in its settle pause) counts as busy too, so a new
+  // press replaces it instead of starting alongside it and firing the output twice.
   if (this->output_select_state_ != OutputSelectState::IDLE ||
       this->arm_disarm_state_ != ArmDisarmState::IDLE ||
-      this->zone_bypass_state_ != ZoneBypassState::IDLE) {
+      this->zone_bypass_state_ != ZoneBypassState::IDLE || this->output_queue_pending_) {
     if (this->output_queue_pending_) {
       ESP_LOGW(TAG, "set_output(%u, %s): replaces queued set_output(%u, %s)", output, ONOFF(state),
                this->output_queue_number_, ONOFF(this->output_queue_state_));
@@ -1421,11 +1436,16 @@ bool CrowAlarmPanel::set_output(uint8_t output, bool state) {
       }
     } else {
       ESP_LOGI(TAG, "set_output(%u, %s): another keypress sequence in progress, queued", output, ONOFF(state));
+      this->output_queue_idle_seen_ = false;
     }
     this->output_queue_pending_ = true;
     this->output_queue_number_ = output;
     this->output_queue_state_ = state;
     this->output_queue_ms_ = millis();
+    // Keep a settle pause already owed by the request being replaced.
+    this->output_queue_wait_settle_ = this->output_queue_wait_settle_ ||
+                                      this->arm_disarm_state_ != ArmDisarmState::IDLE ||
+                                      this->zone_bypass_state_ != ZoneBypassState::IDLE;
     return true;
   }
   this->start_output_select_(output, state);
