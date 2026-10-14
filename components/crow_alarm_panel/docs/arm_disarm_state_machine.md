@@ -74,7 +74,7 @@ IDLE
 │  └─> ARM_AWAY_PENDING / ARM_STAY_PENDING (single keypress sent)
 ├─ on arm_away(code) / arm_stay(code) with non-empty code
 │  └─> CODE_DIGIT_PENDING (first digit sent immediately)
-├─ on disarm(code), panel in exit delay (last ARMED_STATE = Arming)
+├─ on disarm(code), panel in exit delay (last ARMED_STATE = Arming, under 5 min ago)
 │  └─> CODE_CLEAR_PENDING (KEY_ENTER sent — "Back" from the arming screen)
 ├─ on disarm(code), otherwise
 │  └─> CODE_DIGIT_PENDING (first digit sent immediately)

@@ -1266,3 +1266,16 @@ Side note: the 23:49:05.665 press was HA toggling the Gate switch to "off". The 
 - **Exit-delay disarm since `c13b555`:** 5 of 5, three first try and two after one retry (3.0 s and 3.7 s).
 - **The two retried attempts:** the code's terminal ENTER got CMD 0x07 or nothing. In both, the confirmation for one key came only ~20 ms after our transmit, so a lost key is possible, but the cause is not established.
 - **Transmit timing is not a usable signal:** 78 of 484 archived transmits log `Packet sent` within 5 ms of `Sending packet`, including many in sequences that worked, so the same-millisecond timestamps are a logging artefact rather than a failed send.
+
+**Follow-up (2026-10-14, after the review fixes, commit `cbfade9`):** three more rounds of arm → exit-delay disarm from HA → gate queued during the disarm (UTC):
+
+| Disarmed | Disarm attempts | Queued gate (+~1.5 s) | Panel | User saw |
+|---|---|---|---|---|
+| 00:23:50.402 | 1 | ACK, digit confirmed `14.05.01.00.00…` (selection stayed `00`), ENTER → `14.05.15.00.00…`; `OUTPUT_STATE` stayed `[00]` | did not switch | gate stayed shut |
+| 00:24:04.236 | 1 | ACK → `OUTPUT_STATE [04]` | switched | gate opened |
+| 00:24:18.854 | 2 | ACK → `OUTPUT_STATE [04]` | switched | gate opened |
+
+- **The verification matched the hardware all three times.** The failure logged `output 3 did not switch` and reset the switch. Before verification it would have been reported as `sequence complete`.
+- **Queued gate with the 1.5 s pause:** 5 of 6 first try so far. The miss was the first round after a reboot, and the controller acked every key without selecting the output. Cause unknown. If it recurs, try a longer pause or a leading ENTER after a disarm (the physical keypad wakes with ENTER from the post-entry `0x15` state).
+- **Exit-delay disarm:** 8 of 8 overall, 2 of them needing one retry.
+- **Masking:** all 12 code digits from these disarms logged as `**`. Only the output digit `3` was logged in clear, as intended.

@@ -411,13 +411,25 @@ void CrowAlarmPanel::loop() {
                    this->keypad_label_width_, CONTROLLER_LABEL, data[1], data[2]);
         }
 
-        const uint8_t reading = (trouble_current ? 0x01 : 0x00) | (trouble_latched ? 0x02 : 0x00);
-        if (reading != this->last_trouble_reading_) {
-          this->last_trouble_reading_ = reading;
-          break;
+        // `trouble`: same single-frame rule as the supply faults. A short fault in a quiet
+        // period can arrive as one frame followed by the restore frame, so a two-frame debounce
+        // could never publish it. data[0] bit 7 and flags bit 2 are independent indicators that
+        // agreed in every archived frame (231 set, none mixed), so publish when they agree and
+        // drop a frame where they don't.
+        const bool fault_bit_addr = (data[0] & 0x80) != 0;
+        const bool fault_bit_flags = (data[2] & 0x04) != 0;
+        if (fault_bit_addr == fault_bit_flags) {
+          if (this->trouble_ != nullptr) {
+            this->trouble_->publish_state(trouble_current);
+          }
+        } else {
+          ESP_LOGW(TAG, "[%-*s] Controller status: fault bits disagree (b0=0x%02X flags=0x%02X), ignoring",
+                   this->keypad_label_width_, CONTROLLER_LABEL, data[0], data[2]);
         }
-        if (this->trouble_ != nullptr) {
-          this->trouble_->publish_state(trouble_current);
+        const uint8_t latched_reading = trouble_latched ? 0x01 : 0x00;
+        if (latched_reading != this->last_trouble_latched_reading_) {
+          this->last_trouble_latched_reading_ = latched_reading;
+          break;
         }
         if (this->trouble_latched_ != nullptr) {
           this->trouble_latched_->publish_state(trouble_latched);
@@ -529,6 +541,7 @@ void CrowAlarmPanel::loop() {
           ESP_LOGD(TAG, "[%-*s] Arming [%02x.%s]", this->keypad_label_width_, CONTROLLER_LABEL, type,
                    format_hex_pretty(data).c_str());
           this->panel_arming_ = true;
+          this->panel_arming_since_ms_ = millis();
           this->last_confirmed_acp_state_ = alarm_control_panel::ACP_STATE_ARMING;
           if (this->alarm_control_panel_ != nullptr) {
             this->alarm_control_panel_->publish_state(alarm_control_panel::ACP_STATE_ARMING);
@@ -558,6 +571,9 @@ void CrowAlarmPanel::loop() {
         } else {
           ESP_LOGD(TAG, "[%-*s] Armed state unknown [%02x.%s]", this->keypad_label_width_, CONTROLLER_LABEL, type,
                    format_hex_pretty(data).c_str());
+          // Any state other than Arming ends the exit delay (e.g. a never-captured Armed Stay
+          // pattern); leaving the flag set would prefix ENTER on an armed panel.
+          this->panel_arming_ = false;
         }
         // ARMED_STATE is the controller's own authoritative state broadcast, independent of the
         // arm/disarm state machine — this is the only signal treated as proof of success (see the
@@ -635,6 +651,7 @@ void CrowAlarmPanel::loop() {
         }
         if (key > 9) {
           this->keypad_last_command_key_[data[0] & 0x7F] = key;
+          this->keypad_last_command_ms_[data[0] & 0x7F] = millis();
         }
         break;
       }
@@ -1297,7 +1314,7 @@ bool CrowAlarmPanel::start_code_sequence_(const std::string &code, uint8_t termi
 void CrowAlarmPanel::begin_code_attempt_() {
   this->arm_disarm_digit_ack_byte_set_ = false;
   // State (and idx) set BEFORE keypress — same race-condition prevention as set_output().
-  if (this->panel_arming_ && this->arm_disarm_terminal_key_ == KEY_ENTER) {
+  if (this->in_exit_delay_() && this->arm_disarm_terminal_key_ == KEY_ENTER) {
     // Disarm during the exit delay: leave the arming screen with ENTER ("Back") first, as the
     // physical keypad does. ENTER here can at worst submit leftover digits of this same
     // disarm, which is the intended outcome anyway.
@@ -1415,7 +1432,11 @@ void CrowAlarmPanel::arm_disarm_keypress_(uint8_t key) {
     return;
   }
   if (gen != this->arm_disarm_generation_) {
-    ESP_LOGD(TAG, "Arm/disarm: sequence resolved during bus-idle wait, suppressing key 0x%02X", key);
+    if (key <= 9) {
+      ESP_LOGD(TAG, "Arm/disarm: sequence resolved during bus-idle wait, suppressing code digit");
+    } else {
+      ESP_LOGD(TAG, "Arm/disarm: sequence resolved during bus-idle wait, suppressing key 0x%02X", key);
+    }
     this->arm_disarm_key_in_flight_ = false;
     return;
   }
@@ -1489,7 +1510,7 @@ void CrowAlarmPanel::begin_output_select_attempt_() {
   // Set state BEFORE the keypress call. send_packet() uses delay()/yield() internally
   // which re-enters loop(). If the reply arrives during that yield, loop() must already
   // see the state that expects it.
-  if (this->panel_arming_) {
+  if (this->in_exit_delay_()) {
     // During the exit delay the controller has every keypad on its arming screen and acks
     // OUTPUT/digit/ENTER without selecting the output. A physical keypad leaves that screen
     // with ENTER ("Back") first. Only sent in the exit delay: elsewhere ENTER would submit
@@ -1649,7 +1670,14 @@ bool CrowAlarmPanel::keypress_is_masked_(const std::vector<uint8_t> &data) const
     return false;
   }
   const uint8_t context = this->keypad_last_command_key_[data[0] & 0x7F];
-  return context != KEY_OUTPUT && context != KEY_BYPASS;
+  if (context != KEY_OUTPUT && context != KEY_BYPASS) {
+    return true;
+  }
+  return millis() - this->keypad_last_command_ms_[data[0] & 0x7F] > KEYPAD_SELECTION_WINDOW_MS;
+}
+
+bool CrowAlarmPanel::in_exit_delay_() const {
+  return this->panel_arming_ && millis() - this->panel_arming_since_ms_ < PANEL_ARMING_MAX_MS;
 }
 
 bool CrowAlarmPanel::is_bus_idle_() {

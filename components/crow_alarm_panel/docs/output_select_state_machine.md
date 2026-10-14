@@ -17,7 +17,7 @@ IDLE
 │      replaces it). Started once all machines are idle — after a further
 │      OUTPUT_SELECT_QUEUE_SETTLE_MS (1.5 s) if it waited behind an arm/disarm or zone
 │      bypass — and dropped after OUTPUT_SELECT_QUEUE_TIMEOUT_MS (10 s)
-├─ on set_output(n), panel in exit delay (last ARMED_STATE = Arming)
+├─ on set_output(n), panel in exit delay (last ARMED_STATE = Arming, under 5 min ago)
 │  └─> CLEAR_PENDING (digit(s) pre-stored; KEY_ENTER sent)
 ├─ on set_output(n), otherwise
 │  └─> OUTPUT_PENDING (digit(s) pre-stored; KEY_OUTPUT sent)
@@ -78,7 +78,7 @@ They are emitted **one per `KEYPAD_COMMAND`** received — not all at once and n
 2. **Each keypress is acknowledged:** Each digit and ENTER waits for a Command(0x14) response before allowing the next
 3. **Timeout recovery:** Each state has a 1 s no-progress watchdog; the pre-fire states get one automatic retry
 4. **One keypress sequence at a time, requests queued:** All three state machines (output, arm/disarm, zone bypass) consume the same Command frames, so only one runs at a time. A `set_output()` that arrives while another is running is held in a one-slot queue rather than dropped.
-5. **Exit delay needs a leading ENTER:** During the exit delay the controller puts every keypad on its arming screen (`KEYPAD_COMMAND` 0x89, later 0xAA). An OUTPUT → digit → ENTER sent from there is acked key by key but never selects the output. A physical keypad leaves the screen with ENTER ("Back"), and so does this machine. Outside the exit delay no ENTER is prefixed: ENTER submits whatever the controller has buffered for this keypad, and leftover code digits from an aborted arm/disarm plus ENTER is the arm/disarm-with-code gesture. See `protocol_investigations.md`, "Outputs during the exit delay (2026-10-14)".
+5. **Exit delay needs a leading ENTER.** "In the exit delay" means the last `ARMED_STATE` was Arming. Any other state, including an unrecognised pattern, ends it, and so does a 5-minute cap (`PANEL_ARMING_MAX_MS`), so a lost Armed broadcast can't leave later requests sending ENTER on an armed panel. During the exit delay the controller puts every keypad on its arming screen (`KEYPAD_COMMAND` 0x89, later 0xAA). An OUTPUT → digit → ENTER sent from there is acked key by key but never selects the output. A physical keypad leaves the screen with ENTER ("Back"), and so does this machine. Outside the exit delay no ENTER is prefixed: ENTER submits whatever the controller has buffered for this keypad, and leftover code digits from an aborted arm/disarm plus ENTER is the arm/disarm-with-code gesture. See `protocol_investigations.md`, "Outputs during the exit delay (2026-10-14)".
 6. **Success is verified, not assumed:** see Verification above.
 
 ## Mapping to Current Code

@@ -427,6 +427,11 @@ class CrowAlarmPanel : public Component {
   // The controller puts every keypad on its arming screen then (KEYPAD_COMMAND 0x89) and
   // ignores an output selection unless ENTER ("Back") is pressed first.
   bool panel_arming_{false};
+  uint32_t panel_arming_since_ms_{0};
+  // Cap on how long panel_arming_ is trusted without a closing ARMED_STATE: longer than any
+  // exit delay, so a lost "Armed" broadcast can't leave every later output/disarm sending a
+  // leading ENTER on an armed panel.
+  static const uint32_t PANEL_ARMING_MAX_MS = 300000;
   // One set_output() request held while another keypress sequence runs, started when all three
   // state machines are idle (newest request wins).
   bool output_queue_pending_{false};
@@ -515,10 +520,11 @@ class CrowAlarmPanel : public Component {
   binary_sensor::BinarySensor *trouble_latched_{nullptr};
   binary_sensor::BinarySensor *mains_fault_{nullptr};
   binary_sensor::BinarySensor *battery_fault_{nullptr};
-  // Fault bits from the previous CONTROLLER_STATUS (bit 0 = current, bit 1 = latched;
-  // 0xFF = none seen yet). The trouble sensors publish only once two consecutive frames agree,
-  // so a single-bit receive glitch can't toggle them.
-  uint8_t last_trouble_reading_{0xFF};
+  // Latch bit (data[3] bit 2) from the previous CONTROLLER_STATUS (0xFF = none seen yet).
+  // trouble_latched publishes only once two consecutive frames agree: it is a single bit (data[3]
+  // has glitched to 0x10 twice in the archive) and the latch persists until the fault is viewed,
+  // so the wait costs nothing. `trouble` doesn't use this — see the CONTROLLER_STATUS handler.
+  uint8_t last_trouble_latched_reading_{0xFF};
   alarm_control_panel::AlarmControlPanel *alarm_control_panel_{nullptr};
   // Last non-optimistic published ACP state — set from the controller's own ARMED_STATE
   // broadcasts (controller-confirmed), and also from heuristic zone-activity publishes (zone
@@ -537,8 +543,15 @@ class CrowAlarmPanel : public Component {
   // Longest configured keypad label, computed once in setup(); pads the "[label]" prefix in
   // log messages so the text after it lines up regardless of which keypad is logging.
   uint8_t keypad_label_width_{0};
-  // Last non-digit key seen from each keypad address (0 = none yet), for keypress_is_masked_().
+  // Last non-digit key seen from each keypad address (0 = none yet) and when, for
+  // keypress_is_masked_(). OUTPUT/BYPASS only unmask digits for KEYPAD_SELECTION_WINDOW_MS, so
+  // an abandoned selection can't expose a code typed later on that keypad.
   uint8_t keypad_last_command_key_[0x80]{};
+  uint32_t keypad_last_command_ms_[0x80]{};
+  static const uint32_t KEYPAD_SELECTION_WINDOW_MS = 10000;
+  // True while the controller's last ARMED_STATE was "Arming" and PANEL_ARMING_MAX_MS hasn't
+  // passed — the exit delay, during which output selection and disarm need a leading ENTER.
+  bool in_exit_delay_() const;
 };
 
 // Bypass toggle switch created by the parent's `zones:` config. Lives here (not in switch/)
