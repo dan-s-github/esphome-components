@@ -62,8 +62,13 @@ above look similar but corruption proximity was specifically tested as a cause t
 ruled out by counter-examples — this output-select mechanism is confirmed, arm/disarm's
 isn't.)
 
-**What to do:** nothing — the output still ends up in the correct state. Only worth
-reporting if an output-select sequence ever fails outright rather than retrying through.
+**What to do:** usually nothing. One case on 2026-10-14 did fail outright: the panel
+missed a digit confirmation, the retry went through the "recovering" path, and the garage
+door never switched although the log said `sequence complete`. Newer firmware checks that
+the panel actually reported the output switching. If it didn't, you'll see
+`Output-select: output N did not switch …` and the switch returns to its real state; press it
+again. The component doesn't re-send by itself, because a re-send that crosses a lost
+confirmation could pulse the output twice.
 
 ---
 
@@ -224,6 +229,30 @@ keypad or arms the system. What causes the interference isn't known (see
 **What to do:** nothing required — press an RF remote button (or wait for the next use) and
 view/clear the fault on the keypad. Alarm state and entities are unaffected. If it starts
 happening often, check for a new radio source near the panel.
+
+---
+
+## Gate / garage pressed during an arm or disarm
+
+**What you'll see (older firmware):**
+- **During an arm:** pressing an output switch (gate, garage) during the exit delay
+  appeared to work. The switch flicked on and back off, but nothing happened.
+- **During a disarm:** a press while the disarm code was still being entered was rejected
+  with `set_output(N, on): another keypress sequence in progress, ignoring`.
+
+**Cause:**
+- **Exit delay:** the panel puts every keypad on its arming screen. From there it accepts
+  the output keys but doesn't act on them until the keypad presses "Back" (ENTER), which is
+  what you do on the touch keypad before pressing the gate button. RF remotes aren't
+  affected.
+- **Disarm:** only one key sequence can be typed at a time.
+
+See `protocol_investigations.md`, "Outputs during the exit delay (2026-10-14)".
+
+**What to do:** nothing with newer firmware.
+- **Exit delay:** the component presses "Back" first.
+- **Disarm:** a press during an arm/disarm is queued and runs as soon as that finishes
+  (dropped if it's still waiting after 10 s).
 
 ---
 

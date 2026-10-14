@@ -1156,3 +1156,78 @@ The user simulated a mains power failure and then a backup-battery failure at th
 - Each fault produced exactly one status frame, with no zone activity to add more. This is the single-frame case the new sensors were designed for; a two-frame debounce would have published neither.
 
 **Next:** check this against a real mains outage once the logger has one, try a longer simulated outage to see whether a long fault ever latches, and watch for `b1=0x01` whenever the keypad shows `BATT` for a genuinely low battery.
+
+## Outputs during the exit delay (2026-10-14) — the arming screen swallows output selection unless ENTER ("Back") comes first
+
+The user reported that the gate didn't open when pressed from Home Assistant during an arm, and that the garage door failed around a disarm. Capture: frigate long-term logger, 2026-10-13 UTC (2026-10-14 NZDT).
+
+**Observed facts:**
+
+ESPHome keypad (`0x05`), arm at 20:03:22 UTC, exit delay "Arming" 20:03:23 → "Armed Away" 20:03:51:
+
+| Gate (output 3) request | Keys acked? | `KEYPAD_COMMAND` after the digit | `OUTPUT_STATE` | Fired |
+|---|---|---|---|---|
+| 20:03:35 (exit delay) | OUTPUT → ACK, `3`, ENTER all acked | `14.05.01.00.00.01.80` | stays `00` | no |
+| 20:03:44 (exit delay) | same | `14.05.01.00.00.01.80` | stays `00` | no |
+| 20:03:57 (armed) | same | `14.05.01.00.04.01.80` | `[04]` | yes |
+
+The component logged `Output-select: sequence complete` for all three.
+
+- **RF remotes work during the exit delay:** over the 30-day archive (2026-09-14 → 2026-10-14), the gate fired during an exit delay 11 times, each ~100 ms after an `[RF Remote 90:00:36]` gate-button `0x7C` frame. That's 11 of 11.
+- **The physical AAP keypad works during the exit delay too.** The user tested arm → return → garage → disarm at 22:20 UTC:
+  - Arming 22:20:11.800.
+  - Garage: `ENTER`, then `OUTPUT` → ACK `1d.00…` → `4` → `14.00.01.00.08…` and `OUTPUT_STATE [08]` at 22:20:16.439.
+  - Then `ENTER` + `ARM` → Disarmed at 22:20:18.108; the ARM key cancels the exit delay without a code.
+  - The only difference from the failed ESPHome attempts is the `ENTER` before `OUTPUT`. The user explained that this is the touch keypad's screen tap: when idle it wakes the screen, and during the exit delay it is "Back" from the arming screen to the home screen with the gate/garage buttons. Every `ARM`/`OUTPUT` from the AAP keypad in the archive is preceded by `ENTER` (24/24). The gaps between keys on the bus (0–360 ms) are presumably set by the keypad's polling, not by tapping speed.
+- **At "Arming" the controller sends every keypad `KEYPAD_COMMAND` 0x89** (`14.00.89…`, `14.05.89…`, `14.06.89…`), and near the end of the delay 0xAA (20:03:47).
+- **The controller answers `ENTER` with a `KEYPAD_COMMAND` to that keypad** in 59 of 60 archived AAP presses (median 101 ms, max 396 ms). The command byte depends on the previous one:
+  - 0x89 → 0x01 (1 sample, the test above)
+  - 0x04 → 0x01 (11)
+  - 0x15 → 0x01 (11) or 0x15 (1)
+  - 0x01 → 0x15 (26) or 0x01 (8); from mid-entry, ENTER mostly *submits*
+- **`KEYPAD_COMMAND` data[3] is the keypad's selected-output bitmap, not live output state.** It reads `00` right after OUTPUT is accepted and gets the output's bit when the digit is accepted. Outside a sequence it keeps the last selection: `14.05.89.00.08…` and `…04…` at arming, with nothing firing.
+- **During the disarm at 21:26 UTC, the component itself dropped two gate requests** (`set_output(3, on): another keypress sequence in progress, ignoring`) while the arm/disarm machine was retrying. They never reached the panel.
+- **The garage failure at 21:26:55 UTC came ~46 s after that disarm had completed.** OUTPUT was acked, but digit `4` got no confirmation. The retry's OUTPUT got `14.05.07…` instead of an ACK, and the "recovering" path re-sent `4` and ENTER. Data[3] stayed `00`, `OUTPUT_STATE` stayed `00`, and the log said `sequence complete`.
+
+**Inference (medium confidence — 2 failures and 1 success during the exit delay, consistent with 11/11 RF and the user's description of the keypad UI):** the controller tracks each keypad's screen. During the exit delay it holds keypads on the arming screen (0x89). Key presses there are acknowledged, but OUTPUT does not open output selection until the keypad leaves that screen with ENTER. RF remotes bypass keypad screens entirely.
+
+**Change (branch `fix/output-select-reliability`):**
+- During the exit delay (tracked from `ARMED_STATE`), output selection starts with ENTER and waits for its `KEYPAD_COMMAND` before OUTPUT. It is not prefixed elsewhere, because ENTER from mid-entry submits the buffer, and leftover code digits plus ENTER is the arm/disarm-with-code gesture.
+- A sequence must now show the output switching, either in `OUTPUT_STATE` or in data[3] after the digit, or it logs a WARN and republishes the real switch state.
+- `set_output()` requests made during another keypress sequence are queued (one slot, 10 s) instead of dropped.
+
+See `output_select_state_machine.md`.
+
+**To confirm after flashing:** arm from HA, then press Gate during the exit delay. The log should show `panel in exit delay, sending ENTER first`, `ENTER confirmed (CMD 0x01)`, `OUTPUT_STATE [04]`, and `output 3 switched`. If the reply to that ENTER is not 0x01, or the output still doesn't fire, the inference above is wrong.
+
+**Follow-up (2026-10-14, after flashing):** the first exit-delay test answered part of the question and found two bugs in the change.
+
+- **Garage pressed at 23:27:13 UTC, 2 s into the exit delay:**
+  - The leading ENTER was answered `14.05.01.00.08.01.80` (CMD 0x01), as predicted.
+  - OUTPUT was sent **7 ms** later. It got no `0x1D` ACK, just another `14.05.01.00.08…`, so output selection never opened. The physical keypad leaves ~50 ms here.
+  - The "recovering" path then typed `4` + ENTER anyway, and `OUTPUT_STATE` stayed `00`. The user confirmed the garage door did not open.
+- **Verification bug:** data[3] showed the stale `08` (last selection, garage) throughout, and it was trusted because a digit had gone out. The log said `output 4 switched`.
+- **Fixes:**
+  - Wait `OUTPUT_SELECT_CLEAR_DELAY_MS` (100 ms) between the ENTER's confirmation and OUTPUT.
+  - In `OUTPUT_PENDING`, only treat a KEYPAD_COMMAND as an implicit ACK when data[3] is empty; otherwise wait for the watchdog retry.
+  - Only count data[3] after it has been seen without the output's bit in the same attempt.
+
+  Whether the 100 ms gap is enough, or whether ENTER → OUTPUT needs something else, is still open.
+- **Disarm from HA during the exit delay doesn't work either (same session):**
+  - Disarm at 23:27:24 UTC: the code digits were each confirmed, but the terminal ENTER got `14.05.07…`, with no disarm.
+  - Retries 1–3 failed the same way until the exit delay ran out (Armed Away 23:27:39).
+  - Retry 4 also failed. Retry 5 disarmed at 23:27:52, 28 s after the request.
+  - Same arming-screen mechanism as outputs, by inference. The physical keypad cancels the exit delay with ENTER + ARM and no code (22:20:17 UTC).
+- **Re-arm at 23:27:54 UTC:** a fresh `arm_away()` arrived from HA 0.3 s after that disarm. The user likely pressed twice; it was not a stale retry.
+
+**Follow-up (2026-10-14, with the 100 ms gap, commit `e2e6ed3`):** gate pressed three times from HA during one exit delay ("Arming" 23:34:11 UTC, "Armed Away" 23:34:39):
+
+| Press (UTC) | ENTER reply | OUTPUT → `0x1D` ACK | `OUTPUT_STATE` | Logged |
+|---|---|---|---|---|
+| 23:34:13 | CMD 0x01 | yes (106 ms after OUTPUT) | `[04]` | `output 3 switched` |
+| 23:34:17 | CMD 0x01 | yes | `[04]` | `output 3 switched` |
+| 23:34:21 | CMD 0x01 | yes | `[04]` | `output 3 switched` |
+
+The user confirmed the gate physically responded to all three pulses (open, stop, close — the gate controller steps through its cycle per pulse). 3 of 3, against 0 of 3 before the change (2 with no ENTER, 1 with the ENTER but only a 7 ms gap). This confirms the inference above: during the exit delay output selection needs ENTER ("Back") first, plus a short pause before OUTPUT. 100 ms works; the minimum gap was not measured.
+
+**Separate observation:** the device has now been OTA-rebooted three times today (10:56, 12:21 and 12:33 NZDT). The user heard the external siren for a few seconds only around 12:21. It is not in the log, because that window falls in the device's own reboot gap (`OUTPUT_STATE` reports missing 23:20:59 → 23:21:21 UTC). The bus traffic before and after all three reboots looks alike, so the cause is open. The panel's event history (MEM) for ~12:21 has not been checked yet.

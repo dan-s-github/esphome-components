@@ -72,6 +72,13 @@ enum class OutputSelectState : uint8_t {
   ENTER_DELAY,     // all digits confirmed; waiting ~60 ms before sending ENTER so the
                    // controller's output-fire broadcast clears the bus first
   ENTER_PENDING,   // sent ENTER, waiting for final 0x14 KEYPAD_COMMAND confirmation
+  // Exit delay only: sent a leading ENTER (the keypad's "Back" from the arming screen),
+  // waiting for its 0x14 confirmation before sending OUTPUT. Appended last so the state
+  // numbers in existing "timeout in state N" log lines keep their meaning.
+  CLEAR_PENDING,
+  // Exit delay only: leading ENTER confirmed; waiting OUTPUT_SELECT_CLEAR_DELAY_MS before
+  // sending OUTPUT (sent 7 ms after the reply, OUTPUT got no 0x1D ACK — 2026-10-14).
+  CLEAR_DELAY,
 };
 
 enum class ArmDisarmState : uint8_t {
@@ -185,6 +192,16 @@ class CrowAlarmPanelStore {
   // subsequent KEY_OUTPUT attempts with KEYPAD_COMMAND [07].
   static const uint32_t OUTPUT_SELECT_ENTER_DELAY_MS = 60;
 
+  // Delay between the leading ENTER's confirmation and OUTPUT during the exit delay. Sent
+  // 7 ms after the confirmation, OUTPUT got a plain KEYPAD_COMMAND instead of the 0x1D ACK
+  // (output selection never opened); the physical AAP keypad leaves ~50 ms (2026-10-14).
+  static const uint32_t OUTPUT_SELECT_CLEAR_DELAY_MS = 100;
+
+  // How long a set_output() request queued behind another keypress sequence (typically an
+  // arm/disarm, up to ~7 s with retries) waits before being dropped. Long enough for a normal
+  // disarm with retries; short enough that a gate/garage doesn't fire unexpectedly late.
+  static const uint32_t OUTPUT_SELECT_QUEUE_TIMEOUT_MS = 10000;
+
   // Raw bit trace (diagnostic): batches every clock-sampled DAT bit that reaches the
   // frame boundary-search logic (i.e. after glitch filtering, same bits that feed
   // boundary_buffer_) into a fixed-size string and hands it to loop() once full.
@@ -217,10 +234,12 @@ class CrowAlarmPanel : public Component {
   void dump_config() override;
   void loop() override;
 
-  // Returns true if the request was accepted (sequence started); false if it was rejected
-  // (passive mode, or another keypress sequence in progress). Callers that publish an
+  // Returns true if the request was accepted: started, or queued behind another keypress
+  // sequence (started once all state machines are idle, dropped after
+  // OUTPUT_SELECT_QUEUE_TIMEOUT_MS); false if rejected (passive mode). Callers that publish an
   // optimistic entity state must do so only on acceptance — a rejected request starts no
-  // sequence and no watchdog, so nothing would ever correct the optimistic publish.
+  // sequence, so nothing would ever correct the optimistic publish. After acceptance the
+  // parent republishes the real output state if the panel never reports the output switching.
   bool set_output(uint8_t output, bool state);
   void set_zone_bypass(uint8_t zone, bool state);
 
@@ -336,6 +355,10 @@ class CrowAlarmPanel : public Component {
   void arm_disarm_keypress_(uint8_t key);
 
   void send_packet_blocking_(const std::vector<uint8_t> &packet);
+  void start_output_select_(uint8_t output, bool state);
+  void begin_output_select_attempt_();
+  void finish_output_select_(bool completed);
+  void publish_output_actual_(uint8_t output);
   bool wait_for_clock_edge_(bool wait_for_state, uint32_t timeout_us);
 
   // Last frame-queue diagnostic counter values already reported to the log, so loop() emits
@@ -362,6 +385,31 @@ class CrowAlarmPanel : public Component {
   std::vector<uint8_t> output_select_keys_;  // digit(s) to send, consumed one per KEYPAD_COMMAND
   uint8_t output_select_key_idx_{0};
   uint8_t output_select_retry_count_{0};  // max 1 automatic retry before aborting
+  uint8_t output_select_number_{0};       // output the active sequence is switching
+  // Output bit (from the last OUTPUT_STATE) when the sequence started, and whether the panel
+  // has since shown it switched — OUTPUT_STATE bit flipped, or a KEYPAD_COMMAND to us
+  // carrying the output's bit in data[3] after the digit went out. Checked when the sequence
+  // ends: the controller acks every key even when it ignores the selection (e.g. during the
+  // exit delay without the leading ENTER), so "sequence complete" alone doesn't prove it fired.
+  bool output_select_initial_bit_{false};
+  bool output_select_landed_{false};
+  // data[3] keeps the keypad's last selection outside output selection (e.g. 0x08 after a
+  // garage press), so it only proves anything once this attempt has seen it without the
+  // output's bit — which happens when the controller really opened output selection.
+  bool output_select_saw_bit_clear_{false};
+  // Last OUTPUT_STATE bitmap (outputs 1-8), used to report the real output state when a
+  // sequence fails or a queued request expires.
+  uint8_t last_output_bitmap_{0};
+  // True between the controller's "Arming" and its next ARMED_STATE broadcast (the exit delay).
+  // The controller puts every keypad on its arming screen then (KEYPAD_COMMAND 0x89) and
+  // ignores an output selection unless ENTER ("Back") is pressed first.
+  bool panel_arming_{false};
+  // One set_output() request held while another keypress sequence runs, started when all three
+  // state machines are idle (newest request wins).
+  bool output_queue_pending_{false};
+  uint8_t output_queue_number_{0};
+  bool output_queue_state_{false};
+  uint32_t output_queue_ms_{0};
 
   // Zone-bypass state machine. The panel toggles bypass per BYPASS/digits/ENTER sequence,
   // so the switch state is only published from ZONE_STATE bypass-bitmap broadcasts, never
