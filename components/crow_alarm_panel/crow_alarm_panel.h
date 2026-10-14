@@ -363,7 +363,12 @@ class CrowAlarmPanel : public Component {
   CrowAlarmPanelKeypad find_keypad_(uint8_t address);
   bool is_bus_idle_();
   bool wait_for_bus_idle_();
-  void transmit_packet_(uint8_t type, const std::vector<uint8_t> &data);
+  // mask_payload: log the payload bytes as "**" (used for the arm/disarm code's digits).
+  void transmit_packet_(uint8_t type, const std::vector<uint8_t> &data, bool mask_payload = false);
+  // True if a KEYPRESS frame is a digit that may belong to a code: anything except a digit
+  // typed while that keypad is selecting an output or a zone (its last non-digit key was
+  // OUTPUT or BYPASS). Such digits are logged as "*".
+  bool keypress_is_masked_(const std::vector<uint8_t> &data) const;
   bool start_code_sequence_(const std::string &code, uint8_t terminal_key);
   // Starts (or restarts, on retry) the code+terminal-key attempt: with a leading ENTER for a
   // disarm during the exit delay, else straight from the first digit.
@@ -532,6 +537,8 @@ class CrowAlarmPanel : public Component {
   // Longest configured keypad label, computed once in setup(); pads the "[label]" prefix in
   // log messages so the text after it lines up regardless of which keypad is logging.
   uint8_t keypad_label_width_{0};
+  // Last non-digit key seen from each keypad address (0 = none yet), for keypress_is_masked_().
+  uint8_t keypad_last_command_key_[0x80]{};
 };
 
 // Bypass toggle switch created by the parent's `zones:` config. Lives here (not in switch/)

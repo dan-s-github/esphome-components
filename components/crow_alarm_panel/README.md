@@ -284,6 +284,12 @@ logger:
     crow_alarm_panel: DEBUG
 ```
 
+**Alarm code in logs.** Code digits are masked as `*` / `**`:
+- **Masked:** digits this component types for an arm/disarm (`Code sequence` and `Sending packet` lines), and digits typed on any physical keypad, both in `Key … pressed` and in the `log_raw_frames` output. Digits typed right after OUTPUT or BYPASS (output and zone numbers) stay visible.
+- **Not masked:** the `log_raw_bits` diagnostic (it's the literal bitstream, so it can contain the code), and the raw `data` passed to `on_message` automations.
+
+Older log captures from before this masking may still contain the code.
+
 Seeing an occasional `WARN` line or a disarm/arm that takes a few extra seconds? Check
 [`docs/known_quirks.md`](docs/known_quirks.md) before assuming it's a new bug — most
 recurring log noise from this component is already understood and benign.

@@ -347,10 +347,17 @@ void CrowAlarmPanel::loop() {
     std::vector<uint8_t> data;
     data.insert(data.begin(), local_frame + 1, local_frame + frame_len - 1);
 
+    // A keypress that may be a code digit is logged with the key byte masked, here and in
+    // the KEYPRESS handler below — a code typed on a physical keypad would otherwise end up
+    // in every log capture.
+    const std::string raw_hex =
+        (type == KEYPRESS && this->keypress_is_masked_(data))
+            ? format_hex_pretty(std::vector<uint8_t>(data.begin(), data.begin() + 1), '.', false) + ".**"
+            : format_hex_pretty(data);
     if (this->raw_frame_logging_enabled_) {
-      ESP_LOGI(TAG, "Received raw frame [%02x.%s]", type, format_hex_pretty(data).c_str());
+      ESP_LOGI(TAG, "Received raw frame [%02x.%s]", type, raw_hex.c_str());
     } else {
-      ESP_LOGV(TAG, "Received raw frame [%02x.%s]", type, format_hex_pretty(data).c_str());
+      ESP_LOGV(TAG, "Received raw frame [%02x.%s]", type, raw_hex.c_str());
     }
 
     switch (type) {
@@ -619,8 +626,16 @@ void CrowAlarmPanel::loop() {
           break;
         }
         CrowAlarmPanelKeypad keypad = this->find_keypad_(data[0]);
-        ESP_LOGD(TAG, "[%-*s] Key %s (%d) pressed [%02x.%s]", this->keypad_label_width_,
-                 keypad_label(keypad, data[0]).c_str(), KEYS[key], key, type, format_hex_pretty(data).c_str());
+        if (this->keypress_is_masked_(data)) {
+          ESP_LOGD(TAG, "[%-*s] Key * pressed [%02x.%02x.**]", this->keypad_label_width_,
+                   keypad_label(keypad, data[0]).c_str(), type, data[0]);
+        } else {
+          ESP_LOGD(TAG, "[%-*s] Key %s (%d) pressed [%02x.%s]", this->keypad_label_width_,
+                   keypad_label(keypad, data[0]).c_str(), KEYS[key], key, type, format_hex_pretty(data).c_str());
+        }
+        if (key > 9) {
+          this->keypad_last_command_key_[data[0] & 0x7F] = key;
+        }
         break;
       }
       case CURRENT_TIME: {
@@ -840,8 +855,7 @@ void CrowAlarmPanel::loop() {
                 }
                 if (this->arm_disarm_code_idx_ < this->arm_disarm_code_digits_.size()) {
                   uint8_t digit = this->arm_disarm_code_digits_[this->arm_disarm_code_idx_++];
-                  ESP_LOGD(TAG, "Code sequence: sending digit %u (index %u)", digit,
-                           this->arm_disarm_code_idx_ - 1);
+                  ESP_LOGD(TAG, "Code sequence: sending digit (index %u)", this->arm_disarm_code_idx_ - 1);
                   // No timestamp update here: arm_disarm_keypress_() already refreshes
                   // arm_disarm_state_enter_ms_ when the key actually transmits, and assigning
                   // after the call would be stale if the operation resolved (and a newer one
@@ -1405,7 +1419,8 @@ void CrowAlarmPanel::arm_disarm_keypress_(uint8_t key) {
     this->arm_disarm_key_in_flight_ = false;
     return;
   }
-  this->transmit_packet_(KEYPRESS, {key});
+  // Digits sent by this state machine are always code digits; keep them out of the log.
+  this->transmit_packet_(KEYPRESS, {key}, key <= 9);
   // Restart the no-progress window from the actual transmit — the bus-idle wait above may
   // have consumed most (or more) of the 1 s budget before the key even went out, and the
   // watchdog was gated during it.
@@ -1608,7 +1623,7 @@ bool CrowAlarmPanel::wait_for_bus_idle_() {
   return true;
 }
 
-void CrowAlarmPanel::transmit_packet_(uint8_t type, const std::vector<uint8_t> &data) {
+void CrowAlarmPanel::transmit_packet_(uint8_t type, const std::vector<uint8_t> &data, bool mask_payload) {
   std::vector<uint8_t> packet;
   packet.push_back(BOUNDARY);
   packet.push_back(type);
@@ -1616,9 +1631,25 @@ void CrowAlarmPanel::transmit_packet_(uint8_t type, const std::vector<uint8_t> &
   packet.insert(packet.end(), data.begin(), data.end());
   packet.push_back(BOUNDARY);
 
-  ESP_LOGD(TAG, "Sending packet: [%s]", format_hex_pretty(packet).c_str());
+  if (mask_payload) {
+    std::string masked = format_hex_pretty(std::vector<uint8_t>(packet.begin(), packet.begin() + 3), '.', false);
+    for (size_t i = 0; i < data.size(); i++) {
+      masked += ".**";
+    }
+    ESP_LOGD(TAG, "Sending packet: [%s.%02X (%u)]", masked.c_str(), BOUNDARY, (unsigned) packet.size());
+  } else {
+    ESP_LOGD(TAG, "Sending packet: [%s]", format_hex_pretty(packet).c_str());
+  }
   this->send_packet_blocking_(packet);
   ESP_LOGD(TAG, "Packet sent");
+}
+
+bool CrowAlarmPanel::keypress_is_masked_(const std::vector<uint8_t> &data) const {
+  if (data.size() < 2 || data[1] > 9) {
+    return false;
+  }
+  const uint8_t context = this->keypad_last_command_key_[data[0] & 0x7F];
+  return context != KEY_OUTPUT && context != KEY_BYPASS;
 }
 
 bool CrowAlarmPanel::is_bus_idle_() {
