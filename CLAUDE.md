@@ -19,6 +19,7 @@ Local development uses `uv` on Python 3.12+ (verified working through 3.14 as of
 | Lint the latest commit | `uv run commitlint --hash HEAD` |
 | Lint a commit range | `uv run commitlint --from-hash <base> --to-hash HEAD` |
 | Install the commit-msg hook | `uv run pre-commit install --hook-type commit-msg` |
+| Audit `CURRENT_TIME` decodes in device logs (bit-stuffing model check) | `uv run python tools/analyze_current_time.py time.log` (fetch recipe in its docstring) |
 
 There is no source-code lint target or unit-test suite; ESPHome config validation/compile and commit-message linting (Conventional Commits) are the practical checks. Compiling requires a `secrets.yaml` (wifi credentials, API key, alarm code — see the fixture's `!secret` references).
 
