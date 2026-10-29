@@ -144,29 +144,28 @@ is free and that the panel has fully started up.
 
 ---
 
-## Occasional "Current time has invalid ..." log lines
+## "Current time has invalid ..." log lines (rare since 2026-10-29)
 
-**What you'll see:** lines like `Current time has invalid day/month value 36/36` or
-`invalid seconds value 90` (logged at `DEBUG`), or `invalid minutes-since-midnight value
-1470` (logged at `WARN`, since it means the whole frame's time-of-day is unusable, not
-just one field). Not visible anywhere in Home Assistant — the panel's `CURRENT_TIME`
-broadcast isn't exposed as an entity.
+**What you'll see:** with current firmware, normally nothing. An occasional `DEBUG` line
+such as `Current time has invalid day/month value ...`, `invalid seconds value ...` or
+`Current time weekday ... doesn't match date ...` means a corrupted time frame (most likely
+the rare one-bit receive loss), which is discarded. Not visible anywhere in Home Assistant — the
+panel's `CURRENT_TIME` broadcast isn't exposed as an entity.
+
+**On older firmware** these lines were routine: `invalid day/month value 36/36` or
+`invalid seconds value 90` at `DEBUG` many times an hour, `invalid minutes-since-midnight
+value 1470`/`1503` at `WARN` every night at 23:26–23:27 panel-local, and about 85
+`Controller time update` lines a day showing a time off by 32–128 minutes.
 
 **Cause:** the bus bit-stuffs (the panel inserts a `0` after five consecutive `1` bits so
-the `0x7E` frame marker stays unique) and this component does not yet remove the inserted
-bit. Whenever the current time happens to contain such a run, the fields after it are
-shifted and read as doubled (or quadrupled). That is why the same values recur on a fixed
-schedule rather than randomly: once a minute during half of every ~4¼-hour cycle, at
-23:26–23:27 panel-local time every night (the `invalid minutes-since-midnight` WARN, values
-1470 and 1503), and all day on the 31st of a month. See `protocol_investigations.md`,
-"Bit-stuffing on the wire" (2026-10-01).
+the `0x7E` frame marker stays unique), and before 2026-10-29 this component kept the
+inserted bit. Whenever the current time contained such a run, the fields after it were
+shifted, which is why the same bad values recurred on a fixed schedule. The receiver now
+removes the inserted bit. See `protocol_investigations.md`, "Bit-stuffing on the wire"
+(2026-10-01) and "Bit-stuffing removed in the ISR" (2026-10-29).
 
-**What to do:** nothing — for day/month/year the component tries to recover the known
-doubled-bit glitch first (cross-checked against the frame's own weekday field before
-trusting the recovery) and only discards the frame if that check fails; other invalid
-fields are discarded outright. No entity depends on this data either way, so even the
-theoretical edge case where a rarer `×4`-corrupted date could pass the weekday check by
-chance (`protocol_wire_format.md`'s `CURRENT_TIME` entry) isn't user-actionable.
+**What to do:** nothing. If these lines show up regularly on current firmware, that is
+new: capture the log lines (they include the raw frame) and open an issue.
 
 ---
 

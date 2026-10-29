@@ -107,8 +107,8 @@ void IRAM_ATTR HOT CrowAlarmPanelStore::interrupt(CrowAlarmPanelStore *arg) {
   // receiver decoding that burst as garbage (`Unknown [ff.]`/`[fe.]`) while a passive monitor on
   // the same bus decodes it cleanly. Previously this edge was discarded outright — the bit it
   // carried never reached boundary_buffer_/num_bits_ below, silently shifting alignment for
-  // whatever frame followed by one bit (the same class of corruption documented for the
-  // CURRENT_TIME glitch in protocol_investigations.md, but compounding across a whole retry
+  // whatever frame followed by one bit (the same one-bit misalignment that un-removed
+  // bit-stuffing used to cause in CURRENT_TIME frames, but compounding across a whole retry
   // burst instead of one field). Falling through lets this edge's bit feed the same
   // glitch-filter/boundary-detection path as any other edge instead of leaving a hole in it.
   if (arg->ack_pending_) {
@@ -174,6 +174,22 @@ void IRAM_ATTR HOT CrowAlarmPanelStore::interrupt(CrowAlarmPanelStore *arg) {
   }
 
   if (arg->inside_) {
+    // HDLC bit-stuffing: the sender inserts a 0 after five consecutive 1s so 0x7E stays unique
+    // as a delimiter (protocol_investigations.md, "Bit-stuffing on the wire"). Drop that 0 here
+    // so frames arrive as sent. boundary_buffer_ above still sees the raw bits, and a dropped bit
+    // can never complete a boundary match (0x7E needs six 1s before its 0, the stuffed 0 follows
+    // exactly five), so returning early can't skip a closing flag.
+    if (data_bit) {
+      if (arg->ones_run_ < 6) {  // six or more means flag/abort; capped so it can't wrap back to 5
+        arg->ones_run_++;
+      }
+    } else if (arg->ones_run_ == 5) {
+      arg->ones_run_ = 0;
+      return;
+    } else {
+      arg->ones_run_ = 0;
+    }
+
     uint8_t idx = arg->num_bits_ / 8;
     arg->buffer[idx] = (arg->buffer[idx] >> 1) | ((data_bit ? 1 : 0) << 7);
     arg->num_bits_++;
@@ -238,6 +254,7 @@ void IRAM_ATTR HOT CrowAlarmPanelStore::interrupt(CrowAlarmPanelStore *arg) {
 
   if (arg->boundary_buffer_ == BOUNDARY) {
     arg->inside_ = true;
+    arg->ones_run_ = 0;
     return;
   }
 }
@@ -679,53 +696,26 @@ void CrowAlarmPanel::loop() {
         uint8_t day = data[4];
         uint8_t month = data[5];
         uint8_t year = data[6];
+        // The ISR removes bit-stuffing, which was the cause of the frequent doubled/quadrupled
+        // fields this used to see (protocol_investigations.md, "Bit-stuffing on the wire"), so a
+        // field that fails these checks now means other corruption (e.g. the one-bit receive loss
+        // in "Single dropped bit at frame start"): discard rather than guess. DEBUG, because
+        // CURRENT_TIME isn't published to any entity; the weekday cross-check also catches
+        // corruption that leaves every field in range.
         if (day == 0 || day > 31 || month == 0 || month > 12) {
-          // The documented CURRENT_TIME bit-corruption glitch (protocol_investigations.md) shifts
-          // day/month/year one bit left together (a single spurious 0 bit inserted right after the
-          // seconds byte) — i.e. each is exactly double its true value. Halving all three and
-          // cross-checking the recovered date's weekday against the untouched day_of_week field
-          // (data[0], from earlier in the frame, before the glitch's insertion point) makes a false
-          // recovery astronomically unlikely, addressing the coincidental-valid-range risk noted in
-          // that doc. Validated against real HA log timestamps in the 2026-08-05 traces: the
-          // recovered date matched the true date/time exactly in every sample checked.
-          //
-          // This glitch is frequent (up to hundreds of occurrences/hour — see the 2026-08-19
-          // protocol_investigations.md update) and, per that update, an expected/benign property of
-          // the panel's own broadcast logic rather than a bus fault — and CURRENT_TIME isn't published
-          // to any entity, so none of this is user-actionable. Logged at DEBUG, same level as the
-          // successful decode below, to avoid spamming WARN/INFO on every occurrence.
-          bool recovered = false;
-          if ((data[4] % 2) == 0 && (data[5] % 2) == 0 && (data[6] % 2) == 0) {
-            uint8_t rec_day = data[4] / 2;
-            uint8_t rec_month = data[5] / 2;
-            uint8_t rec_year = data[6] / 2;
-            if (rec_day >= 1 && rec_day <= 31 && rec_month >= 1 && rec_month <= 12 &&
-                day_of_week_from_date(2000 + rec_year, rec_month, rec_day) == data[0]) {
-              ESP_LOGD(TAG,
-                       "[%-*s] Current time: recovered doubled-bit glitch, using 20%02u-%02u-%02u [%02x.%s]",
-                       this->keypad_label_width_, CONTROLLER_LABEL, rec_year, rec_month, rec_day, type,
-                       format_hex_pretty(data).c_str());
-              day = rec_day;
-              month = rec_month;
-              year = rec_year;
-              recovered = true;
-            }
-          }
-          if (!recovered) {
-            ESP_LOGD(TAG, "[%-*s] Current time has invalid day/month value %u/%u [%02x.%s]",
-                     this->keypad_label_width_, CONTROLLER_LABEL, data[4], data[5], type,
-                     format_hex_pretty(data).c_str());
-            break;
-          }
+          ESP_LOGD(TAG, "[%-*s] Current time has invalid day/month value %u/%u [%02x.%s]",
+                   this->keypad_label_width_, CONTROLLER_LABEL, day, month, type, format_hex_pretty(data).c_str());
+          break;
         }
-        // Checked after the day/month recovery attempt above (not before) so a bad seconds value
-        // doesn't discard an otherwise-recoverable day/month/year — see protocol_investigations.md,
-        // the 2026-08-10 CURRENT_TIME update, for two sessions where this order previously discarded
-        // cleanly-recoverable date data alongside an unrelated bad seconds byte.
         if (data[3] >= 60) {
-          // Same known glitch family as above (frequent, benign, unpublished) — DEBUG, not WARN.
           ESP_LOGD(TAG, "[%-*s] Current time has invalid seconds value %u [%02x.%s]", this->keypad_label_width_,
                    CONTROLLER_LABEL, data[3], type, format_hex_pretty(data).c_str());
+          break;
+        }
+        if (day_of_week_from_date(2000 + year, month, day) != data[0]) {
+          ESP_LOGD(TAG, "[%-*s] Current time weekday %u doesn't match date 20%02u-%02u-%02u [%02x.%s]",
+                   this->keypad_label_width_, CONTROLLER_LABEL, data[0], year, month, day, type,
+                   format_hex_pretty(data).c_str());
           break;
         }
         ESP_LOGD(TAG, "[%-*s] Controller time update: %s 20%02d-%02d-%02d %02d:%02d:%02d",
@@ -1062,8 +1052,8 @@ void CrowAlarmPanel::loop() {
           ESP_LOGW(TAG, "RF remote event too short, discarding");
           break;
         }
-        ESP_LOGD(TAG, "[RF Remote %02x:%02x:%02x] Button event, code %02x:%02x [%02x.%s]", data[0], data[1],
-                 data[2], data[3], data[4], type, format_hex_pretty(data).c_str());
+        ESP_LOGD(TAG, "[RF Remote %02x:%02x:%02x] Button event, code %02x (data[3] %02x) [%02x.%s]", data[0],
+                 data[1], data[2], data[4], data[3], type, format_hex_pretty(data).c_str());
         break;
       }
       default:
@@ -1721,18 +1711,38 @@ bool CrowAlarmPanel::wait_for_clock_edge_(bool wait_for_state, uint32_t timeout_
 }
 
 void IRAM_ATTR CrowAlarmPanel::send_packet_blocking_(const std::vector<uint8_t> &packet) {
+  // Expand to wire bits (LSB-first) before taking the bus. Everything between the opening and
+  // closing 0x7E is bit-stuffed (a 0 after five consecutive 1s), the HDLC rule the panel uses and
+  // CrowAlarmPanelStore::interrupt() undoes on receive. No packet this component sends today
+  // contains such a run (docs/protocol_wire_format.md, "Frame Format"), so this only matters for
+  // custom send_packet() payloads; it has not been exercised against the panel.
+  static const uint16_t MAX_TX_BITS = 256;
+  bool bits[MAX_TX_BITS];
+  uint16_t bit_count = 0;
+  uint8_t ones_run = 0;
+  for (size_t i = 0; i < packet.size(); i++) {
+    const bool stuffed = i != 0 && i != packet.size() - 1;
+    for (uint8_t j = 0; j < 8; j++) {
+      if (bit_count + 2 > MAX_TX_BITS) {
+        ESP_LOGE(TAG, "Packet too long to send (%u bytes), dropping", (unsigned) packet.size());
+        return;
+      }
+      const bool bit = (packet[i] >> j) & 1;
+      bits[bit_count++] = bit;
+      if (stuffed) {
+        ones_run = bit ? ones_run + 1 : 0;
+        if (ones_run == 5) {
+          bits[bit_count++] = false;
+          ones_run = 0;
+        }
+      }
+    }
+  }
+
   // Set before InterruptLock so the ISR on the other core immediately sees it.
   this->store_.is_transmitting_ = true;
   {
     InterruptLock lock;
-
-    bool bits[200];
-    uint16_t bit_count = 0;
-    for (uint8_t byte : packet) {
-      for (uint8_t j = 0; j < 8; j++) {
-        bits[bit_count++] = (byte >> j) & 1;
-      }
-    }
 
     if (!this->wait_for_clock_edge_(HIGH, CrowAlarmPanelStore::TX_START_TIMEOUT_US) ||
         !this->wait_for_clock_edge_(LOW, CrowAlarmPanelStore::TX_START_TIMEOUT_US) ||

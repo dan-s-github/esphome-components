@@ -110,8 +110,8 @@ Both the `0x7E` flag and the zero-bit-insertion rule match synchronous HDLC (see
 `protocol_investigations.md`, "Bit-stuffing on the wire", 2026-10-01), so the delimiter is
 not a coincidence. No ESPHome HDLC component exists and the externally-clocked open-drain
 transport is incompatible with UART-based implementations, so the framing still has to be
-done in this component's ISR — which currently detects the flag but does not remove
-stuffed bits.
+done in this component's ISR, which detects the flag and (since 2026-10-29) removes
+stuffed bits; the transmit path stuffs to match.
 
 ---
 

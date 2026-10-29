@@ -208,7 +208,7 @@ Notes:
 
 ## `CURRENT_TIME` (0x54) periodic bit-corruption glitch
 
-> **Root-caused 2026-10-01:** the "spurious bit" is HDLC-style bit-stuffing that the receiver does not remove — see "Bit-stuffing on the wire" at the end of this file. The panel-side-defect / bus-contention inferences in the dated entries below are superseded; the observations themselves stand.
+> **Root-caused 2026-10-01:** the "spurious bit" is HDLC-style bit-stuffing that the receiver did not remove until 2026-10-29 — see "Bit-stuffing on the wire" at the end of this file. The panel-side-defect / bus-contention inferences in the dated entries below are superseded; the observations themselves stand.
 
 Source trace: `../../../traces/esphome-aap-alarm-interface-logs-8.txt` (`ESP_LOGV` enabled, so raw frame bytes are visible).
 
@@ -1032,7 +1032,7 @@ Comparing every `Controller time update` line's decoded value against real NZST 
 
 **Assumption (unverified):** that stuffing applies uniformly to every frame type and direction. Only controller→bus `0x54` and RF-receiver→bus `0x7C` are verified. Whether the controller expects *us* to stuff outbound frames is untested — no packet this component currently transmits (`0xA0`/`0xA1` with small address/key values) contains a five-`1` run, so the question has never been exercised.
 
-**Practical takeaway:** no code change made in this session. The correct fix is to drop the stuffed bit in the ISR's receive path (a `0` following five `1`s while inside a frame), after which the `CURRENT_TIME` halving-recovery, the `×4` gap flagged in `protocol_wire_format.md`, and the per-remote `0x7C` code table all become unnecessary. Until then, any frame whose true content has five consecutive `1` bits is silently mis-sliced from that point on. For currently-parsed types this is believed harmless in practice (it would take e.g. five adjacent zones active/bypassed in one `ZONE_STATE` bitmap byte), but it is a latent correctness bug, not just log noise.
+**Practical takeaway:** no code change made in this session (implemented 2026-10-29 — see "Bit-stuffing removed in the ISR" below). The correct fix is to drop the stuffed bit in the ISR's receive path (a `0` following five `1`s while inside a frame), after which the `CURRENT_TIME` halving-recovery, the `×4` gap flagged in `protocol_wire_format.md`, and the per-remote `0x7C` code table all become unnecessary. Until then, any frame whose true content has five consecutive `1` bits is silently mis-sliced from that point on. For currently-parsed types this is believed harmless in practice (it would take e.g. five adjacent zones active/bypassed in one `ZONE_STATE` bitmap byte), but it is a latent correctness bug, not just log noise.
 
 **Predictions on record:** (1) panel-local 2026-10-31 (`2026-10-30 11:00` → `2026-10-31 11:00` UTC): every `CURRENT_TIME` broadcast logs `invalid day/month value 31/20` (or a further-shifted value in the minutes where an earlier field also stuffs). (2) `invalid minutes-since-midnight` keeps values 1470 and 1503 only, at local 23:26/23:27 only.
 
@@ -1279,3 +1279,29 @@ Side note: the 23:49:05.665 press was HA toggling the Gate switch to "off". The 
 - **Queued gate with the 1.5 s pause:** 5 of 6 first try so far. The miss was the first round after a reboot, and the controller acked every key without selecting the output. Cause unknown. If it recurs, try a longer pause or a leading ENTER after a disarm (the physical keypad wakes with ENTER from the post-entry `0x15` state).
 - **Exit-delay disarm:** 8 of 8 overall, 2 of them needing one retry.
 - **Masking:** all 12 code digits from these disarms logged as `**`. Only the output digit `3` was logged in clear, as intended.
+
+## Bit-stuffing removed in the ISR (2026-10-29) — the "wrong minutes" defect was stuffing too
+
+**Source:** frigate long-term logger, 2026-09-26 → 2026-10-29 (all retained rotations), analysed with `tools/analyze_current_time.py`.
+
+**Context:** the wrong-minutes decodes were already documented (2026-08-10 entry, and the 2026-09-03 update that found them quantised to 32-minute steps), and the 2026-10-01 bit-stuffing entry explained the day/month/year shifts. What was missing was the link between the two, and that these frames went through the normal `Controller time update` path.
+
+**Observed facts:**
+
+- On 2026-10-28 at 21:16 panel-local, every `CURRENT_TIME` broadcast decoded as **19:08**, with no warning. Raw frame `54.04.04.7C.01.38.14.34`; the true time 21:16:00 is `minutes = 0x4FC`. `0xFC` contains a five-`1` run, the stuffed `0` pushes `minutes_lo`'s top bit into `seconds` (`7C 01`), and day/month/year arrive doubled. The halving recovery restored the date, the weekday cross-check passed, and nothing validated the minutes. This is the 2026-09-03 "low 6 bits frozen, bits 6–7 cycling" pattern.
+- Un-stuffing (drop a `0` that follows exactly five `1`s, LSB-first, type byte included) reproduces the wall-clock date and time for **all 5,374** raw `0x54` frames logged 2026-10-23 → 10-28, and all 869 logged 10-28 → 10-29. No misses.
+- Accepted-but-wrong decodes: **420 of 26,674** (1.6%) over 10-23 → 10-28, off by +32/+64/+96 or −32/−64/−96/−128 minutes. Per day it is a flat **85–95 of ~5,460** on every firmware build in the archive (ESPHome 2026.9.1 builds of 10-03/10-06/10-14, 2026.10.0, 2026.10.1) back to the oldest retained log, 2026-09-26; one day (10-06, several reflashes) shows 136. It is a property of the clock values, not of any firmware or ESPHome update. Each affected minute passes 2 of its 4 broadcasts: after the shift, `seconds` `00` stays `00` (or `01` with a carried bit) and `15` (`0x0F`) reads as `30`, both in range; `30` and `45` become `0x3C`/`0x5A` and are dropped.
+- Frame types carrying a stuffed bit, across every hex-logged frame in the 30 days: `0x54`, `0x7C` (all 108: type byte `0x7C` has its own run), `0x1F` (all 6: same reason), and one frame each of `0x14` (`14.00.01.00.DF.00.00`) and `0x16` (`16.00.00.DF.5E.0D`). No other type.
+
+**Change:**
+
+- `CrowAlarmPanelStore::interrupt()` counts consecutive `1`s inside a frame (capped at 6) and drops a `0` that follows exactly five. `boundary_buffer_` keeps seeing raw bits; a dropped bit can't complete a `0x7E` match (that needs six `1`s), and the closing flag's `0` follows six `1`s so is never dropped.
+- `send_packet_blocking_()` stuffs between the flags, and refuses packets over 256 wire bits (the previous fixed `bits[200]` had no bounds check). No packet sent today contains a five-`1` run, so this changes nothing on the wire yet.
+- `CURRENT_TIME`: the halving recovery is removed. Out-of-range day/month/seconds, or a weekday byte that doesn't match the date (now checked on every frame), is logged at DEBUG and the frame discarded.
+- `0x7C` log line shows `data[4]` (button code, identical across remotes) plus `data[3]`, instead of the per-remote `data[3..4]`.
+
+**Verified offline:** a Python port of the receive path, fed 20,009 frames bit-stuffed the panel's way (the edge cases `minutes_lo` = `0xFC`/`0xBE`+`0x0F`/`0x7E`/`0x7F`, day 31, `ZONE_STATE` with five or more adjacent zones, real ping and `0x7C` frames, and 20,000 random payloads), returned every frame byte-identical with the closing `0x7E` aligned. Re-stuffing the un-stuffed `0x7C` remote-A arm frame from `protocol_wire_format.md` and the 21:16 `0x54` frame reproduces the logged bytes exactly.
+
+**Not yet verified on hardware.** After flashing, expect: no `Current time has invalid …` or weekday-mismatch lines beyond the occasional one-bit-loss frame (including none of the nightly 23:26–23:27 `minutes-since-midnight 1470/1503`), `tools/analyze_current_time.py` reporting 0 decodes off by more than a few minutes, an RF remote press logging `[RF Remote 48:00:1b] Button event, code fb (data[3] 5e)` (remote A, arm) per the un-stuffed table, and `0x1F` frames (installer menu) with a different payload than the 2026-04-12 trace. The 2026-10-01 predictions (`31/20` all day on 2026-10-31; nightly 1470/1503) stop being observable once this firmware is running — their absence is itself the check.
+
+**Breaking for `on_message` users:** the `data` passed for `0x7C`, `0x1F` and `0x54` frames (and the rare `0x14`/`0x16` above) changes to the un-stuffed bytes. An automation matching bytes captured from older logs needs re-capturing.
