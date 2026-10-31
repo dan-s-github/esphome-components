@@ -38,8 +38,10 @@ static const uint8_t KEYPAD_PING = 0x23;  // Observed recurring keypad keep-aliv
 static const uint8_t KEYPAD_REGISTRATION = 0xA0;  // Keypad announce: [a0.address.00]; sent on power-up/reset
 
 // RF remote button-press event, not tied to any keypad address. data[0..2] is a fixed per-remote
-// identity; data[3..4] is a per-remote, per-button code (not portable across remote units — see
-// docs/protocol_wire_format.md's 0x7C entry).
+// identity; data[4] is the button code, the same on every remote (FB arm, FD disarm, F7 gate,
+// DF garage on the reference install); data[5] counts retransmits; data[6] is a checksum.
+// data[3] equals data[0]+data[1]+data[2]+data[4] in every sample, purpose unknown. Medium-high
+// confidence, 12 frames — see docs/protocol_wire_format.md's 0x7C entry ("Un-stuffed layout").
 static const uint8_t RF_REMOTE_EVENT = 0x7C;
 static const uint8_t BOUNDARY = 0x7E;
 // static const uint8_t KEYPRESS = 0xD1; // This is from upstream, but doesn't get sent by arrowhead panels that I can see
@@ -164,6 +166,7 @@ class CrowAlarmPanelStore {
   ISRInternalGPIOPin data_pin_;
   uint8_t num_bits_{0};
   uint8_t boundary_buffer_{0};
+  uint8_t ones_run_{0};  // consecutive 1 bits inside the current frame, for bit-stuffing removal
 
  public:
   // Hardware ACK: set from CrowAlarmPanel::setup() before interrupts attach.

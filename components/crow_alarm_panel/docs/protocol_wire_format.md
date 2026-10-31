@@ -76,11 +76,28 @@ Frames use HDLC-like `0x7E` boundary markers:
   counted across byte boundaries, one extra `0` bit is sent. Confirmed 2026-10-01 for
   `0x54` and `0x7C` frames (see `protocol_investigations.md`, "Bit-stuffing on the wire").
   There is no *byte*-stuffing (`0x7D` escapes).
-- **The receiver does not currently remove stuffed bits.** Any frame whose true content
-  contains a five-`1` run is mis-sliced from that point on: the byte containing the end of
-  the run and every later byte are shifted up by one bit per stuffing event (later bytes
-  read as `×2`, `×4`, … with the previous byte's top bits carried in). Raw hex in log lines
-  and in the tables below is *as received*, i.e. still stuffed, unless stated otherwise.
+- **The receiver removes stuffed bits (since 2026-10-29).** Inside a frame,
+  `CrowAlarmPanelStore::interrupt()` drops a `0` that follows exactly five `1`s;
+  `boundary_buffer` still sees every raw bit, so flag detection is unchanged. Before that,
+  any frame whose true content contained a five-`1` run was mis-sliced from that point on:
+  the byte containing the end of the run and every later byte were shifted up by one bit per
+  stuffing event (later bytes read as `×2`, `×4`, … with the previous byte's top bits carried
+  in). **Raw hex in log lines from older firmware, and in the historical tables below, is
+  *as received*, i.e. still stuffed**, unless stated otherwise. Over 30 days of frigate logs
+  (2026-09-26 → 10-29) the types that ever carried a stuffed bit were `0x54` (most frames),
+  `0x7C` (every frame: the type byte itself has a five-`1` run), `0x1F` (every frame, same
+  reason), and once each `0x14` and `0x16` (a `0xDF` payload byte). Every other type logged
+  in that window decodes identically before and after.
+- **Keypad-originated frames are unaffected either way.** Whether physical keypads stuff
+  hasn't been observed, but it can't matter: `[A1, address, key]` and `[A0, address, 00]`
+  with an address `0x00`–`0x07` and key `0x00`–`0x11` never contain five consecutive `1`s
+  (the longest run is four: `A1`'s last bit plus address `07`'s three), so de-stuffing never
+  touches them. Addresses with bit 7 set (`0x80`, `0x83`) only appear in the one-bit-short
+  frames of `protocol_investigations.md`, "Single dropped bit at frame start".
+- **The transmit path stuffs too (since 2026-10-29).** `send_packet_blocking_()` inserts a
+  `0` after five `1`s between the flags. Nothing this component sends today contains such a
+  run, so this is a no-op for current traffic and untested against the panel; it covers
+  custom `send_packet()` payloads.
 
 **Parser output convention** used in log messages: `[type.data[0].data[1]... (N)]`
 where `N = data.size()` (payload bytes, excluding type and closing boundary).
@@ -453,10 +470,22 @@ minute = minutes_since_midnight % 60
 ```
 
 **Garbage time values** (seconds ≥ 60, day = 0 or > 31, month = 0 or > 12)
-occur regularly and are not (only) an unset-RTC symptom. **Root cause (2026-10-01):
+occurred regularly until the receiver started removing stuffed bits (2026-10-29, see
+"Frame Format" above). Since then a frame with an out-of-range field, or whose weekday byte
+doesn't match its date, is logged at DEBUG and discarded; nothing is recovered or guessed.
+The rest of this section is history.
+
+**Root cause (2026-10-01):
 un-removed bit-stuffing — see "Frame Format" above; a time whose fields contain five
-consecutive `1` bits is transmitted with an inserted `0` that the receiver keeps.** The
-description below predates that finding and describes the most common case (the run
+consecutive `1` bits is transmitted with an inserted `0` that the receiver kept.** The
+halving recovery described below also let some frames through with a **wrong time**: when
+the run ended inside `minutes_lo`, the date halved back correctly and the weekday check
+passed, but the minutes were off by ±32/64/96/128 (e.g. 21:16 logged as 19:08). This is
+the "wrong minutes" defect first logged 2026-08-10 and quantised to 32-minute steps
+2026-09-03 (`protocol_investigations.md`), now tied to stuffing: about 85 of ~5,460 decodes
+a day, at the same rate on every firmware build back to the oldest retained log
+(2026-09-26); see `protocol_investigations.md`, 2026-10-29. The
+description below predates the bit-stuffing finding and describes the most common case (the run
 completing inside `seconds = 0x0F` when `minutes_lo` has bit 7 set). The pattern as
 originally characterized: a single spurious bit gets clocked into
 the bitstream right after the `seconds` byte, shifting every following byte's
@@ -515,7 +544,7 @@ recovery logic's guarantees, not a confirmed live bug.
 
 *Direction:* RF receiver card → Controller (confirmed by the causality analysis below; not a keypad address — see the manual cross-reference below for why `data[0..2]` never matches the keypad-address convention)  
 *Trigger:* A button press on one of the official RF remotes — never observed for any physical-keypad or integration-initiated command  
-*Min length:* 5 payload bytes (`data[0..2]` identity + `data[3..4]` button code — all the parser decodes; 8 bytes seen in practice in every capture)  
+*Min length:* 5 payload bytes (`data[0..2]` identity + `data[4]` button code, un-stuffed — all the parser decodes; 8 bytes seen in practice in every capture). Logs from firmware with stuffing removal (2026-10-29 on) show the un-stuffed layout below directly; older logs show the as-received bytes.  
 *Confidence:* Confirmed on the RF-remote attribution and on which button was pressed (vendor manual, cross-checked below against four independent trace-derived signals per button); medium-high on the byte layout once bit-stuffing is removed (see "Un-stuffed layout" below)
 
 **Manual cross-reference (`ESL-2 Install & Program Manual (E.V).pdf`, pages 17–19, 48–54):** the panel's RF path is a separate plug-in receiver card, the RX-16 MF349, connected via the "ARRI4" cable — the manual notes explicitly that if this cable is unavailable, "you can wire the receiver the same as a keypad," i.e. the receiver rides the same physical clock/data bus as keypads and presumably reuses the same frame format, which is why `0x7C` shows up as a normal-looking frame despite not coming from a keypad. Remotes are enrolled as **Radio Users** in User slots 21–100 — a completely different addressing space from keypad bus addresses — which is *why* `data[0..2]` never matches the keypad-address convention: it isn't a malformed/omitted keypad address, radio users are categorically not keypads. Each physical 4-button pendant is manual-documented as up to **five separate learned radio-user identities**, one per function class, each with its own program-address block and independent "press the button you wish to learn in" enrollment step: Arm-only (`P18E40E`–`P18E49E` for pendants 0–9), Disarm-only (`P18E50E`–`P18E59E`), **Door 2 Control, linked to Output 3** (`P18E60E`–`P18E69E`), **Door 1 Control, linked to Output 4** (`P18E70E`–`P18E79E`), and Panic (`P18E80E`–`P18E89E`). This structurally explains why `data[3..4]` differs per button even on the *same* physical remote (observed below): each button isn't a sub-code of one remote identity, it's independently enrolled as its own radio user. It also independently confirms the output mapping found by trace: "Door 1" (garage, Output 4) and "Door 2" (Output 3 — wired to the user's gate in this installation, but generically named "Door 2" by the panel) match our button 4/button 3 findings exactly. The manual doesn't document `0x7C`'s on-wire byte layout (it's user/installer-facing, not a protocol reference) — the retransmit-pattern and checksum-byte details below remain trace-only.
