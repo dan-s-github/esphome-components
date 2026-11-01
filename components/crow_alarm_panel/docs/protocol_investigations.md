@@ -1091,6 +1091,25 @@ Every predicted combination above has been logged, and no logged variant falls o
 
 **Practical takeaway:** no code change. A cheap test of the inference: power-cycle or unplug the module at address `0x07` and see whether the 300s announces, the storms and the watchdog trips all drop back to the pre-09-15 level (a few a day). `known_quirks.md`'s watchdog entry now points here.
 
+### Update (2026-11-01): removing `0x07` cut storms and watchdog trips about tenfold
+
+**Source:** the frigate logger's 30-day archive, counted per UTC day. Before: 2026-09-29 → 10-05 (7 days). After: 2026-10-08 → 11-01 05:36, less the logger outage 10-11 03:19 → 10-13 19:45 (about 21.5 days covered). The module was removed when the panel was powered down on 2026-10-06; `0x07` announces stop that day.
+
+**Findings (observed facts):**
+
+| | Before (per day) | After (per day) |
+| --- | --- | --- |
+| "No ping for 60 s" watchdog trips | 41 (~5.9) | 11 (~0.5) |
+| `Unknown [ff.]`/`[fe.]` lines | 513 (~73) | 102 (~4.7) |
+| `… too short` / `… invalid length` WARNs | 12 (~1.7) | 6 (~0.3) |
+
+- 10-07, the first full day after removal, still had 6 trips and 57 `ff.`/`fe.` lines; not investigated. From 10-08 on, the rates above hold.
+- The bursts that remain still come about 10 lines at a time and are still each followed by an `ESPHome Keypad` watchdog trip ~45 s later, with an `AAP Keypad` re-registration in between (e.g. 2026-10-31 18:29:11 UTC: 10 lines, AAP `Registration [a0.00.00]` at 18:29:32, trip at 18:29:56).
+
+**Inference (high confidence on the link; medium on the mechanism):** the 2026-10-01 inference holds. `0x07`'s 5-minute announce cycle was the main source of controller ping-retry storms. The truncated-frame drop suggests those WARNs were mostly storm side effects too. The ~0.5/day residual has no identified trigger.
+
+**Practical takeaway:** no code change. `known_quirks.md` rates updated.
+
 ## RF-interference fault (2026-10-03) — what a panel fault looks like on the bus, and the cause of the 2026-09-25 watchdog exception
 
 **Source:** frigate capture 2026-10-01 04:11 → 2026-10-03 03:16 UTC, the 30-day rotated archive (searched for the same signature), and the user's report that the AAP keypad (`0x00`) showed an interference warning on the morning of 2026-10-03 (~08:00 NZDT = 2026-10-02 ~19:00 UTC). Vendor manual (`ESL-2 Install & Program Manual (E.V).pdf`, "Current Faults/History" event list) for the fault names.
@@ -1310,6 +1329,8 @@ Side note: the 23:49:05.665 press was HA toggling the Gate switch to "off". The 
 - RF remote `48:00:1b` logged `code fb (data[3] 5e)`, `fd (60)`, `f7 (5a)` and `df (42)`, matching the un-stuffed table.
 - No `0x1F` frames: the installer menu wasn't opened, so that prediction is still unchecked.
 - Other traffic was unchanged. 3 arm and 3 disarm cycles (all from the RF remote or keypads, none from ESPHome) and 6 output-4 sequences all completed with no timeouts. The only warnings were 2 `Controller status too short, discarding`, within the pre-fix baseline of 0–2 a day.
+
+**On `main` (2026-11-01):** after PR #18 merged, the device was flashed from `main` (compiled 2026-10-31 17:22:55 +1300). Over the next ~25 h: `analyze_current_time.py` 10,123 of 10,123 exact; an ESPHome arm away (10-31 19:34 NZDT) and two ESPHome disarms with code (10-31 19:35 and 11-01 13:09 NZDT) completed first try, each digit confirmed by `14.05.01…`; one keypad arm (11-01 10:59 NZDT) also completed. This covers the ESPHome-initiated arm/disarm the 10-31 window lacked.
 
 **Not explained by stuffing:** none of the confirmations the output-select and arm/disarm state machines wait for (`14.05.xx.00.08.0x.80`, `1d.05…`) contains a five-`1` run. In the pre-fix ENTER_PENDING timeouts (3 of 11 output sequences, 2026-10-23 → 10-29), the confirmation never arrived at all; it wasn't logged garbled. The pre-fix disarm retries of 2026-10-27 got a real `CMD 0x07` from the panel and the same digits worked on the third try. So output/arm retries, `ff.`/`fe.` bursts and truncated frames are expected to continue. 46 h is too short to show a rate change for any of them.
 
