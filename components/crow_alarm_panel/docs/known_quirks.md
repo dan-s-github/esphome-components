@@ -75,8 +75,9 @@ confirmation could pulse the output twice.
 ## Occasional `Unknown [ff.]` / `Unknown [fe.]` log lines
 
 **What you'll see:** at `DEBUG` level, occasional lines like `Unknown [ff.]` or
-`Unknown [fe.]`, usually in short clustered bursts of several lines within about a second,
-roughly once every 1–2 hours in long-term captures.
+`Unknown [fe.]`, usually in short clustered bursts of several lines within about a second.
+Since the unused keypad module at address `0x07` was removed (2026-10-06), a burst comes
+about once every two days; before that it was roughly every 1–2 hours.
 
 **Cause:** the controller retransmitting a frame (its own ACK-detection quirk, not
 anything this integration does) faster than our receiver can cleanly decode it — the
@@ -94,10 +95,9 @@ after a burst.
 
 ## Occasional "No ping for 60 s, re-sending registration announce" warning
 
-**What you'll see:** a `WARN`-level log line, at a rate that's varied a lot between
-capture windows — roughly 0.05–0.9/h in most windows, with some full 21–27h windows at
-zero — followed immediately by the integration re-registering itself on the bus. No
-functional interruption — entities keep working normally.
+**What you'll see:** a `WARN`-level log line, about once every two days since 2026-10-08
+(several a day before that), followed immediately by the integration re-registering itself
+on the bus. No functional interruption — entities keep working normally.
 
 **Cause:** in almost every observed instance, this fires exactly when an
 `Unknown [ff.]`/`[fe.]` corruption burst (see above) happens to land in this integration's
@@ -107,23 +107,24 @@ pauses polling for ~15–20s when it raises a fault, which trips the watchdog in
 way — see "Keypad TROUBLE light / RF interference warning" below. (The 2026-09-25
 instance once listed here as unexplained turned out to be one of these.)
 
-Since mid-September 2026 most of these bursts line up with another device on the bus —
-the keypad at address `0x07` re-announcing itself every 5 minutes — rather than random
-noise; about 1 in 20 of its announces disturbs the bus enough to trigger this. See
-`protocol_investigations.md`, "Keypad registration-announce patterns" (2026-10-01).
+From mid-September to 2026-10-06 most of these bursts lined up with another device on the
+bus: an unused IP module at keypad address `0x07` re-announcing itself every 5 minutes.
+Removing it cut the trip rate about tenfold. If you see several trips a day, look for a
+similar device on your bus. See `protocol_investigations.md`, "Keypad registration-announce
+patterns" (2026-10-01) and its 2026-11-01 update.
 
 **What to do:** nothing — this is the existing watchdog recovering exactly as designed.
-The observed baseline has varied between capture windows, including at least one full
-~21-27h window with zero trips, so treat "roughly hourly" as a loose upper bound rather
-than a stable rate; a sustained rate well above that would still be worth a fresh look.
+A sustained rate of several a day is worth a look for a misbehaving keypad or module.
 
 ---
 
-## "Never pinged since announce, re-sending registration announce" warning after a power cut
+## "Never pinged since announce, re-sending registration announce" warning after a power cut or reboot
 
 **What you'll see:** right after the alarm panel and this device power up together (power
 cut, or the panel being powered down for maintenance), one or more of these `WARN` lines
-about a minute apart, then normal polling resumes.
+about a minute apart, then normal polling resumes. It can also happen, less often, after
+this device alone reboots (e.g. an OTA update): seen once in about 20 logged reboots
+(2026-10-31), where the second announce 60 s later was polled at once.
 
 **Cause:** the integration announces itself 15 s after boot. If the panel is still starting up
 at that point, it can miss the announce and never poll this device. Observed 2026-10-06, when
@@ -144,35 +145,10 @@ is free and that the panel has fully started up.
 
 ---
 
-## "Current time has invalid ..." log lines (rare since 2026-10-29)
-
-**What you'll see:** with current firmware, normally nothing. An occasional `DEBUG` line
-such as `Current time has invalid day/month value ...`, `invalid seconds value ...` or
-`Current time weekday ... doesn't match date ...` means a corrupted time frame (most likely
-the rare one-bit receive loss), which is discarded. Not visible anywhere in Home Assistant — the
-panel's `CURRENT_TIME` broadcast isn't exposed as an entity.
-
-**On older firmware** these lines were routine: `invalid day/month value 36/36` or
-`invalid seconds value 90` at `DEBUG` many times an hour, `invalid minutes-since-midnight
-value 1470`/`1503` at `WARN` every night at 23:26–23:27 panel-local, and about 85
-`Controller time update` lines a day showing a time off by 32–128 minutes.
-
-**Cause:** the bus bit-stuffs (the panel inserts a `0` after five consecutive `1` bits so
-the `0x7E` frame marker stays unique), and before 2026-10-29 this component kept the
-inserted bit. Whenever the current time contained such a run, the fields after it were
-shifted, which is why the same bad values recurred on a fixed schedule. The receiver now
-removes the inserted bit. See `protocol_investigations.md`, "Bit-stuffing on the wire"
-(2026-10-01) and "Bit-stuffing removed in the ISR" (2026-10-29).
-
-**What to do:** nothing. If these lines show up regularly on current firmware, that is
-new: capture the log lines (they include the raw frame) and open an issue.
-
----
-
 ## Rare truncated-frame warnings (`... too short, discarding` / `... invalid length, discarding`)
 
-**What you'll see:** very occasionally (roughly once every several hours in long-term
-captures), a `WARN` line like `Controller status too short, discarding`, `Zone state
+**What you'll see:** very occasionally (about once every few days since 2026-10-08; a
+couple a day before that), a `WARN` line like `Controller status too short, discarding`, `Zone state
 invalid length, discarding`, `Output state too short, discarding`, or `Current time too
 short, discarding`.
 
@@ -233,29 +209,22 @@ happening often, check for a new radio source near the panel.
 
 ## Gate / garage pressed during an arm or disarm
 
-**What you'll see (older firmware):**
-- **During an arm:** pressing an output switch (gate, garage) during the exit delay
-  appeared to work. The switch flicked on and back off, but nothing happened.
-- **During a disarm:** a press while the disarm code was still being entered was rejected
-  with `set_output(N, on): another keypress sequence in progress, ignoring`.
+**What you'll see:** a gate or garage press from Home Assistant while an arm or disarm is
+being typed doesn't fire straight away. The log shows
+`set_output(N, on): another keypress sequence in progress, queued`, and the output fires
+about 1.5 s after the arm/disarm finishes. A press still waiting after 10 s is dropped. Rarely
+(1 of 6 in testing), a queued press doesn't switch: the log shows
+`Output-select: output N did not switch …` and the switch goes back to off.
 
 **Cause:**
-- **Exit delay:** the panel puts every keypad on its arming screen. From there it accepts
-  the output keys but doesn't act on them until the keypad presses "Back" (ENTER), which is
-  what you do on the touch keypad before pressing the gate button. RF remotes aren't
-  affected.
-- **Disarm:** only one key sequence can be typed at a time.
+- **One sequence at a time:** the panel only accepts one key sequence, so a second one waits.
+- **Exit delay:** the panel holds every keypad on its arming screen, where output keys are
+  acknowledged but ignored until "Back" (ENTER) is pressed. The component presses "Back"
+  first, both for outputs and for a disarm code. RF remotes aren't affected.
 
 See `protocol_investigations.md`, "Outputs during the exit delay (2026-10-14)".
 
-**What to do:** nothing with newer firmware.
-- **Exit delay:** the component presses "Back" first.
-- **Disarm:** a press during an arm/disarm is queued and runs 1.5 s after that finishes
-  (dropped if it's still waiting after 10 s).
-
-Disarming from Home Assistant during the exit delay hit the same arming screen. The code
-was accepted key by key, but the disarm only went through after the delay ended, ~28 s and 5
-retries later (2026-10-14). Newer firmware presses "Back" before typing the code there too.
+**What to do:** nothing for the delay. If you see `did not switch`, press it again.
 
 ---
 
