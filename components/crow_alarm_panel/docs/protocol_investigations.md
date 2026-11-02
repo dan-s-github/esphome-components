@@ -1194,9 +1194,9 @@ The component logged `Output-select: sequence complete` for all three.
 **Change (branch `fix/output-select-reliability`):**
 - During the exit delay (tracked from `ARMED_STATE`), output selection starts with ENTER and waits for its `KEYPAD_COMMAND` before OUTPUT. It is not prefixed elsewhere, because ENTER from mid-entry submits the buffer, and leftover code digits plus ENTER is the arm/disarm-with-code gesture.
 - A sequence must now show the output switching, either in `OUTPUT_STATE` or in data[3] after the digit, or it logs a WARN and republishes the real switch state.
-- `set_output()` requests made during another keypress sequence are queued (one slot, 10 s) instead of dropped.
 
 See `output_select_state_machine.md`.
+Test line added by a Visual Worktree test pull request. Do not merge.
 
 **To confirm after flashing:** arm from HA, then press Gate during the exit delay. The log should show `panel in exit delay, sending ENTER first`, `ENTER confirmed (CMD 0x01)`, `OUTPUT_STATE [04]`, and `output 3 switched`. If the reply to that ENTER is not 0x01, or the output still doesn't fire, the inference above is wrong.
 
