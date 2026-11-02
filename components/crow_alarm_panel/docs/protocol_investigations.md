@@ -1335,3 +1335,38 @@ Side note: the 23:49:05.665 press was HA toggling the Gate switch to "off". The 
 **Not explained by stuffing:** none of the confirmations the output-select and arm/disarm state machines wait for (`14.05.xx.00.08.0x.80`, `1d.05…`) contains a five-`1` run. In the pre-fix ENTER_PENDING timeouts (3 of 11 output sequences, 2026-10-23 → 10-29), the confirmation never arrived at all; it wasn't logged garbled. The pre-fix disarm retries of 2026-10-27 got a real `CMD 0x07` from the panel and the same digits worked on the third try. So output/arm retries, `ff.`/`fe.` bursts and truncated frames are expected to continue. 46 h is too short to show a rate change for any of them.
 
 **Breaking for `on_message` users:** the `data` passed for `0x7C`, `0x1F` and `0x54` frames (and the rare `0x14`/`0x16` above) changes to the un-stuffed bytes. An automation matching bytes captured from older logs needs re-capturing.
+
+## Gate presses and a disarm during one exit delay (2026-11-02) — first `CODE_DIGIT_PENDING` timeouts since the exit-delay fixes
+
+**Source:** frigate long-term logger, 2026-11-02 03:29–03:31 UTC (16:29–16:31 NZDT). The device was on the `main` build flashed 2026-10-31; the logger shows no reconnect in the current file. Sequence: ESPHome disarm, ESPHome arm away, gate (output 3) pressed three times from HA during the exit delay, then an ESPHome disarm during the same exit delay.
+
+**Observed facts:**
+
+- **Disarm at 03:29:54** (not in the exit delay): each digit confirmed by `14.05.01…`, `Disarmed` 137 ms after the terminal ENTER, 0.6 s in total.
+- **Arm away at 03:30:12:** `Arming` 138 ms after `KEY_ARM`; every keypad got `KEYPAD_COMMAND` 0x89, as on 2026-10-14.
+- **Gate presses during the exit delay:**
+
+| Start (UTC) | Leading ENTER reply | OUTPUT → `0x1D` ACK | `OUTPUT_STATE` | Final ENTER reply | Logged |
+|---|---|---|---|---|---|
+| 03:30:13.804 | CMD 0x01 | yes | `[04]` | `14.05.15.00.04…` | `output 3 switched` |
+| 03:30:16.876 | CMD 0x01 | yes | `[04]` | `14.05.15.00.04…` | `output 3 switched` |
+| 03:30:20.051 | CMD 0x01 | yes | `[04]` at 20.742 | none | `timeout in state 5, aborting`, then `sequence aborted, output 3 switched` |
+
+  In the third run the digit's confirmation (`14.05.01.00.04…`) arrived twice, at 20.600 and 20.670. The final ENTER went out at 20.674, 4 ms after the duplicate, and nothing answered it within the 1 s watchdog. The output had already fired on the digit, so the abort was reported correctly as switched. This is the 4th `ENTER_PENDING` abort since 2026-10-23 (others: 10-23 19:22, 10-23 23:33, 10-26 01:42 UTC).
+
+- **Disarm at 03:30:26.194**, 4.5 s after that abort, still in the exit delay:
+
+| Attempt | Leading ENTER reply | Digit 0 | Digit 1 | Result |
+|---|---|---|---|---|
+| first | `14.05.15.00.04…` (CMD 0x15) | confirmed after 268 ms (`14.05.01…`) | sent 26.771, no reply | `timeout in state 3`, retry 1/6 |
+| retry 1 (28.819) | CMD 0x07 | confirmed | sent 29.297, no reply | `timeout in state 3`, retry 2/6 |
+| retry 2 (32.312) | CMD 0x07 | confirmed | confirmed | all 4 digits + ENTER confirmed; `Disarmed` at 33.321 |
+
+  7.1 s from request to `Disarmed`. Right after the first attempt's digit 1 went out, the log has `api took a long time (53 ms)` and `crow_alarm_panel took a long time for an operation (101 ms)`, the only two such warnings in the current log file. No `Unknown`, truncated-frame or other bus-corruption lines appear in 03:30:20–03:30:33.
+
+- **Across the archive (2026-10-13 → 11-02):** every earlier arm/disarm timeout was in state 4 (`CODE_ENTER_PENDING`) or 1. These are the first state 3 (`CODE_DIGIT_PENDING`) timeouts in the retained logs, and both stalled on the same digit (index 1).
+- In the 2026-10-14 exit-delay disarms the leading ENTER was always answered CMD 0x01. Here it was answered 0x15, then 0x07 twice.
+
+**Inference (low confidence, one session):** the third gate sequence's final ENTER may never have reached the panel, leaving the ESPHome keypad in output selection. The disarm's leading ENTER would then have closed it, matching the 0x15 reply that ENTER gets at the end of a normal output sequence, instead of taking "Back" from the arming screen (0x01). That would leave the code entry starting from a different screen than the 2026-10-14 tests. It doesn't explain why retry 1 also stalled on digit 1, or why retry 2 succeeded with the same 0x07 reply. The 101 ms loop stall is a second candidate for the first attempt only: a confirmation that arrived while `loop()` was blocked could have been missed. Neither is established.
+
+**Outcome:** every command ended in the requested state, and the retry budget was far from exhausted (2 of 6). No code change. To watch for: more state 3 timeouts, especially a disarm shortly after an output sequence that aborted in state 5.
