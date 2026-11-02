@@ -1,6 +1,6 @@
 # Visual Worktree test file
 
-Line three, which the second push changes.
+Line three, changed by the second push.
 
 Line five, whose thread gets resolved.
 Line six, for the pending review.
