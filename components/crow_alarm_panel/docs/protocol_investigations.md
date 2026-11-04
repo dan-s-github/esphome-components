@@ -1414,3 +1414,38 @@ Normal gaps are 70–90 ms. Many earlier unexplained retries (10-13 23:27/23:45/
 
 **Change tried and dropped:** the ISR stamped each queued frame with `micros()` at its closing boundary, TX recorded `micros()` at completion, and a `KEYPAD_COMMAND` for our keypad that completed less than 40 ms after our last TX was logged (`… too early to be its reply, ignoring`) and kept from driving any state machine. It was flashed to the device on 2026-11-04 (03:44–04:18 UTC) and then dropped from `dan-dev`. Logs from that window are excluded from analysis. The early-confirmation question stays open, and the device-side timestamping is still the way to settle it without the log-timestamp caveat.
 
+
+## Gate press just after the exit delay (2026-11-04 04:26 UTC) — a lost final ENTER leaves the keypad in output selection, and a disarm then types its code there
+
+**Source:** frigate long-term logger, 2026-11-04 04:18–04:31 UTC. The device ran the build compiled 2026-11-04 17:17:46 +1300 (installed 04:18:06 UTC), which has the same code as `main`. The `compiled on` banners at 04:24:57 and 04:25:16 are logger reconnects, not reboots.
+
+**Observed facts:**
+
+| Time (UTC) | Action | Result |
+|---|---|---|
+| 04:26:01 | ESPHome arm away | `Arming` |
+| 04:26:02 / :04 / :06 | Gate (output 3), exit delay | all complete |
+| 04:26:29 | — | `armed_away` |
+| 04:26:30 | Gate | `timeout in state 3`, retry via `KEYPAD_COMMAND in OUTPUT_PENDING (no 0x1D), recovering`, complete |
+| 04:26:34 | Gate | OUTPUT ACKed, digit confirmed, output switched; final ENTER unanswered → `timeout in state 5, aborting … output 3 switched` |
+| 04:26:40, :49, :55 | Gate | OUTPUT answered CMD 0x07, selection 0x04 → `OUTPUT not accepted`, `did not switch` each time |
+| 04:27:00 | ESPHome disarm (fully armed, so no leading ENTER) | first digit answered, then `timeout in state 3`; same on retries 1–5 |
+| 04:27:03 | — | `Alarm pending from zone 3`, `pending` |
+| 04:27:26 | Disarm on the physical AAP keypad | `disarmed` |
+| 04:27:43 – 04:29:06 | Gate ×4 | OUTPUT answered CMD 0x07 → `did not switch` each time |
+| 04:30:37 | — | `[ESPHome Keypad] Command [14.05.00…]`, then `[ESPHome Keypad] In normal state` |
+
+- During the disarm, the same output switched on once per attempt (04:27:00, :03, :06, :10, :16, :26 in `Output state`), with no output request running. Which output is not recorded here: a code digit selects it, so naming it would disclose part of the alarm code.
+- The panel sends `[ESPHome Keypad] In normal state` every ~90 s (04:18:22, 04:19:51, 04:21:21, 04:22:51, 04:24:21, 04:25:51) and right after each completed sequence. Between the 04:26:36 abort and 04:30:37 there were none, although three periodic ones were due.
+- The 04:26:34 abort has the shape of the earlier `ENTER_PENDING` aborts: `Output state [04]` logged after ENTER went out.
+
+**Inference (high confidence on the mechanism):** the controller never took the final ENTER, so it kept the ESPHome keypad in output selection for ~4 minutes and then released it on its own. In that state OUTPUT gets CMD 0x07, and a disarm that doesn't press ENTER first has its first code digit taken as an output number (switching that output on) while the rest of the code is ignored. On 2026-11-02 the same abort was followed by an exit-delay disarm, whose leading ENTER got CMD 0x15 and closed output selection. Why the final ENTER is lost is still open. Whether the output triggered zone 3 is not established.
+
+**Change:** `CrowAlarmPanel` now tracks `output_select_open_`. It is set when OUTPUT is accepted (0x1D, or the no-0x1D recovery), when an output sequence aborts in `ENTER_DELAY`/`ENTER_PENDING`, and when OUTPUT is refused with CMD 0x07 outside the exit delay. It is cleared by a `KEYPAD_COMMAND` with CMD 0x15 or an `In normal state` for our keypad. While it is set:
+
+- with all state machines idle, `loop()` sends ENTER once a second, up to 5 times (`Output-select: keypad may still be in output selection, sending ENTER to leave it (n/5)`), then logs an error and waits for the controller;
+- an output sequence, and an arm/disarm code sequence, start with ENTER (the existing `CLEAR_PENDING` paths);
+- a code digit is never typed: if the leading ENTER's reply isn't the exit reply, `CODE_CLEAR_DELAY` logs `keypad still in output selection, not typing the code` and the watchdog retries from the leading ENTER;
+- arm away/stay without a code and zone bypass are refused with a warning.
+
+Compiled against the test fixture, not yet tested on hardware. To check: after a `timeout in state 5` abort, the recovery ENTER's reply is CMD 0x15 (or `In normal state` follows), and a disarm right after succeeds without switching an output.

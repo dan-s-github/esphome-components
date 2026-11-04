@@ -228,6 +228,33 @@ See `protocol_investigations.md`, "Outputs during the exit delay (2026-10-14)".
 
 ---
 
+## "Keypad may still be in output selection, sending ENTER to leave it" warning
+
+**What you'll see:** after an output press logs `Output-select: timeout in state 5, aborting`
+(the output itself usually did switch), a few seconds of:
+
+```
+[W] Output-select: keypad may still be in output selection (final ENTER unanswered)
+[W] Output-select: keypad may still be in output selection, sending ENTER to leave it (1/5)
+[D] Output-select: keypad out of output selection (exit reply)
+```
+
+An arm or bypass requested in those seconds may be refused with `keypad may still be in
+output selection, ignoring`; a disarm instead starts with an extra ENTER.
+
+**Cause:** the panel sometimes doesn't take the final ENTER of an output press (most often right
+after the exit delay ends), and then keeps this keypad in output selection for ~4 minutes.
+Code digits typed there are read as output numbers, so before this was handled a disarm switched
+an output on and failed. The component now presses ENTER to leave first, and never types the
+code while the keypad may still be there. See `protocol_investigations.md`,
+"Gate press just after the exit delay (2026-11-04 04:26 UTC)".
+
+**What to do:** nothing, unless you see `[E] Output-select: no exit reply after 5 ENTERs`. Then
+disarm from a physical keypad if needed; the panel releases the keypad on its own after a few
+minutes.
+
+---
+
 ## Mains / battery fault sensors
 
 **What you'll see:** during a power cut, or while the panel's backup battery is low or missing, the optional
