@@ -817,7 +817,16 @@ void CrowAlarmPanel::loop() {
               }
               break;
             case OutputSelectState::ENTER_PENDING:
-              this->finish_output_select_(true);
+              // Only the exit reply (CMD 0x15) confirms ENTER. On 2026-11-04 05:17:39 a repeat of
+              // the digit's confirmation (CMD 0x01) arrived instead, ENTER had been lost, and
+              // the keypad was still in output selection. Keep waiting; on timeout the watchdog
+              // leaves output selection with ENTER.
+              if (data.size() > 1 && data[1] == 0x15) {
+                this->finish_output_select_(true);
+              } else {
+                ESP_LOGD(TAG, "Output-select: CMD 0x%02X after ENTER is not the exit reply, waiting",
+                         data.size() > 1 ? data[1] : 0);
+              }
               break;
             default:
               break;
