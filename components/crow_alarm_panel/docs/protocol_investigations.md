@@ -1412,4 +1412,34 @@ Normal gaps are 70–90 ms. Many earlier unexplained retries (10-13 23:27/23:45/
 
 **Inference (medium-low confidence):** a `KEYPAD_COMMAND` is 9 bytes, ~60 ms on the wire at 833 µs/bit, so one that completes less than ~40 ms after our TX started before our key went out and can't be its reply. It is either the panel repeating its previous confirmation (it re-sends `KEYPAD_COMMAND` when it doesn't see our ACK) or one queued during a `loop()` stall, like the 96 ms one above. Advancing on it sends the next key before the panel has taken the previous one, which would explain a garbled code and the 0x07 reply. Against: the timestamps are client-side, so a short logged gap can also be Wi-Fi batching, and batching and slow loops probably go together with failures for other reasons. 5 attempts survived a short gap (today's retry had two), and 7 failures had none, so this is at most one cause.
 
-**Change:** the ISR now stamps each queued frame with `micros()` at its closing boundary, and TX records `micros()` at completion. A `KEYPAD_COMMAND` for our keypad that completed less than `MIN_REPLY_DELAY_US` (40 ms) after our last TX is logged (`Command ended N ms after our last TX, too early to be its reply, ignoring`) and doesn't drive any state machine; the 1 s watchdog still covers a reply that never comes. This uses device-side times, so it doesn't depend on the log timestamps. To check after flashing: how often the new line appears, and whether arm/disarm retries drop.
+**Change tried and dropped:** the ISR stamped each queued frame with `micros()` at its closing boundary, TX recorded `micros()` at completion, and a `KEYPAD_COMMAND` for our keypad that completed less than 40 ms after our last TX was logged (`… too early to be its reply, ignoring`) and kept from driving any state machine. It compiled and was flashed for the hardware test below, but the log line never appeared there, so it changed nothing observable. The commit was dropped from `dan-dev`. The early-confirmation question stays open, and the device-side timestamping is still the way to settle it without the log-timestamp caveat.
+
+## Hardware test (2026-11-04 03:44–03:57 UTC) — a lost output ENTER leaves the keypad in output selection, and the next disarm types the code there
+
+**Source:** frigate long-term logger, 2026-11-04 03:44–03:57 UTC. The device was flashed at 03:44 with the early-reply filter above (compiled 16:43 NZDT). **This failure has only been seen on that build.** The filter can only change behavior by skipping a frame, and it logs `… too early to be its reply, ignoring` before doing so; that line appears nowhere in this window, and its only other change is one timestamp store in the ISR. So the filter most likely played no part, but that rests on the log being complete, and the sequence below has not yet been reproduced on `main`.
+
+**Observed facts:**
+
+| Time (UTC) | Action | Result |
+|---|---|---|
+| 03:53:52 | ESPHome arm away | `Arming` |
+| 03:53:53 | Gate (output 3), exit delay | complete |
+| 03:53:57 | Gate (output 3), exit delay | leading ENTER unanswered (`timeout in state 6`), retry complete |
+| 03:54:20 | — | `armed_away` (exit delay over) |
+| 03:54:22 | Gate (output 3), fully armed | OUTPUT ACKed, digit confirmed, `Output state [04]`; final ENTER unanswered → `timeout in state 5, aborting … output 3 switched` |
+| 03:54:27 | Gate (output 3) | OUTPUT answered CMD 0x07, selection 0x04 → `OUTPUT not accepted`, twice → `did not switch` |
+| 03:54:30 | ESPHome disarm, fully armed | no leading ENTER (not in exit delay); first code digit answered CMD 0x01 with a non-zero selection, and `Output state` showed an output on; next digit unanswered → `timeout in state 3` |
+| 03:54:32–03:55:11 | disarm retries 1–6 | same each time: an output switched on after the first digit, then `timeout in state 3`; `aborting after 6 retries` |
+| 03:54:33 | — | `Alarm pending from zone 3`, `Alarm Status` → `pending` |
+| 03:55:44 | Disarm on the physical AAP keypad | `Disarmed` |
+| 03:55:33, 03:55:54, 03:55:58 | Output press from HA | OUTPUT answered CMD 0x07 with a non-zero selection → `did not switch` each time |
+
+- The same output switched on six times, once per disarm attempt (03:54:30, :33, :36, :40, :46, 03:55:10), with no output request running at those moments. Which output is deliberately not recorded here: it is selected by a code digit, so naming it would disclose part of the alarm code.
+- In the 03:54:22 abort the digit's confirmation arrived twice (23.082, 23.134) and `Output state [04]` was logged after ENTER went out (23.224 vs ENTER 23.169–23.203), the same shape as the earlier `ENTER_PENDING` aborts.
+- After every completed output or arm/disarm sequence the panel sends `[ESPHome Keypad] In normal state [15.05…]`. The last one in this window is 03:54:00; none follows the 03:54:24 abort up to the end of the capture (03:57).
+
+**Inference (high confidence on the mechanism, one session):** the lost final ENTER left the ESPHome keypad in output selection. OUTPUT is then refused with 0x07 (consistent with the `OUTPUT_SELECT_ENTER_DELAY_MS` comment in `crow_alarm_panel.h`), and a disarm that doesn't press ENTER first types its code digits into output selection: the first digit selects and fires the output with that number, and the panel waits for ENTER, so the second digit gets no reply. On 2026-11-02 the same abort was followed by an exit-delay disarm, whose leading ENTER got 0x15 and closed output selection, which is why that disarm eventually worked. Whether that output triggered zone 3 is not established. The missing `In normal state` broadcast is a candidate signal for "still in output selection" (low confidence: its timing outside sequences hasn't been checked).
+
+**Relation to `main` (inference):** `main` has the same `ENTER_PENDING` abort (10-23 19:22 and 23:33, 10-26 01:42, 11-02 03:30 UTC), and on 11-02 the following exit-delay disarm's leading ENTER got 0x15, which fits the keypad having been left in output selection there too. No `main` log yet shows an output press or a disarm outside the exit delay following such an abort, so the full chain is unobserved on `main`.
+
+**Outcome:** a likely hazard: after an `ENTER_PENDING` abort, an ESPHome disarm outside the exit delay failed all 6 retries and fired an output on every attempt. First step: reproduce on `main` (gate press right after the exit delay ends, until a state 5 abort, then an output press), stopping before a disarm. Needs a code change: track that output selection is open, resend ENTER until 0x15 instead of aborting, and send ENTER first (refusing to type code digits without a 0x15) before any sequence while it may still be open. Not implemented yet.
