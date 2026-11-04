@@ -231,7 +231,8 @@ See `protocol_investigations.md`, "Outputs during the exit delay (2026-10-14)".
 ## "Keypad may still be in output selection, sending ENTER to leave it" warning
 
 **What you'll see:** after an output press logs `Output-select: timeout in state 5, aborting`
-(the output itself usually did switch), a few seconds of:
+(the output itself usually did switch), sometimes preceded by
+`CMD 0x01 after ENTER is not the exit reply, waiting`, a few seconds of:
 
 ```
 [W] Output-select: keypad may still be in output selection (final ENTER unanswered)

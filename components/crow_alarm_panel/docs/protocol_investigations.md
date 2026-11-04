@@ -1449,3 +1449,20 @@ Normal gaps are 70–90 ms. Many earlier unexplained retries (10-13 23:27/23:45/
 - arm away/stay without a code and zone bypass are refused with a warning.
 
 Compiled against the test fixture, not yet tested on hardware. To check: after a `timeout in state 5` abort, the recovery ENTER's reply is CMD 0x15 (or `In normal state` follows), and a disarm right after succeeds without switching an output.
+
+## Output-selection recovery on hardware (2026-11-04 04:46–05:18 UTC) — ENTER leaves output selection; a lost ENTER can also look like a completed press
+
+**Source:** frigate long-term logger, 2026-11-04 04:46:41–05:18:22 UTC, build compiled 2026-11-04 17:46:19 +1300 (`ede4dfa`, the output-selection tracking above). Two sessions: 04:52–04:54 and 05:15–05:18, watched live.
+
+**Observed facts:**
+
+- **Recovery by the next press (04:53:12):** the first gate press 7 s after `armed_away` switched the output (`Output state [04]`), but its final ENTER went unanswered: `timeout in state 5, aborting`, then `keypad may still be in output selection (final ENTER unanswered)`. The next press, 0.6 s later, logged `sending ENTER first`; the controller answered `14.05.15.00.04…` (`keypad out of output selection (exit reply)`) and `In normal state` 60 ms later, and that press then completed normally. On `main` (04:26 above) every press after such an abort got CMD 0x07 for ~4 minutes.
+- **Recovery by the idle ENTER (05:17:39):** the press logged `sequence complete, output 3 switched`, but the reply it took for ENTER was `14.05.01.00.04…`, identical to the digit's confirmation 50 ms earlier, not the exit reply. 0.6 s later `loop()` logged `sending ENTER to leave it (1/5)`; the controller answered CMD 0x15 within 0.12 s, followed by `In normal state`.
+- **Disarms:** 04:54:42 (first attempt, 0.66 s) and 05:17:56 (CMD 0x07 after the terminal ENTER, `timeout in state 4`, retry 1 succeeded, 3.3 s total) both disarmed, with `Output state` staying `[00]`. A disarm while output selection was still open didn't occur: the recovery cleared it first each time.
+- 41 gate presses in total: 38 completed and switched, 1 aborted in state 5 but switched (04:53:12), 2 `did not switch` (05:16:12 after a state-1 retry, and 05:17:35).
+
+**Across the retained archive (2026-10-02 → 11-04):** of 110 output sequences that reached `sequence complete`, 108 got CMD 0x15 as the reply to their final ENTER. The other two, 10-13 23:27 and 11-04 05:17:39, got CMD 0x01, which is the lost-ENTER case above.
+
+**Selection byte is not a reliable "digit taken" signal:** the reply to the output digit showed selection 0x00 in 14 sequences. In some the byte toggled off a selection still showing from the previous press (04:53:18, 04:53:52: ACK `1d.05.00.04…`, digit reply `…00.00…`) and the output still switched; in 10-13 23:49:05 it stayed 0x00 and the output switched too. A rule holding the sequence until the digit's reply shows the output selected would have retried (and possibly re-fired) those presses, so it was not adopted. Why the two `did not switch` presses missed is still open.
+
+**Change:** in `ENTER_PENDING` only CMD 0x15 now completes the sequence. Any other `KEYPAD_COMMAND` logs `CMD 0x.. after ENTER is not the exit reply, waiting`; if no 0x15 comes, the watchdog aborts in state 5 and the recovery ENTER follows. Compiled, not yet tested on hardware.
