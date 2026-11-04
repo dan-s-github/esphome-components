@@ -5,7 +5,7 @@ in Home Assistant, in the ESPHome logs, or physically at the panel. These are al
 already-understood behaviors from the reverse-engineering notes in this `docs/` folder;
 each entry links to the detailed technical writeup for anyone who wants the full analysis.
 
-Unless marked as an open bug, none of these need a code change — they're either genuinely benign bus/panel
+None of these currently need a code change — they're either genuinely benign bus/panel
 behavior, or already handled correctly by existing retry/recovery logic. This page exists
 so a symptom doesn't get mistaken for a new bug.
 
@@ -225,29 +225,6 @@ about 1.5 s after the arm/disarm finishes. A press still waiting after 10 s is d
 See `protocol_investigations.md`, "Outputs during the exit delay (2026-10-14)".
 
 **What to do:** nothing for the delay. If you see `did not switch`, press it again.
-
----
-
-## Disarm fails and fires a gate/garage output after an output press didn't finish (suspected open bug)
-
-**What you'll see:** an output press from Home Assistant logs
-`Output-select: timeout in state 5, aborting` (the output itself usually did switch). After
-that, further output presses log `OUTPUT not accepted (CMD 0x07 …)` and `did not switch`,
-and an ESPHome disarm while fully armed fails all 6 retries
-(`timeout in state 3, … aborting after 6 retries`). **Each disarm attempt switches an output
-on** (seen 2026-11-04: the same output, six times), and the panel may go to pending if that output
-opens something covered by a zone.
-
-**Cause:** the panel never answered the final ENTER of the output press, so it kept the
-ESPHome keypad in output selection. A disarm outside the exit delay doesn't press ENTER
-first, so its code digits go into output selection: the first one picks and fires an output.
-Seen once, on a test build with an extra (inactive) change; not yet reproduced on `main`, though
-`main` has the same output-press abort that starts it. See `protocol_investigations.md`,
-"Hardware test (2026-11-04 03:44–03:57 UTC)".
-
-**What to do:** this needs a code fix and isn't handled yet. If you see the state 5 abort,
-don't disarm from ESPHome until the log shows `[ESPHome Keypad] In normal state` again;
-disarm at a physical keypad instead.
 
 ---
 
