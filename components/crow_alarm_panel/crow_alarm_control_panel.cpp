@@ -1,10 +1,19 @@
 #include "crow_alarm_panel.h"
 #include "esphome/core/log.h"
+#include "esphome/core/version.h"
 
 namespace esphome {
 namespace crow_alarm_panel {
 
 static const char *TAG_ACP = "crow_alarm_panel.acp";
+
+// ESPHome 2026.11 deprecated the name-keyed status_momentary_warning() in favour of a
+// LogString message; older releases (back to the 2026.7.2 minimum) only have the former.
+#if ESPHOME_VERSION_CODE >= VERSION_CODE(2026, 11, 0)
+#define ACP_MOMENTARY_WARNING(msg) this->status_momentary_warning(LOG_STR(msg), 2000)
+#else
+#define ACP_MOMENTARY_WARNING(msg) this->status_momentary_warning(msg, 2000)
+#endif
 
 void CrowAlarmControlPanel::dump_config() { ESP_LOGCONFIG(TAG_ACP, "Crow Alarm Control Panel"); }
 
@@ -24,7 +33,7 @@ void CrowAlarmControlPanel::control(const alarm_control_panel::AlarmControlPanel
     case alarm_control_panel::ACP_STATE_ARMED_AWAY: {
       std::string code = this->requires_code_to_arm_ ? this->resolve_code_(call) : "";
       if (this->requires_code_to_arm_ && code.empty()) {
-        this->status_momentary_warning("Code required to arm", 2000);
+        ACP_MOMENTARY_WARNING("Code required to arm");
         return;
       }
       // Publish the optimistic transitional state only if the request was accepted (a
@@ -42,7 +51,7 @@ void CrowAlarmControlPanel::control(const alarm_control_panel::AlarmControlPanel
     case alarm_control_panel::ACP_STATE_ARMED_HOME: {
       std::string code = this->requires_code_to_arm_ ? this->resolve_code_(call) : "";
       if (this->requires_code_to_arm_ && code.empty()) {
-        this->status_momentary_warning("Code required to arm", 2000);
+        ACP_MOMENTARY_WARNING("Code required to arm");
         return;
       }
       const uint32_t gen = this->parent_->arm_disarm_generation();
@@ -54,7 +63,7 @@ void CrowAlarmControlPanel::control(const alarm_control_panel::AlarmControlPanel
     case alarm_control_panel::ACP_STATE_DISARMED: {
       std::string code = this->resolve_code_(call);
       if (code.empty()) {
-        this->status_momentary_warning("Code required to disarm", 2000);
+        ACP_MOMENTARY_WARNING("Code required to disarm");
         return;
       }
       const uint32_t gen = this->parent_->arm_disarm_generation();
