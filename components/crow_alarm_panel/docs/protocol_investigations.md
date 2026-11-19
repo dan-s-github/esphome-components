@@ -1481,3 +1481,19 @@ Compiled against the test fixture, not yet tested on hardware. To check: after a
 - **Background:** 29 `Unknown [ff.]`/`[fe.]` lines (~0.18/h), 3 "No ping for 60 s" trips, 7 `Controller status too short, discarding`, two one-off loop-timing warnings (`api` 71 ms, `crow_alarm_panel` 92 ms). No ERROR lines. All within earlier baselines.
 
 **Conclusion:** the idle recovery ENTER works after a state-5 abort as designed. No regressions were seen from requiring CMD 0x15 to complete a press. The `not the exit reply, waiting` path and a disarm straight after a recovery still need a live example.
+
+## Second week of the exit-reply rule, and the ESPHome 2026.11.0 builds (2026-11-11 02:40 → 11-19 08:53 UTC)
+
+**Source:** frigate long-term logger, 2026-11-11 02:40 to 2026-11-19 08:53 UTC. No gaps over 5 minutes and no logger restarts. The `4cdc01d` build ran until 2026-11-19 07:28:51 (`Update complete`). After that the device took three ESPHome 2026.11.0 builds from `dan-dev` (07:28, 07:37 and 08:06 UTC; the last compiled 2026-11-19 21:05:31 +1300, i.e. `fb21008`). Each boot logged `Boot seems successful`, and the ESPHome keypad re-announced within about 15 s.
+
+**Observed facts:**
+
+- **Outputs:** 10 output-4 (gate) presses from ESPHome, all on the `4cdc01d` build. All 10 ended on CMD 0x15 (`keypad out of output selection (exit reply)`), 9 with `sequence complete, output 4 switched`. There were no `timeout in state` lines, no `final ENTER unanswered`, no recovery ENTER, and no `CMD 0x.. after ENTER is not the exit reply, waiting`.
+- **`did not switch` (11-13 20:57:56):** ACK `1d.05.00.00…`, then `14.05.01.00.00…` as the reply to OUTPUT and again as the reply to the digit, ENTER answered by `14.05.15.00.00…`, and no `Output state` other than `[00]`. The digit's reply was parsed 19 ms after `Packet sent` for the digit. The retry 3 s later (20:57:58.803) got its digit reply 99 ms after `Packet sent`, showed `14.05.01.00.08…` with `Output state [08]`, and switched. This is the same short-gap shape as the 11-06 22:01:06 miss, but this time no `took a long time for an operation` warning was logged near it. The timestamps are still client-side.
+- **Arm/disarm:** 11 arm-away cycles, none started from ESPHome. All 5 ESPHome `Disarm` requests were confirmed via `ARMED_STATE` within about 0.6 s on the first attempt. No arm/disarm timeouts or retries.
+- **Background:** no `Unknown [ff.]`/`[fe.]` lines, no "No ping for 60 s" trips, 7 `Controller status too short, discarding`, 4 `Unknown [08.00.00.40.00]` (11-11 04:04, 11-12 06:50 and 09:05, 11-15 08:58), no loop-timing warnings and no ERROR lines. Keypad `0x07` was neither pinged nor announced at any point in the window (or in the retained logs back to 11-06). The `ff.`/`fe.` storms are tied to its 5-minute cycle (see "Keypad registration-announce patterns"); the last ones were 9 lines on 11-10.
+- **2026.11.0 builds (07:28 → 08:53 UTC):** no ERROR lines; the only warnings were the OTA warning-flag lines, `Sending registration announce` after each boot, and the logger's own `Reading failed CONNECTION_CLOSED` reconnects. No gate press, arm or disarm happened on these builds within the window.
+
+**Inference (low confidence):** `Unknown [08.00.00.40.00]` looks like the `Unknown [08.00.80.60.00]` shape from the dropped-bit work, but it hasn't been checked against that model, so it stays uncatalogued.
+
+**Conclusion:** no regressions from the exit-reply rule in a second week. The `not the exit reply, waiting` path and a disarm straight after a recovery ENTER still haven't been seen on hardware. Both need the controller to drop the final ENTER, which happened in about 2 of 110 presses across the archive. The 2026.11.0 builds boot and run cleanly, but no output or arm/disarm sequence has been exercised on them yet.
