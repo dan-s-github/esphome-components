@@ -1414,3 +1414,102 @@ Normal gaps are 70–90 ms. Many earlier unexplained retries (10-13 23:27/23:45/
 
 **Change tried and dropped:** the ISR stamped each queued frame with `micros()` at its closing boundary, TX recorded `micros()` at completion, and a `KEYPAD_COMMAND` for our keypad that completed less than 40 ms after our last TX was logged (`… too early to be its reply, ignoring`) and kept from driving any state machine. It was flashed to the device on 2026-11-04 (03:44–04:18 UTC) and then dropped from `dan-dev`. Logs from that window are excluded from analysis. The early-confirmation question stays open, and the device-side timestamping is still the way to settle it without the log-timestamp caveat.
 
+
+## Gate press just after the exit delay (2026-11-04 04:26 UTC) — a lost final ENTER leaves the keypad in output selection, and a disarm then types its code there
+
+**Source:** frigate long-term logger, 2026-11-04 04:18–04:31 UTC. The device ran the build compiled 2026-11-04 17:17:46 +1300 (installed 04:18:06 UTC), which has the same code as `main`. The `compiled on` banners at 04:24:57 and 04:25:16 are logger reconnects, not reboots.
+
+**Observed facts:**
+
+| Time (UTC) | Action | Result |
+|---|---|---|
+| 04:26:01 | ESPHome arm away | `Arming` |
+| 04:26:02 / :04 / :06 | Gate (output 3), exit delay | all complete |
+| 04:26:29 | — | `armed_away` |
+| 04:26:30 | Gate | `timeout in state 3`, retry via `KEYPAD_COMMAND in OUTPUT_PENDING (no 0x1D), recovering`, complete |
+| 04:26:34 | Gate | OUTPUT ACKed, digit confirmed, output switched; final ENTER unanswered → `timeout in state 5, aborting … output 3 switched` |
+| 04:26:40, :49, :55 | Gate | OUTPUT answered CMD 0x07, selection 0x04 → `OUTPUT not accepted`, `did not switch` each time |
+| 04:27:00 | ESPHome disarm (fully armed, so no leading ENTER) | first digit answered, then `timeout in state 3`; same on retries 1–5 |
+| 04:27:03 | — | `Alarm pending from zone 3`, `pending` |
+| 04:27:26 | Disarm on the physical AAP keypad | `disarmed` |
+| 04:27:43 – 04:29:06 | Gate ×4 | OUTPUT answered CMD 0x07 → `did not switch` each time |
+| 04:30:37 | — | `[ESPHome Keypad] Command [14.05.00…]`, then `[ESPHome Keypad] In normal state` |
+
+- During the disarm, the same output switched on once per attempt (04:27:00, :03, :06, :10, :16, :26 in `Output state`), with no output request running. Which output is not recorded here: a code digit selects it, so naming it would disclose part of the alarm code.
+- The panel sends `[ESPHome Keypad] In normal state` every ~90 s (04:18:22, 04:19:51, 04:21:21, 04:22:51, 04:24:21, 04:25:51) and right after each completed sequence. Between the 04:26:36 abort and 04:30:37 there were none, although three periodic ones were due.
+- The 04:26:34 abort has the shape of the earlier `ENTER_PENDING` aborts: `Output state [04]` logged after ENTER went out.
+
+**Inference (high confidence on the mechanism):** the controller never took the final ENTER, so it kept the ESPHome keypad in output selection for ~4 minutes and then released it on its own. In that state OUTPUT gets CMD 0x07, and a disarm that doesn't press ENTER first has its first code digit taken as an output number (switching that output on) while the rest of the code is ignored. On 2026-11-02 the same abort was followed by an exit-delay disarm, whose leading ENTER got CMD 0x15 and closed output selection. Why the final ENTER is lost is still open. Whether the output triggered zone 3 is not established.
+
+**Change:** `CrowAlarmPanel` now tracks `output_select_open_`. It is set when OUTPUT is accepted (0x1D, or the no-0x1D recovery), when an output sequence aborts in `ENTER_DELAY`/`ENTER_PENDING`, and when OUTPUT is refused with CMD 0x07 outside the exit delay. It is cleared by a `KEYPAD_COMMAND` with CMD 0x15 or an `In normal state` for our keypad. While it is set:
+
+- with all state machines idle, `loop()` sends ENTER once a second, up to 5 times (`Output-select: keypad may still be in output selection, sending ENTER to leave it (n/5)`), then logs an error and waits for the controller;
+- an output sequence, and an arm/disarm code sequence, start with ENTER (the existing `CLEAR_PENDING` paths);
+- a code digit is never typed: if the leading ENTER's reply isn't the exit reply, `CODE_CLEAR_DELAY` logs `keypad still in output selection, not typing the code` and the watchdog retries from the leading ENTER;
+- arm away/stay without a code and zone bypass are refused with a warning.
+
+Compiled against the test fixture, not yet tested on hardware. To check: after a `timeout in state 5` abort, the recovery ENTER's reply is CMD 0x15 (or `In normal state` follows), and a disarm right after succeeds without switching an output.
+
+## Output-selection recovery on hardware (2026-11-04 04:46–05:18 UTC) — ENTER leaves output selection; a lost ENTER can also look like a completed press
+
+**Source:** frigate long-term logger, 2026-11-04 04:46:41–05:18:22 UTC, build compiled 2026-11-04 17:46:19 +1300 (the output-selection tracking above, before the exit-reply rule). Two sessions: 04:52–04:54 and 05:15–05:18, watched live.
+
+**Observed facts:**
+
+- **Recovery by the next press (04:53:12):** the first gate press 7 s after `armed_away` switched the output (`Output state [04]`), but its final ENTER went unanswered: `timeout in state 5, aborting`, then `keypad may still be in output selection (final ENTER unanswered)`. The next press, 0.6 s later, logged `sending ENTER first`; the controller answered `14.05.15.00.04…` (`keypad out of output selection (exit reply)`) and `In normal state` 60 ms later, and that press then completed normally. On `main` (04:26 above) every press after such an abort got CMD 0x07 for ~4 minutes.
+- **Recovery by the idle ENTER (05:17:39):** the press logged `sequence complete, output 3 switched`, but the reply it took for ENTER was `14.05.01.00.04…`, identical to the digit's confirmation 50 ms earlier, not the exit reply. 0.6 s later `loop()` logged `sending ENTER to leave it (1/5)`; the controller answered CMD 0x15 within 0.12 s, followed by `In normal state`.
+- **Disarms:** 04:54:42 (first attempt, 0.66 s) and 05:17:56 (CMD 0x07 after the terminal ENTER, `timeout in state 4`, retry 1 succeeded, 3.3 s total) both disarmed, with `Output state` staying `[00]`. A disarm while output selection was still open didn't occur: the recovery cleared it first each time.
+- 41 gate presses in total: 38 completed and switched, 1 aborted in state 5 but switched (04:53:12), 2 `did not switch` (05:16:12 after a state-1 retry, and 05:17:35).
+
+**Across the retained archive (2026-10-02 → 11-04):** of 110 output sequences that reached `sequence complete`, 108 got CMD 0x15 as the reply to their final ENTER. The other two, 10-13 23:27 and 11-04 05:17:39, got CMD 0x01, which is the lost-ENTER case above.
+
+**Selection byte is not a reliable "digit taken" signal:** the reply to the output digit showed selection 0x00 in 14 sequences. In some the byte toggled off a selection still showing from the previous press (04:53:18, 04:53:52: ACK `1d.05.00.04…`, digit reply `…00.00…`) and the output still switched; in 10-13 23:49:05 it stayed 0x00 and the output switched too. A rule holding the sequence until the digit's reply shows the output selected would have retried (and possibly re-fired) those presses, so it was not adopted. Why the two `did not switch` presses missed is still open.
+
+**Change:** in `ENTER_PENDING` only CMD 0x15 now completes the sequence. Any other `KEYPAD_COMMAND` logs `CMD 0x.. after ENTER is not the exit reply, waiting`; if no 0x15 comes, the watchdog aborts in state 5 and the recovery ENTER follows. Compiled, not yet tested on hardware at the time; see the next section for the first week on the device.
+
+## First week of the exit-reply rule on hardware (2026-11-04 07:00 → 11-11 02:40 UTC)
+
+**Source:** frigate long-term logger, 2026-11-04 07:00:32 (`Update complete`, build compiled 2026-11-04 20:00:12 +1300, the first with the exit-reply rule) to 2026-11-11 02:40 UTC. No reboots or logger restarts in the window.
+
+**Observed facts:**
+
+- **Outputs:** 11 output-4 (gate) presses from ESPHome. 9 completed on CMD 0x15 (`keypad out of output selection (exit reply)`, then `sequence complete, output 4 switched`). One of them (11-06 19:03:03) first needed a `timeout in state 1` retry. `CMD 0x.. after ENTER is not the exit reply, waiting` never fired, so that branch is still untested on hardware.
+- **Recovery ENTER after a `timeout in state 5` abort (11-06 22:01:25):** the fourth of four presses in 19 s, panel disarmed. OUTPUT was ACKed, the digit reply showed `14.05.01.00.08…`, `Output state [08]` followed, and the final ENTER (sent 22:01:26.102) got no reply. At 27.110 the watchdog aborted with `keypad may still be in output selection (final ENTER unanswered)` and `sequence aborted, output 4 switched`. At 28.113 `loop()` logged `sending ENTER to leave it (1/5)`; the controller answered `14.05.15.00.08…` (exit reply) 0.12 s later, followed by `In normal state`. On 11-04 the idle ENTER had only been seen after a press that wrongly looked complete (05:17:39); this is the first time it ran after a state-5 abort, which is the case the "To check" note above asked about. No arm or disarm followed within minutes, so the "disarm right after" half is still unobserved.
+- **`did not switch` (11-06 22:01:06):** ACK `1d.05.00.00…`, then `14.05.01.00.00…` as the reply to OUTPUT and again as the reply to the digit, ENTER answered by `14.05.15.00.00…`, and no `Output state` other than `[00]`. The log reported `output 4 did not switch` and reset the switch. The garage door zone stayed inactive until after the next press (22:01:15), so the verification matched the hardware.
+- That miss had a short gap: the digit's reply was parsed 24 ms after `Packet sent` for the digit, against 99–100 ms for the three later presses in the same minute. A `crow_alarm_panel took a long time for an operation (92 ms)` warning was logged between the two lines. This matches the short-gap failures in the 2026-11-04 early-confirmation table and has the same caveat: the timestamps are client-side.
+- **Arm/disarm:** 9 arm cycles in the window; the ESPHome ones (1 `Arm away`, 3 `Disarm`) all reached their state first time, with no arm/disarm timeouts.
+- **Background:** 29 `Unknown [ff.]`/`[fe.]` lines (~0.18/h), 3 "No ping for 60 s" trips, 7 `Controller status too short, discarding`, two one-off loop-timing warnings (`api` 71 ms, `crow_alarm_panel` 92 ms). No ERROR lines. All within earlier baselines.
+
+**Conclusion:** the idle recovery ENTER works after a state-5 abort as designed. No regressions were seen from requiring CMD 0x15 to complete a press. The `not the exit reply, waiting` path and a disarm straight after a recovery still need a live example.
+
+## Second week of the exit-reply rule, and the ESPHome 2026.11.0 builds (2026-11-11 02:40 → 11-19 08:53 UTC)
+
+**Source:** frigate long-term logger, 2026-11-11 02:40 to 2026-11-19 08:53 UTC. No gaps over 5 minutes and no logger restarts. The exit-reply build ran until 2026-11-19 07:28:51 (`Update complete`). After that the device took three ESPHome 2026.11.0 builds from `dan-dev` (07:28, 07:37 and 08:06 UTC; the last compiled 2026-11-19 21:05:31 +1300, i.e. with the `alloc_helpers.h` include fix but not the later `LogString` warning change). Each boot logged `Boot seems successful`, and the ESPHome keypad re-announced within about 15 s.
+
+**Observed facts:**
+
+- **Outputs:** 10 output-4 (gate) presses from ESPHome, all on the exit-reply build. All 10 ended on CMD 0x15 (`keypad out of output selection (exit reply)`), 9 with `sequence complete, output 4 switched`. There were no `timeout in state` lines, no `final ENTER unanswered`, no recovery ENTER, and no `CMD 0x.. after ENTER is not the exit reply, waiting`.
+- **`did not switch` (11-13 20:57:56):** ACK `1d.05.00.00…`, then `14.05.01.00.00…` as the reply to OUTPUT and again as the reply to the digit, ENTER answered by `14.05.15.00.00…`, and no `Output state` other than `[00]`. The digit's reply was parsed 19 ms after `Packet sent` for the digit. The retry 3 s later (20:57:58.803) got its digit reply 99 ms after `Packet sent`, showed `14.05.01.00.08…` with `Output state [08]`, and switched. This is the same short-gap shape as the 11-06 22:01:06 miss, but this time no `took a long time for an operation` warning was logged near it. The timestamps are still client-side.
+- **Arm/disarm:** 11 arm-away cycles, none started from ESPHome. All 5 ESPHome `Disarm` requests were confirmed via `ARMED_STATE` within about 0.6 s on the first attempt. No arm/disarm timeouts or retries.
+- **Background:** no `Unknown [ff.]`/`[fe.]` lines, no "No ping for 60 s" trips, 7 `Controller status too short, discarding`, 4 `Unknown [08.00.00.40.00]` (11-11 04:04, 11-12 06:50 and 09:05, 11-15 08:58), no loop-timing warnings and no ERROR lines. Keypad `0x07` was neither pinged nor announced at any point in the window (or in the retained logs back to 11-06). The `ff.`/`fe.` storms are tied to its 5-minute cycle (see "Keypad registration-announce patterns"); the last ones were 9 lines on 11-10.
+- **2026.11.0 builds (07:28 → 08:53 UTC):** no ERROR lines; the only warnings were the OTA warning-flag lines, `Sending registration announce` after each boot, and the logger's own `Reading failed CONNECTION_CLOSED` reconnects. No gate press, arm or disarm happened on these builds within the window.
+
+**Inference (low confidence):** `Unknown [08.00.00.40.00]` looks like the `Unknown [08.00.80.60.00]` shape from the dropped-bit work, but it hasn't been checked against that model, so it stays uncatalogued.
+
+**Conclusion:** no regressions from the exit-reply rule in a second week. The `not the exit reply, waiting` path and a disarm straight after a recovery ENTER still haven't been seen on hardware. Both need the controller to drop the final ENTER, which happened in about 2 of 110 presses across the archive. The 2026.11.0 builds boot and run cleanly, but no output or arm/disarm sequence has been exercised on them yet.
+
+## Third week of the exit-reply rule (2026-11-19 08:53 → 11-26 06:59 UTC)
+
+**Source:** frigate long-term logger, 2026-11-19 08:53 to 2026-11-26 06:59 UTC. No gaps over 5 minutes, no logger restarts, and no device reboots: the whole window ran the ESPHome 2026.11.0 build compiled 2026-11-19 21:05:31 +1300.
+
+**Observed facts:**
+
+- **Outputs:** 5 output-4 (gate) presses from ESPHome. All 5 ended on CMD 0x15 (`keypad out of output selection (exit reply)`), 4 with `sequence complete, output 4 switched`. There were no `timeout in state` lines in output selection, no `final ENTER unanswered`, no recovery ENTER, and no `CMD 0x.. after ENTER is not the exit reply, waiting`.
+- **`did not switch` (11-20 19:02:33):** ACK `1d.05.00.00…`, then `14.05.01.00.00…` as the reply to OUTPUT and again as the reply to the digit, ENTER answered by `14.05.15.00.00…`, and no `Output state` other than `[00]`. The digit's reply was parsed 32 ms after `Packet sent` for the digit, against 84–99 ms for the four presses that switched. A `crow_alarm_panel took a long time for an operation (93 ms)` warning was logged between `Packet sent` and that reply. A new press 3 s later (19:02:35.538) showed `14.05.01.00.08…` with `Output state [08]` and switched. This is the third miss of this shape (11-06 22:01:06, 11-13 20:57:56, 11-20 19:02:33); the 11-13 one had no loop-timing warning, so the warning is not a necessary condition.
+- **Arm/disarm:** 8 arm-away cycles, none started from ESPHome. 3 ESPHome `Disarm` requests, each from `armed_away` (not during an exit delay). 11-25 04:00:24 was confirmed via `ARMED_STATE` in 0.64 s on the first attempt. 11-23 04:18:36 and 11-26 03:36:19 each had all four code digits confirmed by `14.05.01…`, then the terminal ENTER answered by `14.05.07…` (`CMD 0x07 after terminal key`), no `ARMED_STATE`, and `timeout in state 4, retrying (1/6)`. Retry 1 disarmed both (`Disarmed [11.00.00.00.00]`, 3.2 s total each). The 11-23 attempt logged a 102 ms loop-timing warning during the digits; the 11-26 one logged none.
+- **Keypad drop (11-25 00:16:26):** a burst of 11 `Unknown [ff.]`/`[fe.]` lines within about 1 s, the first burst since 11-10. After it the controller kept pinging the AAP (`0x00`) and Control4 (`0x06`) keypads but did not ping the ESPHome keypad (`0x05`) from 00:16:11 on. `No ping for 60 s, re-sending registration announce` fired at 00:17:11.870, and `0x05` was polled again at 00:17:12.470. Keypad `0x07` was again neither pinged nor announced in the window.
+- **Background:** 1 further isolated `Unknown [ff.]` (11-23 16:42:02), 28 `Controller status too short, discarding`, 10 `Unknown [08.00.80.60.00]`, 7 `Unknown [08.00.00.40.00]`, 1 `Unknown [00.00.80.60.00]` (11-20 19:49:23), two loop-timing warnings (the two above), and no ERROR lines.
+
+**Inference (low confidence):** the three `did not switch` misses share a digit reply that arrives well under the ~85–100 ms seen on good presses and still shows output 4 off. That looks like the controller answering the digit before it has processed it, so these misses (3 of 26 gate presses across the three weeks of the exit-reply rule) may be controller-side rather than a parsing issue. The timestamps are still client-side, so this needs a bus trace to confirm.
+
+**Conclusion:** no regressions from the exit-reply rule in a third week, and the ESPHome 2026.11.0 build ran a week without a reboot or ERROR line. Both disarm retries are the known `CMD 0x07` after-ENTER rejection and recovered on the first retry. The keypad drop is the documented burst → watchdog re-announce path (see `known_quirks.md`). The `not the exit reply, waiting` path and a disarm straight after a recovery ENTER still haven't been seen on hardware.
