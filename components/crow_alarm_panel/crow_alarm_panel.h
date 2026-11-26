@@ -208,6 +208,12 @@ class CrowAlarmPanelStore {
   // (output selection never opened); the physical AAP keypad leaves ~50 ms (2026-10-14).
   static const uint32_t OUTPUT_SELECT_CLEAR_DELAY_MS = 100;
 
+  // Recovery ENTERs sent while the keypad may still be in output selection and nothing else
+  // is running (see output_select_open_): one per interval, up to the max, then give up and
+  // leave it to the controller's own timeout.
+  static const uint32_t OUTPUT_SELECT_RECOVER_INTERVAL_MS = 1000;
+  static const uint8_t OUTPUT_SELECT_RECOVER_MAX = 5;
+
   // How long a set_output() request queued behind another keypress sequence (typically an
   // arm/disarm, up to ~7 s with retries) waits before being dropped. Long enough for a normal
   // disarm with retries; short enough that a gate/garage doesn't fire unexpectedly late.
@@ -384,6 +390,7 @@ class CrowAlarmPanel : public Component {
   void start_output_select_(uint8_t output, bool state);
   void begin_output_select_attempt_();
   void finish_output_select_(bool completed);
+  void set_output_select_open_(bool open, const char *reason);
   void publish_output_actual_(uint8_t output);
   bool wait_for_clock_edge_(bool wait_for_state, uint32_t timeout_us);
 
@@ -423,6 +430,16 @@ class CrowAlarmPanel : public Component {
   // garage press), so it only proves anything once this attempt has seen it without the
   // output's bit — which happens when the controller really opened output selection.
   bool output_select_saw_bit_clear_{false};
+  // The controller may still have our keypad in output selection: set when OUTPUT is
+  // accepted (0x1D), cleared by the exit reply (KEYPAD_COMMAND CMD 0x15) or an
+  // "In normal state" KEYPAD_STATE for us. When an output sequence's final ENTER goes
+  // unanswered, the controller keeps the keypad there (~4 min on 2026-11-04): OUTPUT then
+  // gets CMD 0x07, and a disarm's code digits are taken as output numbers, switching an
+  // output on per attempt. While set, loop() presses ENTER to leave (when idle), sequences
+  // press ENTER first, and code digits are never typed.
+  bool output_select_open_{false};
+  uint32_t output_select_recover_ms_{0};   // last recovery ENTER (or when the flag was set)
+  uint8_t output_select_recover_count_{0};
   // Last OUTPUT_STATE bitmap (outputs 1-8), used to report the real output state when a
   // sequence fails or a queued request expires.
   uint8_t last_output_bitmap_{0};

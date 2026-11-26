@@ -645,6 +645,7 @@ void CrowAlarmPanel::loop() {
           ESP_LOGD(TAG, "Output-select: ACK received, awaiting KEYPAD_COMMAND");
           this->output_select_state_ = OutputSelectState::AWAIT_COMMAND;
           this->output_select_state_enter_ms_ = millis();
+          this->set_output_select_open_(true, nullptr);
         }
         break;
       }
@@ -738,6 +739,10 @@ void CrowAlarmPanel::loop() {
         CrowAlarmPanelKeypad keypad = this->find_keypad_(data[0]);
         ESP_LOGD(TAG, "[%-*s] Command [%02x.%s]", this->keypad_label_width_, keypad_label(keypad, data[0]).c_str(),
                  type, format_hex_pretty(data).c_str());
+        // CMD 0x15 is the controller closing output selection (the reply to its final ENTER).
+        if (data[0] == this->keypad_address_ && data.size() > 1 && data[1] == 0x15) {
+          this->set_output_select_open_(false, "exit reply");
+        }
         // Drive output-select state machine forward when command is addressed to us.
         if (data[0] == this->keypad_address_) {
           // data[3] is this keypad's selected-output bitmap: reset to 0 when OUTPUT is
@@ -781,11 +786,17 @@ void CrowAlarmPanel::loop() {
               if (data.size() > 3 && data[3] != 0) {
                 ESP_LOGW(TAG, "Output-select: OUTPUT not accepted (CMD 0x%02X, selection 0x%02X), waiting",
                          data.size() > 1 ? data[1] : 0, data[3]);
+                // Outside the exit delay, CMD 0x07 here means a previous sequence left us in
+                // output selection (2026-11-04); the retry then presses ENTER first.
+                if (data.size() > 1 && data[1] == 0x07 && !this->in_exit_delay_()) {
+                  this->set_output_select_open_(true, "OUTPUT refused with CMD 0x07");
+                }
                 break;
               }
               ESP_LOGW(TAG, "Output-select: KEYPAD_COMMAND in OUTPUT_PENDING (no 0x1D), recovering");
               this->output_select_state_ = OutputSelectState::AWAIT_COMMAND;
               this->output_select_state_enter_ms_ = millis();
+              this->set_output_select_open_(true, nullptr);
               [[fallthrough]];
             case OutputSelectState::AWAIT_COMMAND:
             case OutputSelectState::DIGIT_PENDING:
@@ -942,6 +953,11 @@ void CrowAlarmPanel::loop() {
         if (data[1] == 00) {
           ESP_LOGD(TAG, "[%-*s] In normal state [%02x.%s]", this->keypad_label_width_,
                    keypad_label(keypad, data[0]).c_str(), type, format_hex_pretty(data).c_str());
+          // Sent after each completed sequence and every ~90 s, but not while the controller
+          // keeps us in output selection (2026-11-04: none for the 4 min it was stuck).
+          if (data[0] == this->keypad_address_) {
+            this->set_output_select_open_(false, "keypad in normal state");
+          }
         } else if (data[1] == 02) {
           ESP_LOGD(TAG, "[%-*s] In installer mode [%02x.%s]", this->keypad_label_width_,
                    keypad_label(keypad, data[0]).c_str(), type, format_hex_pretty(data).c_str());
@@ -1108,6 +1124,12 @@ void CrowAlarmPanel::loop() {
       } else {
         ESP_LOGW(TAG, "Output-select: timeout in state %u, aborting",
                  static_cast<uint8_t>(this->output_select_state_));
+        // The final ENTER (or its exit reply) never came, so output selection is still open
+        // even if a stray "In normal state" cleared the flag mid-sequence.
+        if (this->output_select_state_ == OutputSelectState::ENTER_DELAY ||
+            this->output_select_state_ == OutputSelectState::ENTER_PENDING) {
+          this->set_output_select_open_(true, "final ENTER unanswered");
+        }
         this->finish_output_select_(false);
       }
     }
@@ -1144,6 +1166,28 @@ void CrowAlarmPanel::loop() {
     }
   }
 
+  // Leave output selection left open by a sequence whose final ENTER went unanswered: press
+  // ENTER while nothing else is running, until the exit reply (CMD 0x15) or "In normal state"
+  // clears output_select_open_. A queued output request handles it itself (ENTER first).
+  if (this->output_select_open_ && this->output_select_state_ == OutputSelectState::IDLE &&
+      this->arm_disarm_state_ == ArmDisarmState::IDLE && this->zone_bypass_state_ == ZoneBypassState::IDLE &&
+      !this->output_queue_pending_ &&
+      this->output_select_recover_count_ <= CrowAlarmPanelStore::OUTPUT_SELECT_RECOVER_MAX &&
+      millis() - this->output_select_recover_ms_ >= CrowAlarmPanelStore::OUTPUT_SELECT_RECOVER_INTERVAL_MS) {
+    // Counter and timestamp updated BEFORE the keypress — it can yield and re-enter loop().
+    this->output_select_recover_count_++;
+    this->output_select_recover_ms_ = millis();
+    if (this->output_select_recover_count_ > CrowAlarmPanelStore::OUTPUT_SELECT_RECOVER_MAX) {
+      ESP_LOGE(TAG, "Output-select: no exit reply after %u ENTERs; code digits stay blocked until the "
+               "panel reports the keypad in normal state",
+               CrowAlarmPanelStore::OUTPUT_SELECT_RECOVER_MAX);
+    } else {
+      ESP_LOGW(TAG, "Output-select: keypad may still be in output selection, sending ENTER to leave it (%u/%u)",
+               this->output_select_recover_count_, CrowAlarmPanelStore::OUTPUT_SELECT_RECOVER_MAX);
+      this->keypress(KEY_ENTER);
+    }
+  }
+
   // Zone-bypass watchdog: abort if any non-IDLE state exceeds 1s without progress.
   // No automatic retry — the sequence toggles panel state, so a blind retry could
   // undo a toggle that actually landed (same reasoning as post-fire output states).
@@ -1165,11 +1209,18 @@ void CrowAlarmPanel::loop() {
   if (this->arm_disarm_state_ == ArmDisarmState::CODE_CLEAR_DELAY && !this->arm_disarm_retry_pending_ &&
       !this->arm_disarm_key_in_flight_ &&
       millis() - this->arm_disarm_state_enter_ms_ >= CrowAlarmPanelStore::OUTPUT_SELECT_CLEAR_DELAY_MS) {
-    // State and index set BEFORE the keypress — it can yield and re-enter loop().
-    this->arm_disarm_code_idx_ = 1;
-    this->arm_disarm_state_ = ArmDisarmState::CODE_DIGIT_PENDING;
-    this->arm_disarm_state_enter_ms_ = millis();
-    this->arm_disarm_keypress_(this->arm_disarm_code_digits_[0]);
+    if (this->output_select_open_) {
+      // The leading ENTER got a reply, but not the exit reply: never type the code into
+      // output selection. Back to waiting, so the watchdog retries from the leading ENTER.
+      ESP_LOGW(TAG, "Code sequence: keypad still in output selection, not typing the code");
+      this->arm_disarm_state_ = ArmDisarmState::CODE_CLEAR_PENDING;
+    } else {
+      // State and index set BEFORE the keypress — it can yield and re-enter loop().
+      this->arm_disarm_code_idx_ = 1;
+      this->arm_disarm_state_ = ArmDisarmState::CODE_DIGIT_PENDING;
+      this->arm_disarm_state_enter_ms_ = millis();
+      this->arm_disarm_keypress_(this->arm_disarm_code_digits_[0]);
+    }
   }
 
   // Arm/disarm watchdog: abort if any non-IDLE state exceeds 1s without progress. See
@@ -1315,6 +1366,17 @@ void CrowAlarmPanel::begin_code_attempt_() {
     this->arm_disarm_keypress_(KEY_ENTER);
     return;
   }
+  if (this->output_select_open_) {
+    // Code digits typed into output selection are taken as output numbers: each attempt
+    // switched an output on and none disarmed (2026-11-04). Leave it with ENTER first;
+    // CODE_CLEAR_DELAY only types the code once the exit reply has cleared the flag.
+    ESP_LOGD(TAG, "Code sequence: keypad may still be in output selection, sending ENTER first");
+    this->arm_disarm_code_idx_ = 0;
+    this->arm_disarm_state_ = ArmDisarmState::CODE_CLEAR_PENDING;
+    this->arm_disarm_state_enter_ms_ = millis();
+    this->arm_disarm_keypress_(KEY_ENTER);
+    return;
+  }
   this->arm_disarm_code_idx_ = 1;
   this->arm_disarm_state_ = ArmDisarmState::CODE_DIGIT_PENDING;
   this->arm_disarm_state_enter_ms_ = millis();
@@ -1340,6 +1402,11 @@ bool CrowAlarmPanel::arm_away(const std::string &code) {
   if (!code.empty()) {
     ESP_LOGI(TAG, "Arm away (with code)");
     return this->start_code_sequence_(code, KEY_ARM);
+  }
+  if (this->output_select_open_) {
+    // KEY_ARM would land in output selection; loop() is already pressing ENTER to leave it.
+    ESP_LOGW(TAG, "arm_away: keypad may still be in output selection, ignoring (retry in a few seconds)");
+    return false;
   }
   ESP_LOGI(TAG, "Arm away");
   this->arm_disarm_state_ = ArmDisarmState::ARM_AWAY_PENDING;
@@ -1369,6 +1436,11 @@ bool CrowAlarmPanel::arm_stay(const std::string &code) {
   if (!code.empty()) {
     ESP_LOGI(TAG, "Arm stay (with code)");
     return this->start_code_sequence_(code, KEY_STAY);
+  }
+  if (this->output_select_open_) {
+    // KEY_STAY would land in output selection; loop() is already pressing ENTER to leave it.
+    ESP_LOGW(TAG, "arm_stay: keypad may still be in output selection, ignoring (retry in a few seconds)");
+    return false;
   }
   ESP_LOGI(TAG, "Arm stay");
   this->arm_disarm_state_ = ArmDisarmState::ARM_STAY_PENDING;
@@ -1503,10 +1575,18 @@ void CrowAlarmPanel::begin_output_select_attempt_() {
   if (this->in_exit_delay_()) {
     // During the exit delay the controller has every keypad on its arming screen and acks
     // OUTPUT/digit/ENTER without selecting the output. A physical keypad leaves that screen
-    // with ENTER ("Back") first. Only sent in the exit delay: elsewhere ENTER would submit
-    // whatever the controller still has buffered for us (e.g. code digits of an aborted
-    // disarm), which can arm or disarm the panel.
+    // with ENTER ("Back") first. Otherwise only sent while output selection may still be open
+    // (below): elsewhere ENTER would submit whatever the controller still has buffered for us
+    // (e.g. code digits of an aborted disarm), which can arm or disarm the panel.
     ESP_LOGD(TAG, "Output-select: panel in exit delay, sending ENTER first");
+    this->output_select_state_ = OutputSelectState::CLEAR_PENDING;
+    this->output_select_state_enter_ms_ = millis();
+    this->keypress(KEY_ENTER);
+  } else if (this->output_select_open_) {
+    // Still in output selection from an earlier attempt or sequence: OUTPUT would get CMD
+    // 0x07. ENTER closes it (CMD 0x15); in output selection there's no code buffered for it
+    // to submit.
+    ESP_LOGD(TAG, "Output-select: keypad may still be in output selection, sending ENTER first");
     this->output_select_state_ = OutputSelectState::CLEAR_PENDING;
     this->output_select_state_enter_ms_ = millis();
     this->keypress(KEY_ENTER);
@@ -1538,6 +1618,21 @@ void CrowAlarmPanel::finish_output_select_(bool completed) {
   this->publish_output_actual_(output);
 }
 
+void CrowAlarmPanel::set_output_select_open_(bool open, const char *reason) {
+  const bool was_open = this->output_select_open_;
+  this->output_select_open_ = open;
+  if (open) {
+    // (Re)start recovery: the first ENTER goes out one interval after this point.
+    this->output_select_recover_count_ = 0;
+    this->output_select_recover_ms_ = millis();
+    if (reason != nullptr) {
+      ESP_LOGW(TAG, "Output-select: keypad may still be in output selection (%s)", reason);
+    }
+  } else if (was_open) {
+    ESP_LOGD(TAG, "Output-select: keypad out of output selection (%s)", reason);
+  }
+}
+
 void CrowAlarmPanel::publish_output_actual_(uint8_t output) {
   const bool on = output >= 1 && output <= 8 && ((this->last_output_bitmap_ >> (output - 1)) & 0x01);
   for (CrowAlarmPanelOutput &o : this->outputs_) {
@@ -1562,6 +1657,13 @@ void CrowAlarmPanel::set_zone_bypass(uint8_t zone, bool state) {
   if (this->output_select_state_ != OutputSelectState::IDLE ||
       this->arm_disarm_state_ != ArmDisarmState::IDLE) {
     ESP_LOGW(TAG, "set_zone_bypass(%u, %s): another keypress sequence in progress, ignoring", zone,
+             ONOFF(state));
+    return;
+  }
+  if (this->output_select_open_) {
+    // BYPASS and the zone digits would land in output selection; loop() is already pressing
+    // ENTER to leave it.
+    ESP_LOGW(TAG, "set_zone_bypass(%u, %s): keypad may still be in output selection, ignoring", zone,
              ONOFF(state));
     return;
   }
